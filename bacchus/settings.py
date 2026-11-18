@@ -24,6 +24,8 @@ _MODELS = {
 }
 _PROVIDER_KEY = "BACCHUS_PLANNER_PROVIDER"
 _API_LOG_DIR = "BACCHUS_API_LOG_DIR"
+_VIDEO_ENCODER = "BACCHUS_VIDEO_ENCODER"
+_ENCODER_MODES = ("auto", "cpu")
 _PROVIDERS = ("anthropic", "openai")
 _FEATURES = {
     "useOpenAITranscription": "BACCHUS_USE_OPENAI_TRANSCRIPTION",
@@ -38,7 +40,7 @@ _KEYS = {
     "OPENAI_API_KEY": ("openAIKey", "clearOpenAIKey", "OpenAI"),
     "ANTHROPIC_API_KEY": ("anthropicKey", "clearAnthropicKey", "Anthropic"),
 }
-_PREFERENCES = {"plannerProvider", "apiLogDirectory", *_BOOLEANS, *_MODELS}
+_PREFERENCES = {"plannerProvider", "apiLogDirectory", "videoEncoder", *_BOOLEANS, *_MODELS}
 _INPUT_FIELDS = _PREFERENCES | {field for key, clear, _ in _KEYS.values() for field in (key, clear)}
 _MODEL_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _LOCK = RLock()
@@ -94,6 +96,11 @@ def _normalize_planner(value):
 def planner_choice():
     """Resolve the configured planner; provider readiness never changes this choice."""
     return _normalize_planner(provider_value(_PROVIDER_KEY, ""))
+
+
+def video_encoder_mode():
+    value = provider_value(_VIDEO_ENCODER, "auto")
+    return value if value in _ENCODER_MODES else "auto"
 
 
 def openai_transcription_enabled():
@@ -152,6 +159,8 @@ class Settings:
         selected = stored.get("plannerProvider")
         if isinstance(selected, str) and selected.strip().lower() in (*_PROVIDERS, "", "auto"):
             preferences["plannerProvider"] = _normalize_planner(selected)
+        if stored.get("videoEncoder") in _ENCODER_MODES:
+            preferences["videoEncoder"] = stored["videoEncoder"]
         secrets = {provider_value(name) for name in _KEYS}
         if "apiLogDirectory" in stored:
             with suppress(SettingsError):
@@ -170,6 +179,8 @@ class Settings:
             _OVERRIDES[_PROVIDER_KEY] = preferences["plannerProvider"]
         if "apiLogDirectory" in preferences:
             _OVERRIDES[_API_LOG_DIR] = preferences["apiLogDirectory"]
+        if "videoEncoder" in preferences:
+            _OVERRIDES[_VIDEO_ENCODER] = preferences["videoEncoder"]
         for field, name in _FEATURES.items():
             if field in preferences:
                 _OVERRIDES[name] = "1" if preferences[field] else "0"
@@ -182,6 +193,7 @@ class Settings:
             view = {
                 "completed": self.preferences.get("completed", False),
                 "plannerProvider": planner_choice(),
+                "videoEncoder": video_encoder_mode(),
                 "useOpenAITranscription": openai_transcription_enabled(),
                 "useOpenAIImages": openai_images_enabled(),
                 "hasOpenAIKey": bool(provider_value("OPENAI_API_KEY", "").strip()),
@@ -214,6 +226,10 @@ class Settings:
                 if data["plannerProvider"] not in _PROVIDERS:
                     raise SettingsError("Choose Anthropic or OpenAI for the planner.")
                 preferences["plannerProvider"] = data["plannerProvider"]
+            if "videoEncoder" in data:
+                if data["videoEncoder"] not in _ENCODER_MODES:
+                    raise SettingsError("Choose automatic hardware encoding or CPU only.")
+                preferences["videoEncoder"] = data["videoEncoder"]
             secrets = {provider_value(name) for name in _KEYS} | set(credentials.values())
             if "apiLogDirectory" in data or "apiLogDirectory" in preferences:
                 value = data.get("apiLogDirectory", preferences.get("apiLogDirectory"))

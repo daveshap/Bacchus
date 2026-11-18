@@ -116,6 +116,11 @@ def run_export(url, project):
             if request(url, export["url"])[4:8] != b"ftyp":
                 raise RuntimeError("Export downloaded but lacked an MP4 file header.")
             receipt = json.loads(request(url, export["receiptUrl"]))
+            media = export["media"]
+            if (media != receipt["media"] or media.get("encoderMode") != "auto" or not media.get("encoder")
+                or media.get("hardwareEncoding") != (media["encoder"] != "libx264")
+                or (not media["hardwareEncoding"] and not media.get("encoderFallback"))):
+                raise RuntimeError("The default export did not identify its actual encoder and any fallback.")
             if receipt["candidate"]["mix"]["rendered"]["sha256"] != prepared["sha256"]:
                 raise RuntimeError("The exported receipt did not bind the approved WAV.")
             for scope, key in (("assets", "assetChecks"), ("animation", "animationChecks")):
@@ -124,7 +129,7 @@ def run_export(url, project):
                     check["status"] != "passed" or not check["proofHash"] for check in checks.values()
                 ):
                     raise RuntimeError(f"The exported receipt did not bind the passed {scope} proofs.")
-            return
+            return media["encoder"]
         if export["status"] == "failed":
             raise RuntimeError(export["error"])
         time.sleep(0.25)
@@ -183,6 +188,7 @@ def main():
         env = os.environ.copy()
         for variable in PROVIDER_SETTINGS:
             env.pop(variable, None)
+        env.pop("BACCHUS_VIDEO_ENCODER", None)
         process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             url = endpoint(root, process)
@@ -200,7 +206,7 @@ def main():
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")
             if args.render:
-                run_export(url, project)
+                print(f"Verified default export encoder: {run_export(url, project)}")
             request(url, "/api/quit", {})
             if process.wait(15) != 0:
                 raise RuntimeError("Bacchus returned a failure status after quitting.")

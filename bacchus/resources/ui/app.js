@@ -335,7 +335,7 @@ function settingsView() {
   const provider = settings.plannerProvider === "openai" ? "openai" : "anthropic";
   const keyStatus = value => badge(value ? "Key available" : "No key set", value ? "good" : "");
   return `
-    ${heading(setup ? "Set up Bacchus" : "Settings", "Check the local media tools and choose the providers you want to use.")}
+    ${heading(setup ? "Set up Bacchus" : "Settings", "Check the media tools and choose your providers and video encoder.")}
     <div class="columns">
       <form class="panel stack" data-form="settings" autocomplete="off">
         <div><h2>Scene planning</h2>
@@ -375,6 +375,14 @@ function settingsView() {
             </div>
           </details>
         </fieldset>
+        <div class="field">
+          <label for="videoEncoder">Video encoding</label>
+          <select id="videoEncoder" name="videoEncoder">
+            <option value="auto"${settings.videoEncoder === "cpu" ? "" : " selected"}>Automatic GPU (CPU fallback)</option>
+            <option value="cpu"${settings.videoEncoder === "cpu" ? " selected" : ""}>CPU only</option>
+          </select>
+          <p class="hint">Automatic uses a supported hardware encoder for MP4 export and falls back to the CPU if needed.</p>
+        </div>
         <details class="timing-panel">
           <summary>API logs</summary>
           <div class="field settings-note">
@@ -1483,6 +1491,7 @@ function exportView(project) {
   if (!project.accepted) return prerequisite("Export", "Run QC and accept the candidate before exporting a video.", "review", "Open preview & QC");
   const output = project.export;
   const status = output?.status;
+  const media = output?.media;
   const running = status === "running" || project.busy === "rendering";
   return `
     ${heading("Export", "Render the accepted candidate and download the finished files.")}
@@ -1497,7 +1506,11 @@ function exportView(project) {
         <dt>Narration</dt><dd>${project.audio ? escapeHtml(project.audio.name) : "No recording"}</dd>
         ${project.mix ? `<dt>Music</dt><dd>${project.mix.musicMode === "track" ? escapeHtml(project.mix.music?.name) : "No music"}</dd>
           <dt>Sound effects</dt><dd>${project.mix.effects.length}</dd>` : ""}
+        ${media?.encoder ? `<dt>Video encoder</dt><dd><code>${escapeHtml(media.encoder)}</code></dd>` : ""}
+        ${typeof media?.hardwareEncoding === "boolean"
+          ? `<dt>Encoding mode</dt><dd>${media.hardwareEncoding ? "Hardware encoding" : "CPU encoding"}</dd>` : ""}
       </dl>
+      ${media?.encoderFallback ? `<p class="notice actions"><strong>CPU fallback.</strong> ${escapeHtml(media.encoderFallback)}</p>` : ""}
       ${running ? '<p class="hint actions" role="status">Rendering the accepted candidate…</p>' : ""}
       ${status === "failed" ? `<p class="notice error actions">${escapeHtml(output.error || "The render failed.")}</p>` : ""}
       ${!state.config.renderAvailable ? mediaSettingsNotice("Set up the media tools to export a video.") : ""}
@@ -1839,6 +1852,7 @@ function settingsPayload(data) {
   const payload = {
     completed: true,
     plannerProvider: data.get("plannerProvider"),
+    videoEncoder: data.get("videoEncoder"),
     useOpenAIImages: data.has("useOpenAIImages"),
     apiLogDirectory: data.get("apiLogDirectory")?.trim() ?? "",
     clearOpenAIKey: data.has("clearOpenAIKey"),

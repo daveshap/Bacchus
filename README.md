@@ -4,7 +4,7 @@ Bacchus turns recorded narration and a creative brief into a reviewed MP4. AI ca
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.4.0 Windows installer](releases/0.4.0/Bacchus-0.4.0-windows-x64.msi) and its [SHA-256 checksum](releases/0.4.0/Bacchus-0.4.0-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.4.0` tag records the source and installer for this release.
+Download the [Bacchus 0.4.1 Windows installer](releases/0.4.1/Bacchus-0.4.1-windows-x64.msi) and its [SHA-256 checksum](releases/0.4.1/Bacchus-0.4.1-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.4.1` tag records the source and installer for this release.
 
 1. Run the MSI, then open **Bacchus** from the Start menu. Bacchus opens its local workspace in your default browser.
 2. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data.
@@ -48,7 +48,9 @@ The offline example starts with an approved visual plan. The local starter plan,
 
 The recording is the timing authority. Import a `timing.json` with its `audio.sha256`, `duration`, and `words` with `text`, `start`, and `end`. For audio-only intake, extract the Parakeet TDT model separately and select the folder containing `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx` and `tokens.txt`. The local recognizer derives individual timestamps from the waveform. Review its draft against the audio before locking it. Older project exports remain downloadable. Resume a project with recording-bound cues by reopening its intake. [Parakeet TDT model instructions](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html#sherpa-onnx-nemo-parakeet-tdt-0-6b-v2-int8-english)
 
-Bacchus keeps original recordings, normalized media, plans, review proofs, decisions, and exports in its data folder. Proofs bind to the artwork version and the scene inputs they show. Changes to the cut invalidate its acceptance. Checks that still show the current inputs can carry forward. The built-in motions apply to the whole scene. The artwork checks use still images.
+Bacchus keeps original recordings, normalized media, plans, review proofs, decisions, and exports in its data folder. Proofs bind to the artwork version and the scene inputs they show. Changes to the cut invalidate its acceptance. Checks that still show the current inputs can carry forward.
+
+**Video encoding** in Settings defaults to **Automatic GPU**. Bacchus tries a real encode with the delivery format. It prefers NVIDIA NVENC where available, can use Intel Quick Sync or AMD AMF on Windows, VAAPI on Linux, and VideoToolbox on macOS. On Windows it can use a compatible FFmpeg on PATH if the app-managed FFmpeg cannot initialize the GPU. It falls back to libx264 if a hardware encoder is unavailable or fails the export checks. Choose **CPU only** to skip hardware tests. Export and its receipt identify the actual encoder and any fallback. Scene composition uses the local Pillow renderer.
 
 ## Reuse artwork
 

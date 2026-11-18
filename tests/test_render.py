@@ -7,11 +7,12 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 import wave
 
 from PIL import Image
 
-from bacchus import render
+from bacchus import render, video_encoding
 
 
 def project():
@@ -87,6 +88,32 @@ class RendererTests(unittest.TestCase):
                 self.assertEqual(frame.size, (1280, 720))
                 colors.add(frame.getpixel((0, 0)))
         self.assertEqual(len(colors), 3)
+
+    @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
+    def test_retries_failed_hardware_export_on_cpu(self):
+        real_encode = render._encode
+        attempted = []
+
+        def encode(source, folder, composition, frames, scratch, encoder, approved_mix):
+            attempted.append(encoder.name)
+            if encoder == video_encoding.NVENC:
+                (scratch / "h264_nvenc.mp4").write_bytes(b"partial")
+                raise render._EncodingFailure("GPU became unavailable")
+            return real_encode(source, folder, composition, frames, scratch, encoder, approved_mix)
+
+        with (
+            TemporaryDirectory(prefix="bacchus-gpu-fallback-") as temporary,
+            patch.object(video_encoding, "choose", return_value=(video_encoding.NVENC, None)),
+            patch.object(render, "_encode", side_effect=encode),
+        ):
+            folder = Path(temporary)
+            path = folder / "video.mp4"
+            media = render.export_video(project(), folder, path)
+            self.assertEqual(path.read_bytes()[4:8], b"ftyp")
+        self.assertEqual(attempted, ["h264_nvenc", "libx264"])
+        self.assertEqual(media["encoder"], "libx264")
+        self.assertFalse(media["hardwareEncoding"])
+        self.assertIn("NVIDIA NVENC", media["encoderFallback"])
 
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_mix_and_mp4_duck_loop_and_place_sound(self):

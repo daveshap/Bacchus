@@ -16,7 +16,7 @@ from threading import Timer
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from . import layer_spec, media_tools, mixing
+from . import layer_spec, media_tools, mixing, video_encoding
 
 WIDTH, HEIGHT, FPS = 1280, 720, 24
 SAMPLE_RATE = mixing.SAMPLE_RATE
@@ -534,9 +534,13 @@ def _video_frames(composition, frame_count):
         yield data
 
 
-def _encode(project, folder, composition, frame_count, scratch, approved_mix=None):
-    output = scratch / "video.mp4"
-    log = scratch / "ffmpeg.log"
+class _EncodingFailure(RenderError):
+    pass
+
+
+def _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix):
+    output = scratch / f"{encoder.name}.mp4"
+    log = scratch / f"{encoder.name}.log"
     duration = frame_count / FPS
     mix = project.get("mix") or {}
     if approved_mix is None and (project.get("audio") or mix.get("musicMode") == "track" or mix.get("effects")):
@@ -546,12 +550,10 @@ def _encode(project, folder, composition, frame_count, scratch, approved_mix=Non
         audio_path = verify_mix(folder, approved_mix, composition.duration)
         audio_options = ["-f", "wav", "-i", str(audio_path), "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
     command = [
-        media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-f", "rawvideo", "-pixel_format", "rgb24",
-        "-video_size", f"{WIDTH}x{HEIGHT}", "-framerate", str(FPS), "-i", "pipe:0",
+        encoder.executable or media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
+        *encoder.input_options, *video_encoding.raw_input(WIDTH, HEIGHT, FPS),
         *audio_options, "-map", "0:v:0",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-c:v", encoder.name, *encoder.options, "-movflags", "+faststart",
         str(output),
     ]
     with log.open("w+b") as errors:
@@ -578,7 +580,7 @@ def _encode(project, folder, composition, frame_count, scratch, approved_mix=Non
         if return_code:
             errors.seek(0)
             detail = errors.read(1200).decode("utf-8", "replace").strip()
-            raise RenderError(f"FFmpeg could not encode the video. {detail or 'The encoder exited.'}")
+            raise _EncodingFailure(f"FFmpeg could not encode the video. {detail or 'The encoder exited.'}")
     return output, bool(audio_options)
 
 
@@ -599,6 +601,7 @@ def _inspect(output, frame_count, has_audio):
         valid = (
             len(video) == 1 and len(audio) == int(has_audio)
             and (video[0]["width"], video[0]["height"], video[0]["codec_name"]) == (WIDTH, HEIGHT, "h264")
+            and video[0].get("pix_fmt") == "yuv420p"
             and video[0]["avg_frame_rate"] == f"{FPS}/1"
             and int(video[0]["nb_frames"]) == frame_count
             and abs(duration - frame_count / FPS) < 0.08
@@ -624,16 +627,34 @@ def _frame_count(duration):
     return math.ceil(duration * FPS)
 
 
-def export_video(project, folder: Path, destination: Path, *, approved_mix=None) -> dict:
+def _encode_verified(project, folder, composition, frame_count, scratch, encoder, approved_mix):
+    output, has_audio = _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix)
+    try:
+        return output, _inspect(output, frame_count, has_audio)
+    except RenderError as error:
+        raise _EncodingFailure(str(error)) from error
+
+
+def export_video(project, folder: Path, destination: Path, *, approved_mix=None, encoder_mode="auto") -> dict:
     if not render_available():
         raise RenderError("Video export needs FFmpeg and FFprobe on PATH.")
     composition = _Composition(project, folder)
     frame_count = _frame_count(composition.duration)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    encoder, fallback = video_encoding.choose(encoder_mode, WIDTH, HEIGHT, FPS)
     with TemporaryDirectory(prefix=".bacchus-render-", dir=destination.parent) as work:
-        output, has_audio = _encode(project, folder, composition, frame_count, Path(work), approved_mix)
-        media = _inspect(output, frame_count, has_audio)
+        args = (project, folder, composition, frame_count, Path(work))
+        try:
+            output, media = _encode_verified(*args, encoder, approved_mix)
+        except _EncodingFailure:
+            if encoder == video_encoding.CPU:
+                raise
+            fallback = f"{encoder.label} failed the export or its output checks. Bacchus retried on the CPU."
+            encoder = video_encoding.CPU
+            output, media = _encode_verified(*args, encoder, approved_mix)
         output.replace(destination)
+    media.update(encoder=encoder.name, hardwareEncoding=encoder != video_encoding.CPU,
+                 encoderMode=encoder_mode, encoderFallback=fallback)
     return media
 
 

@@ -13,6 +13,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from . import ENGINE_VERSION, api_log, audio, gates, local_timing, planning, providers, render, score, timing, visual_review
 from .library import Library, LibraryError
+from .settings import video_encoder_mode
 
 
 MAX_ART_BYTES = 12 * 1024 * 1024
@@ -1495,24 +1496,26 @@ class Studio:
             if not render.render_available():
                 raise WorkflowError("FFmpeg and ffprobe must be installed and on PATH.", 409)
             snapshot = deepcopy(project)
+            encoder_mode = video_encoder_mode()
             project["busy"] = "rendering"
             project["export"] = {"status": "running", "candidateHash": key, "startedAt": now()}
             self._save(project)
             job = threading.Thread(
-                target=self._export, args=(snapshot, folder, key, record),
+                target=self._export, args=(snapshot, folder, key, record, encoder_mode),
                 name=f"render-{project_id[:8]}",
             )
             self.jobs.add(job)
             job.start()
             return self._view(project)
 
-    def _export(self, snapshot, folder, key, record):
+    def _export(self, snapshot, folder, key, record, encoder_mode):
         output_dir = folder / "exports"
         temporary = output_dir / f".{uuid.uuid4().hex}.mp4"
         result = {}
         try:
             output_dir.mkdir(exist_ok=True)
-            details = render.export_video(snapshot, folder, temporary, approved_mix=record["mix"]["rendered"])
+            details = render.export_video(snapshot, folder, temporary,
+                                          approved_mix=record["mix"]["rendered"], encoder_mode=encoder_mode)
             self._apply_library_issues(snapshot)
             if candidate(snapshot, folder) != record:
                 raise WorkflowError("An input changed while the candidate was rendering.", 409)

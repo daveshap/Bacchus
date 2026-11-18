@@ -36,8 +36,8 @@ def configure(root):
     _managed = root / "tools" / WINDOWS_BUILD if sys.platform == "win32" else None
 
 
-def path(name):
-    if _managed and all((_managed / f"{tool}.exe").is_file() for tool in TOOLS):
+def path(name, *, managed=True):
+    if managed and _managed and all((_managed / f"{tool}.exe").is_file() for tool in TOOLS):
         return str(_managed / f"{name}.exe")
     found = shutil.which(name)
     if not found and sys.platform == "darwin":

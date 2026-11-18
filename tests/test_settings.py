@@ -91,6 +91,15 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse((self.root / "settings.json").exists())
         self.assertFalse(setup.get()["completed"])
 
+    def test_automatic_video_encoding_defaults_and_cpu_choice_persists(self):
+        setup = settings.Settings(self.root)
+        self.assertEqual(setup.get()["videoEncoder"], "auto")
+        with self.assertRaises(settings.SettingsError):
+            setup.save({"videoEncoder": "h264_nvenc"})
+        self.assertEqual(setup.save({"videoEncoder": "cpu"})["videoEncoder"], "cpu")
+        self.assertEqual(settings.Settings(self.root).get()["videoEncoder"], "cpu")
+        self.assertEqual(settings.video_encoder_mode(), "cpu")
+
     def test_api_log_directory_defaults_and_persists_without_keys(self):
         directory = self.root / "audit"
         setup = settings.Settings(self.root)
