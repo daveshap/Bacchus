@@ -1,28 +1,23 @@
-import argparse
+"""Loopback HTTP interface for the desktop workspace."""
+
 import json
 import math
 import re
-import sys
 import threading
-import traceback
 import uuid
-import webbrowser
-from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import audio, media_tools, planning, providers, render
+from . import RESOURCES, audio, media_tools, planning, providers, render
 from .library import LibraryError
-from .runtime import APP_VERSION, default_data_directory, open_running
-from .settings import Settings, SettingsError
+from .runtime import APP_VERSION
+from .settings import SettingsError
 from .workflow import (
     MAX_ART_BYTES, MAX_ART_GENERATIONS, MAX_AUDIO_BYTES, MAX_DURATION, MAX_EFFECTS,
-    MAX_FX_BYTES, MAX_FX_DURATION, MAX_TRANSCRIPTIONS, PACK_PIN, STYLES, Studio, WorkflowError, fields, write_json,
+    MAX_FX_BYTES, MAX_FX_DURATION, MAX_TRANSCRIPTIONS, PACK_PIN, STYLES, WorkflowError, fields,
 )
 
 
-ROOT = Path(__file__).resolve().parent.parent
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
@@ -86,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
         studio = self.server.studio
         if path in STATIC_FILES:
             filename, mime = STATIC_FILES[path]
-            self._bytes((ROOT / "static" / filename).read_bytes(), mime)
+            self._bytes((RESOURCES / "ui" / filename).read_bytes(), mime)
             return
         if path == "/api/config":
             self._json({
@@ -100,7 +95,7 @@ class Handler(BaseHTTPRequestHandler):
                 "styles": [{"id": style, "name": label} for style, label in STYLES.items()],
                 "maxEffects": MAX_EFFECTS, "maxFxDuration": MAX_FX_DURATION,
                 "maxArtGenerations": MAX_ART_GENERATIONS, "maxTranscriptionCalls": MAX_TRANSCRIPTIONS,
-                "desktopMode": self.server.desktop, "version": APP_VERSION,
+                "version": APP_VERSION,
             })
             return
         if path == "/api/instance":
@@ -152,8 +147,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/media-tools/install":
             fields(self._body(), ())
-            if not self.server.desktop:
-                raise WorkflowError("Automatic media setup is available in the desktop release.", 409)
             try:
                 media_tools.install()
             except media_tools.MediaToolsError as error:
@@ -208,18 +201,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(studio.change(project_id, "/".join(tail), self._body()))
 
     def _settings_view(self, settings):
+        render_available = render.render_available()
         return {
             **settings,
             "dataPath": str(self.server.studio.root),
             "libraryPath": str(self.server.studio.library.root),
             "audioAvailable": audio.audio_available(),
-            "renderAvailable": render.render_available(),
-            "mediaInstallAvailable": self.server.desktop and media_tools.can_install() and not render.render_available(),
+            "renderAvailable": render_available,
+            "mediaInstallAvailable": media_tools.can_install() and not render_available,
         }
 
     def _quit(self):
-        if not self.server.desktop:
-            raise WorkflowError("Close Bacchus from the terminal that started it.", 409)
         studio = self.server.studio
         with studio.lock:
             if studio.jobs or studio.providers_in_use() or media_tools.INSTALL_LOCK.locked():
@@ -317,93 +309,10 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
 
-@contextmanager
-def data_lock(root):
-    root.mkdir(parents=True, exist_ok=True)
-    with (root / ".instance.lock").open("a+b") as file:
-        file.seek(0)
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            raise AlreadyRunning(f"Another Bacchus process already uses {root}.") from error
-        yield
-
-
-class AlreadyRunning(Exception):
-    pass
-
-
-@contextmanager
-def desktop_log(data, enabled):
-    if not enabled:
-        yield
-        return
-    data.mkdir(parents=True, exist_ok=True)
-    previous = sys.stdout, sys.stderr
-    path = data / "bacchus.log"
-    mode = "w" if path.is_file() and path.stat().st_size >= 1024 * 1024 else "a"
-    with path.open(mode, encoding="utf-8", buffering=1) as log:
-        sys.stdout = sys.stdout or log
-        sys.stderr = sys.stderr or log
-        try:
-            yield
-        except Exception:
-            traceback.print_exc(file=log)
-            raise
-        finally:
-            sys.stdout, sys.stderr = previous
-
-
-def _serve(options, data, desktop):
-    with data_lock(data), desktop_log(data, desktop):
-        media_tools.configure(data)
-        with ThreadingHTTPServer(("127.0.0.1", options.port), Handler) as server:
-            library = options.library.expanduser() if options.library is not None else None
-            server.studio = Studio(data, library)
-            server.settings = Settings(data)
-            server.desktop = desktop
-            server.closing = False
-            server.instance_id = uuid.uuid4().hex
-            url = f"http://127.0.0.1:{server.server_port}"
-            runtime = data / "runtime.json"
-            write_json(runtime, {"url": url, "instance": server.instance_id})
-            print(f"Bacchus {APP_VERSION} is running at {url}", flush=True)
-            if not options.no_browser:
-                browser = threading.Timer(0.3, webbrowser.open, args=(url,))
-                browser.daemon = True
-                browser.start()
-            try:
-                server.serve_forever()
-            except KeyboardInterrupt:
-                print("\nClosing Bacchus.", flush=True)
-            finally:
-                runtime.unlink(missing_ok=True)
-            for job in tuple(server.studio.jobs):
-                job.join()
-
-
-def main(desktop=False):
-    parser = argparse.ArgumentParser(description="Run the local Bacchus animation studio.")
-    parser.add_argument("--port", type=int, default=0 if desktop else 8755)
-    parser.add_argument("--data", type=Path, default=default_data_directory(),
-                        help="Choose where Bacchus stores videos, settings, and its default library.")
-    parser.add_argument("--library", type=Path, help="Set a separate directory for shared versioned artwork.")
-    parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--version", action="version", version=APP_VERSION)
-    options = parser.parse_args()
-    data = options.data.expanduser().resolve()
-    try:
-        _serve(options, data, desktop)
-    except AlreadyRunning as error:
-        if desktop and not options.no_browser and open_running(data):
-            return
-        raise SystemExit(str(error)) from error
-
-
-if __name__ == "__main__":
-    main()
+class StudioServer(ThreadingHTTPServer):
+    def __init__(self, port, studio, settings):
+        self.studio = studio
+        self.settings = settings
+        self.closing = False
+        self.instance_id = uuid.uuid4().hex
+        super().__init__(("127.0.0.1", port), Handler)

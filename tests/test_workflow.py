@@ -153,6 +153,26 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertEqual(self.project["input"]["timing"], "estimated")
         self.assertFalse(self.project["accepted"])
 
+    def test_saved_text_first_project_reopens_under_current_intake_rules(self):
+        sample = self.studio.create("An early cut", demo=True)
+        identifier = sample["id"]
+        path = self.studio.root / identifier / "project.json"
+        previous = json.loads(path.read_bytes())
+        previous.pop("mix")
+        previous["legacy"] = True
+        path.write_text(json.dumps(previous), encoding="utf-8")
+
+        opened = self.studio.get(identifier)
+        self.assertEqual(opened["input"], sample["input"])
+        self.assertTrue(opened["plan"]["approved"])
+        self.assertTrue(opened["requiresAudio"])
+        self.assertTrue(self.studio.preview(identifier, 1).startswith(b"\x89PNG"))
+        unlocked = self.studio.change(identifier, "input/unlock", {"revision": opened["revision"]})
+        with self.assertRaisesRegex(WorkflowError, "Import the narration recording"):
+            self.studio.change(identifier, "input", {
+                "revision": unlocked["revision"], "script": SCRIPT, "intention": "",
+            })
+
     def test_gate_order_and_plan_invalidation(self):
         with self.assertRaisesRegex(WorkflowError, "Lock the narration"):
             self.change("plan", scenes=two_scenes())

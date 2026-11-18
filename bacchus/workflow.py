@@ -390,11 +390,12 @@ class Studio:
         try:
             project = json.loads((self._folder(project_id) / "project.json").read_bytes())
             if "mix" not in project:
-                # Existing text-first projects keep their media and scene plans.
-                project.update(style="warm-editorial", mix=new_mix("none"), demo=False, legacy=True,
+                # Backfill the current format for saved early projects.
+                project.update(style="warm-editorial", mix=new_mix("none"), demo=False,
                                transcript=None, transcriptionRuns=[], artRuns=[])
                 if not project["busy"]:
                     reset_candidate(project)
+            project.pop("legacy", None)
             return project
         except FileNotFoundError as error:
             raise WorkflowError("Project not found.", 404) from error
@@ -439,7 +440,7 @@ class Studio:
         view["transcriptionLastRun"] = transcription_runs[-1] if transcription_runs else None
         art_runs = view.pop("artRuns")
         view["artGenerations"] = len(art_runs)
-        view["requiresAudio"] = not (project["demo"] or project.get("legacy"))
+        view["requiresAudio"] = not project["demo"]
         view.pop("approvals")
         if view["export"] and view["export"]["status"] == "complete":
             output = view["export"]
@@ -549,7 +550,7 @@ class Studio:
             if action == "input":
                 if project["input"]:
                     raise WorkflowError("Unlock the narration before replacing it.", 409)
-                if not project["audio"] and not (project["demo"] or project.get("legacy")):
+                if not project["audio"] and not project["demo"]:
                     raise WorkflowError("Import the narration recording before locking intake.", 409)
                 style = data.get("style", project["style"])
                 if not isinstance(style, str) or style not in STYLES:

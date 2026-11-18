@@ -22,8 +22,7 @@ def notices(package, destination):
 
 
 data = [
-    (str(project / "static"), "static"),
-    (str(project / "packs" / "editorial"), "packs/editorial"),
+    (str(project / "bacchus" / "resources"), "bacchus/resources"),
     (str(project / "LICENSE"), "licenses/Bacchus"),
 ]
 data.extend(notices("Pillow", "Pillow"))
@@ -36,7 +35,7 @@ for directory in (Path(sys.base_prefix), stdlib, stdlib.parent):
         break
 
 analysis = Analysis(
-    [str(packaging / "launch.py")],
+    [str(project / "bacchus" / "__main__.py")],
     pathex=[str(project)],
     datas=data,
 )

@@ -86,19 +86,18 @@ def can_install():
 
 
 def process_options():
-    if not getattr(sys, "frozen", False):
-        return {}
     env = os.environ.copy()
     for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
         env.pop(key, None)
     if sys.platform == "win32":
         return {"env": env, "creationflags": subprocess.CREATE_NO_WINDOW}
-    for key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
-        original = env.pop(f"{key}_ORIG", None)
-        if original is None:
-            env.pop(key, None)
-        else:
-            env[key] = original
+    if getattr(sys, "frozen", False):
+        for key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+            original = env.pop(f"{key}_ORIG", None)
+            if original is None:
+                env.pop(key, None)
+            else:
+                env[key] = original
     return {"env": env}
 
 

@@ -2,25 +2,21 @@
 
 Bacchus turns recorded narration and a creative brief into a reviewed MP4. AI can transcribe the recording, plan the whole cut, and design or generate artwork. The local studio validates scene coverage, tracks approvals, mixes sound, and renders the approved candidate.
 
-## Install Bacchus
+## Install Bacchus on Windows x64
 
-The [Bacchus 0.3.0 Windows preview](releases/0.3.0/) contains the installer and its SHA-256 checksum. The `v0.3.0` tag records the corresponding source and installer.
+Download the [Bacchus 0.3.1 Windows installer](releases/0.3.1/Bacchus-0.3.1-windows-x64.msi) and its [SHA-256 checksum](releases/0.3.1/Bacchus-0.3.1-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.3.1` tag records the source and installer for this release.
 
-**Windows x64.** Run the Bacchus MSI and open **Bacchus** from the Start menu. Bacchus opens its local workspace in your browser. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data. Select **Quit Bacchus** in the sidebar to stop the local app.
+1. Run the MSI, then open **Bacchus** from the Start menu. Bacchus opens its local workspace in your default browser.
+2. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data.
+3. To close the app, select **Quit Bacchus** in the sidebar. Quit Bacchus before running a newer installer or uninstalling it from **Settings → Apps** in Windows.
 
-The installer includes Python and the app's dependencies. You can use Bacchus offline once its media tools are available. Provider keys are optional for manual workflows.
+Manual workflows work offline once the media tools are available. Add provider keys in Bacchus **Settings** to use AI features.
 
 ## Storage
 
-Bacchus keeps its runtime data separate from the installed app and from folders you import media from. **Settings** shows both the active storage folder and the art library folder.
+Bacchus stores projects, settings and the default art library in `%LOCALAPPDATA%\Bacchus` on Windows. **Settings** shows the active data and art library locations. The Windows installer manages the application files separately.
 
-| Platform | Default data folder |
-| --- | --- |
-| Windows | `%LOCALAPPDATA%\Bacchus` |
-| macOS | `~/Library/Application Support/Bacchus` |
-| Linux | `$XDG_DATA_HOME/bacchus`, or `~/.local/share/bacchus` |
-
-Use the launcher's `--data <folder>` option to keep Bacchus data in another location, such as an external drive. Early development builds stored state in a checkout's `projects/` folder. To bring that state forward, close Bacchus and copy the contents of that folder into an empty Bacchus data folder, then launch against that location.
+To back up Bacchus, quit the app, then copy its data folder and any separately configured art library. To restore a Bacchus 0.3.0 backup, copy its contents into an empty data folder with Bacchus closed. The application supports `--data <folder>` for a different storage location, such as an external drive.
 
 ## Configure AI
 
@@ -38,7 +34,7 @@ Keys entered in the GUI last until the Bacchus process exits. Nonsecret settings
 4. Choose a built-in score with transition accents, import music and place effects, or select no music. Listen to the same mix used in the final video, then approve it.
 5. Review the cut, run checks, and accept the candidate. Press **Render video** to download the H.264 MP4, SRT captions, and a render receipt.
 
-The offline example starts with an approved visual plan. For your own recording, manual transcript, the local starter plan, image import, and built-in soundtracks also work offline. The app supports recordings up to 30 minutes and three visual treatments over the same title, editorial, and illustration layouts. Export is 720p at 24 fps. OpenAI file transcription and manually entered transcript text use estimated timing. Import a legacy `timing.json` with matching `audio.sha256`, `duration`, and `words` to use source-linked cues. Editing the imported transcript text switches it to estimated timing.
+The offline example starts with an approved visual plan. For your own recording, manual transcript entry, the local starter plan, image import and built-in soundtracks also work offline. The app supports recordings up to 30 minutes and three visual treatments over the same title, editorial, and illustration layouts. Export is 720p at 24 fps. OpenAI file transcription and manually entered transcript text use estimated timing. Import a `timing.json` with matching `audio.sha256`, `duration`, and `words` to use source-linked cues. Editing the imported transcript text switches it to estimated timing.
 
 Bacchus keeps the original uploaded recording, normalized media, plans, approvals, request metadata, and exports in its data folder. Editing a plan, referenced asset, or sound mix requires fresh approval of the resulting candidate. Earlier completed MP4s and receipts remain on disk.
 
@@ -50,10 +46,18 @@ The planner receives a shortlist of up to 20 library images matched to the brief
 
 By default the art library lives in `library/` inside the Bacchus data folder. The launcher's `--library <folder>` option can point to a separate storage or backup location. Keep `entries/` and `blobs/` together. The library's JSON files store version histories, and the blobs are PNGs named by their content hash. A separate Git checkout can track those two directories and ignore `.library.lock` and temporary `.tmp` files.
 
-## Development
+## Build and test
 
-Use Python 3.11 or newer. Create and activate a virtual environment, install `requirements.txt`, and start the source checkout with `python -m bacchus`. The source server opens [Bacchus](http://127.0.0.1:8755/) and runs until you close it from the terminal.
+The app entry point, interface, and planner resources are in `bacchus/`. Installer, bundle, and release verification tools are in `packaging/`. Exact release installers and checksums live in `releases/`.
 
-Use a full FFmpeg build with H.264 (`libx264`), AAC and PCM encoding, and the `sidechaincompress` and `alimiter` filters. Run `python -m unittest discover -s tests -v`. A separate native release workflow builds installers and bundles. The app ships under the [MIT License](LICENSE). [FFmpeg download and license information](https://ffmpeg.org/download.html)
+Build on the target platform with Python 3.11 or newer and a virtual environment. Media tests use a full FFmpeg build with H.264 (`libx264`), AAC and PCM encoding, and the `sidechaincompress` and `alimiter` filters. [FFmpeg download and license information](https://ffmpeg.org/download.html)
 
-See the [public harness research](docs/harness-research.md) and the [source workflow audit](docs/source-workflows.md) for the design evidence and production gaps.
+```text
+python -m pip install -r requirements.txt -r packaging/requirements.txt
+python -m unittest discover -s tests -v
+python packaging/build.py
+```
+
+On Windows, test the built application and its video export with `python packaging/smoke_bundle.py dist/Bacchus/Bacchus.exe --render`.
+
+The [native release workflow](.github/workflows/release.yml) defines Windows installer and macOS and Linux bundle builds, including packaged application smoke tests. The app ships under the [MIT License](LICENSE). See the [harness research](docs/harness-research.md) and [source workflow audit](docs/source-workflows.md) for design context.

@@ -1,5 +1,5 @@
-from .server import main
+from bacchus.desktop import run
 
 
 if __name__ == "__main__":
-    main()
+    run()

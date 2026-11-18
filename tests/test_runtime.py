@@ -9,6 +9,14 @@ from bacchus import media_tools, runtime
 
 
 class RuntimeTests(TestCase):
+    def test_child_processes_do_not_receive_provider_keys(self):
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-one", "ANTHROPIC_API_KEY": "test-two"}):
+            with mock.patch.object(media_tools.sys, "frozen", False, create=True):
+                child_env = media_tools.process_options()["env"]
+            self.assertNotIn("OPENAI_API_KEY", child_env)
+            self.assertNotIn("ANTHROPIC_API_KEY", child_env)
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "test-one")
+
     def test_platform_defaults_use_user_data(self):
         with TemporaryDirectory() as location:
             root = Path(location)

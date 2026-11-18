@@ -3,11 +3,15 @@
 import argparse
 import json
 from pathlib import Path
+from runpy import run_path
 import subprocess
 from tempfile import TemporaryDirectory
 import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+
+APP_VERSION = run_path(str(Path(__file__).resolve().parents[1] / "bacchus" / "runtime.py"))["APP_VERSION"]
 
 
 def request(url, path, data=None):
@@ -65,7 +69,9 @@ def main():
         try:
             url = endpoint(root, process)
             config = json.loads(request(url, "/api/config"))
-            if not config["desktopMode"] or not config["pack"]["version"] or b"Bacchus" not in request(url, "/"):
+            if config.get("version") != APP_VERSION:
+                raise RuntimeError(f"Expected Bacchus {APP_VERSION}, received {config.get('version')!r}.")
+            if not config["pack"]["version"] or b"Bacchus" not in request(url, "/"):
                 raise RuntimeError("The bundle failed to load its local pack or interface.")
             for asset in ("/static/app.js", "/static/styles.css"):
                 if not request(url, asset):

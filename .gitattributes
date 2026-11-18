@@ -1,1 +1,2 @@
 *.msi binary
+bacchus/resources/packs/** text eol=lf

@@ -197,7 +197,7 @@ function render() {
   const style = state.config?.styles?.find(option => option.id === project?.style);
   packName.textContent = state.config?.pack ? `${style?.name ?? state.config.pack.name} · v${state.config.pack.version}` : "";
   packName.hidden = Boolean(toolName) || !packName.textContent;
-  quitButton.hidden = state.config?.desktopMode !== true;
+  quitButton.disabled = !state.config;
   studioNavigation.querySelectorAll("[data-view]").forEach(control => {
     control.disabled = !state.config;
     if (control.dataset.view === state.view) control.setAttribute("aria-current", "page");
@@ -247,6 +247,13 @@ function goTo(stage, label) {
 
 function prerequisite(title, description, stage, label) {
   return `${heading(title)}<section class="panel slim"><p class="muted">${description}</p>${goTo(stage, label)}</section>`;
+}
+
+function mediaSettingsNotice(detail) {
+  return `<div class="notice actions">
+    <p>${detail}</p>
+    <button class="button quiet" type="button" data-view="settings">Open Settings</button>
+  </div>`;
 }
 
 function readiness(label, available, waitingLabel, readyLabel = "Ready") {
@@ -565,7 +572,7 @@ function intakeView(project) {
               ${audio ? button("Remove recording", "remove-audio", { style: "quiet danger", disabled: busy }) : ""}
             </div>
           </form>
-          ${state.config.audioAvailable === false ? '<p class="notice actions">FFmpeg and ffprobe are required to import a recording.</p>' : ""}`}
+          ${state.config.audioAvailable === false ? mediaSettingsNotice("Set up the media tools to import a recording.") : ""}`}
       </section>
       ${hasSource ? `<section class="panel">
         <div class="panel-header">
@@ -1035,7 +1042,7 @@ function exportView(project) {
       </dl>
       ${running ? '<p class="hint actions" role="status">Rendering the accepted candidate…</p>' : ""}
       ${status === "failed" ? `<p class="notice error actions">${escapeHtml(output.error || "The render failed.")}</p>` : ""}
-      ${!state.config.renderAvailable ? '<p class="notice actions">FFmpeg is required on this computer to export video.</p>' : ""}
+      ${!state.config.renderAvailable ? mediaSettingsNotice("Set up the media tools to export a video.") : ""}
       ${status === "complete" ? `<div class="actions cluster">
         ${exportLink(output.url, "Download MP4", true)}
         ${exportLink(output.captionsUrl, "Download captions")}
@@ -1223,8 +1230,8 @@ function beginRequest(busy) {
 }
 
 async function quitBacchus() {
-  if (state.closed || state.pending || state.config?.desktopMode !== true) return;
-  if (!window.confirm("Quit Bacchus? You can close this browser tab after it shuts down.")) return;
+  if (state.closed || state.pending || !state.config) return;
+  if (!window.confirm("Quit Bacchus?")) return;
   const finish = beginRequest("Quitting Bacchus…");
   try {
     const response = await fetch("/api/quit", {
@@ -1255,7 +1262,7 @@ async function quitBacchus() {
   packName.hidden = true;
   setConnection("closed");
   setMessage();
-  content.innerHTML = heading("Bacchus has quit", "You can close this browser tab.");
+  content.innerHTML = heading("Bacchus has quit", "You can close this window.");
   content.focus();
 }
 
@@ -1770,7 +1777,7 @@ async function initialize() {
     render();
   } catch (error) {
     setConnection("offline");
-    content.innerHTML = heading("Studio unavailable", "Reload this page after the local Bacchus server starts.");
+    content.innerHTML = heading("Studio unavailable", "Open Bacchus again to reconnect.");
     setMessage(error.message, "error");
   } finally {
     picker.disabled = !state.config;

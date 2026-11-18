@@ -1,12 +1,11 @@
 import hashlib
 import json
-from pathlib import Path
-
+from . import RESOURCES
 from .providers import ProviderError, openai_json, post_json
 from .settings import DEFAULT_OPENAI_MODEL, provider_value
 
 
-PACK_FOLDER = Path(__file__).resolve().parent.parent / "packs" / "editorial"
+PACK_FOLDER = RESOURCES / "packs" / "editorial"
 PACK_BYTES = (PACK_FOLDER / "pack.json").read_bytes()
 PACK = json.loads(PACK_BYTES)
 PROMPT_BYTES = (PACK_FOLDER / "plan.md").read_bytes()
