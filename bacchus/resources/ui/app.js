@@ -12,10 +12,15 @@ const stages = [
 const audioFormats = ".mp3,.flac,.wav,audio/mpeg,audio/flac,audio/wav,audio/x-flac,audio/x-wav";
 const newStyleOption = "__new_style__";
 const maxStyleArchiveBytes = 512 * 1024 * 1024;
+const connectedProbeInterval = 3000;
+const disconnectedProbeInterval = 10000;
 
 const state = {
   config: null,
   closed: false,
+  connection: "connecting",
+  connectionPoll: null,
+  checkingConnection: false,
   view: "project",
   settings: null,
   library: null,
@@ -60,6 +65,7 @@ const state = {
 
 const content = document.querySelector("#stage-content");
 const message = document.querySelector("#message");
+const connectionStatus = document.querySelector("#connection-status");
 const picker = document.querySelector("#projects");
 const navigation = document.querySelector("#stages");
 const studioNavigation = document.querySelector("#studio-nav");
@@ -85,7 +91,14 @@ function projectPath(suffix = "", project = state.project) {
 }
 
 async function apiResponse(path, options) {
-  const response = await fetch(path, { cache: "no-store", ...options });
+  let response;
+  try {
+    response = await fetch(path, { cache: "no-store", ...options });
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    if (state.connection === "online") probeConnection();
+    throw new Error("Bacchus could not reach the local studio. Reopen Bacchus if it has stopped.");
+  }
   if (!response.ok) {
     const data = await response.json().catch(() => null);
     const error = new Error(data?.error || `The studio returned HTTP ${response.status}.`);
@@ -130,9 +143,55 @@ function setMessage(text = "", type = "") {
 }
 
 function setConnection(status) {
-  const labels = { online: "Local studio connected", offline: "Studio unavailable", closed: "Studio closed" };
+  if (state.connection === status) return;
+  const labels = {
+    online: "Local studio connected",
+    offline: state.config ? "Local studio disconnected" : "Studio unavailable",
+    closed: "Studio closed",
+  };
+  state.connection = status;
   document.querySelector(".sidebar").dataset.connection = status;
-  document.querySelector("#connection-status").textContent = labels[status];
+  connectionStatus.textContent = labels[status];
+}
+
+function scheduleConnectionProbe() {
+  clearTimeout(state.connectionPoll);
+  if (state.closed) return;
+  const interval = state.connection === "offline" || document.hidden ? disconnectedProbeInterval : connectedProbeInterval;
+  state.connectionPoll = setTimeout(probeConnection, interval);
+}
+
+async function probeConnection() {
+  if (state.closed || state.checkingConnection) return;
+  clearTimeout(state.connectionPoll);
+  state.checkingConnection = true;
+  let connected = false;
+  try {
+    const response = await fetch("/api/instance", { cache: "no-store", signal: AbortSignal.timeout(2000) });
+    if (response.ok) {
+      const { instance } = await response.json();
+      connected = typeof instance === "string" && instance.length > 0;
+    }
+  } catch {
+    // The loopback app may have quit, restarted, or become temporarily unresponsive.
+  }
+  try {
+    if (state.closed) return;
+    if (!connected) {
+      setConnection("offline");
+      clearTimeout(state.poll);
+      clearTimeout(state.timingModelPoll);
+    } else if (!state.config) {
+      await initialize();
+    } else if (state.connection !== "online") {
+      setConnection("online");
+      schedulePoll();
+      scheduleTimingModelPoll();
+    }
+  } finally {
+    state.checkingConnection = false;
+    scheduleConnectionProbe();
+  }
 }
 
 function openStage(stage, focus = true) {
@@ -1885,18 +1944,36 @@ function reviewView(project) {
     </div>`;
 }
 
-function exportLink(url, label, primary = false) {
+function videoFilename(title) {
+  let stem = String(title ?? "").replace(/[<>:"/\\|?*\u0000-\u001f\u007f-\u009f]+/gu, " ")
+    .replace(/ {2,}/gu, " ").trim().replace(/[. ]+$/u, "").replace(/\.mp4$/iu, "").replace(/[. ]+$/u, "");
+  if (!stem) stem = "Bacchus video";
+  const firstPart = stem.split(".", 1)[0].trimEnd();
+  if (/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$|conout\$)$/iu.test(firstPart)) stem = `_${stem}`;
+  const utf8 = new TextEncoder();
+  let bytes = 0;
+  let length = 0;
+  for (const character of stem) {
+    bytes += utf8.encode(character).length;
+    if (bytes > 255 - ".mp4".length) break;
+    length += character.length;
+  }
+  return `${stem.slice(0, length).replace(/[. ]+$/u, "")}.mp4`;
+}
+
+function exportLink(url, label, { primary = false, filename } = {}) {
   const href = localMedia(url);
-  return href ? `<a class="button${primary ? " primary" : ""}" href="${href}" download>${label}</a>` : "";
+  const download = filename ? `download="${escapeHtml(filename)}"` : "download";
+  return href ? `<a class="button${primary ? " primary" : ""}" href="${href}" ${download}>${label}</a>` : "";
 }
 
 function encoderPreference(mode) {
   return mode === "cpu" ? "CPU only" : "Automatic GPU (CPU fallback)";
 }
 
-function deliveryDownloads(delivery) {
+function deliveryDownloads(delivery, title) {
   return `<div class="actions cluster">
-    ${exportLink(delivery.url, "Download MP4", true)}
+    ${exportLink(delivery.url, "Download MP4", { primary: true, filename: videoFilename(title) })}
     ${exportLink(delivery.captionsUrl, "Download captions")}
     ${exportLink(delivery.receiptUrl, "Download receipt")}
   </div>`;
@@ -1911,7 +1988,7 @@ function deliveryNotices(delivery) {
     ${warnings.length ? `<ul class="notice read-list actions">${warnings.map(warning => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}`;
 }
 
-function previousDelivery(delivery) {
+function previousDelivery(delivery, title) {
   if (delivery?.status !== "complete" || delivery.verification !== "verified") return "";
   return `<section class="panel slim">
     <div class="panel-header"><h2>Previous delivery</h2>${badge("Verified", "good")}</div>
@@ -1921,14 +1998,14 @@ function previousDelivery(delivery) {
       ${delivery.media?.encoder ? `<dt>Video encoder</dt><dd><code>${escapeHtml(delivery.media.encoder)}</code></dd>` : ""}
     </dl>
     ${deliveryNotices(delivery)}
-    ${deliveryDownloads(delivery)}
+    ${deliveryDownloads(delivery, title)}
   </section>`;
 }
 
 function exportView(project) {
   if (!project.accepted) return `<div class="stack">
     ${prerequisite("Export", "Run QC and accept the candidate before exporting a video.", "review", "Open preview & QC")}
-    ${previousDelivery(project.lastDelivery)}
+    ${previousDelivery(project.lastDelivery, project.title)}
   </div>`;
   const output = project.export;
   const status = output?.status;
@@ -1962,7 +2039,7 @@ function exportView(project) {
       ${status === "failed" ? `<p class="notice error actions">${escapeHtml(output.error || "The render failed.")}</p>` : ""}
       ${invalid ? `<p class="notice error actions">${escapeHtml(output.integrityError || "Bacchus could not verify the delivery files.")}</p>` : ""}
       ${!state.config.renderAvailable ? mediaSettingsNotice("Set up the media tools to export a video.") : ""}
-      ${complete ? deliveryDownloads(output) : ""}
+      ${complete ? deliveryDownloads(output, project.title) : ""}
       ${running ? "" : `<div class="actions stack">
         <p class="hint">Next render uses ${encoderPreference(mode)}.${differentMode ? " The encoding setting changed after this delivery." : ""}${complete ? " Rerendering uses the accepted candidate and its existing approvals." : ""}</p>
         <div class="cluster">${button(complete ? "Rerender video" : invalid ? "Render a fresh copy" : status === "failed" ? "Retry export" : "Render video", complete ? "rerender-export" : "export", {
@@ -1972,7 +2049,7 @@ function exportView(project) {
       ${complete ? button("Check delivery files", "check-delivery-files", { style: "quiet" }) : ""}
       <button class="button quiet" type="button" data-view="settings">Encoding settings</button></div></div>`}
     </section>
-    ${previousDelivery(prior)}</div>`;
+    ${previousDelivery(prior, project.title)}</div>`;
 }
 
 function attachPreview(project) {
@@ -2125,13 +2202,13 @@ function attachPreview(project) {
 
 function schedulePoll() {
   clearTimeout(state.poll);
-  if (state.closed) return;
+  if (state.closed || state.connection === "offline") return;
   if (!state.project?.busy && state.project?.export?.status !== "running") return;
   const id = state.project.id;
   state.poll = setTimeout(async () => {
     try {
       const current = await api(`/api/projects/${encodeURIComponent(id)}`);
-      if (state.closed || state.project?.id !== id) return;
+      if (state.closed || state.connection === "offline" || state.project?.id !== id) return;
       if (state.pending) {
         schedulePoll();
         return;
@@ -2147,7 +2224,9 @@ function schedulePoll() {
 
 function scheduleTimingModelPoll() {
   clearTimeout(state.timingModelPoll);
-  if (!state.closed && timingModelIsWorking()) state.timingModelPoll = setTimeout(refreshTimingModel, 850);
+  if (!state.closed && state.connection !== "offline" && timingModelIsWorking()) {
+    state.timingModelPoll = setTimeout(refreshTimingModel, 850);
+  }
 }
 
 async function refreshTimingModel() {
@@ -2211,15 +2290,11 @@ async function quitBacchus() {
   if (!window.confirm("Quit Bacchus?")) return;
   const finish = beginRequest("Quitting Bacchus…");
   try {
-    const response = await fetch("/api/quit", {
+    await apiResponse("/api/quit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
-    if (!response.ok) {
-      const data = await response.json().catch(() => null);
-      throw new Error(data?.error || "Bacchus could not quit. Please try again.");
-    }
     state.closed = true;
   } catch (error) {
     setMessage(error.message, "error");
@@ -2229,6 +2304,7 @@ async function quitBacchus() {
   if (!state.closed) return;
   clearTimeout(state.poll);
   clearTimeout(state.timingModelPoll);
+  clearTimeout(state.connectionPoll);
   state.stopPreview?.();
   content.querySelectorAll("audio").forEach(audio => audio.pause());
   picker.disabled = true;
@@ -3341,4 +3417,8 @@ async function initialize() {
   }
 }
 
-initialize();
+connectionStatus.setAttribute("role", "status");
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.connection !== "connecting") probeConnection();
+});
+initialize().finally(scheduleConnectionProbe);

@@ -4,6 +4,8 @@ from functools import lru_cache
 import hashlib
 import json
 import re
+import shutil
+import stat
 
 
 FILES = {
@@ -13,6 +15,9 @@ FILES = {
 }
 LABELS = {"video": "MP4", "captions": "captions", "receipt": "receipt"}
 SHA256 = re.compile(r"[0-9a-f]{64}")
+STAGING_PREFIX = ".bacchus-delivery-"
+# Match only directories named by tempfile.TemporaryDirectory.
+_STAGING_NAME = re.compile(re.escape(STAGING_PREFIX) + r"[a-z0-9_]{8}")
 
 
 class DeliveryError(ValueError):
@@ -21,6 +26,60 @@ class DeliveryError(ValueError):
 
 def bundle_paths(directory):
     return {kind: directory / (kind + suffix) for kind, (suffix, _) in FILES.items()}
+
+
+def _plain_stat(path):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return None
+    return info
+
+
+def _ordinary_tree(root, device):
+    pending = [root]
+    while pending:
+        path = pending.pop()
+        info = _plain_stat(path)
+        if info is None or info.st_dev != device:
+            return False
+        if stat.S_ISDIR(info.st_mode):
+            pending.extend(path.iterdir())
+        elif not stat.S_ISREG(info.st_mode):
+            return False
+    return True
+
+
+def remove_abandoned_staging(data_root, folder):
+    """Discard interrupted render scratch while startup owns the data instance lock."""
+    exports = folder / "exports"
+    try:
+        if folder.parent != data_root or folder.resolve(strict=True) != folder or exports.resolve(strict=True) != exports:
+            return
+        project_info = _plain_stat(folder / "project.json")
+        folder_info = _plain_stat(folder)
+        exports_info = _plain_stat(exports)
+        if (project_info is None or not stat.S_ISREG(project_info.st_mode)
+                or folder_info is None or not stat.S_ISDIR(folder_info.st_mode)
+                or exports_info is None or not stat.S_ISDIR(exports_info.st_mode)
+                or exports_info.st_dev != folder_info.st_dev):
+            return
+        entries = tuple(exports.iterdir())
+    except (OSError, RuntimeError):
+        return
+
+    for entry in entries:
+        if not _STAGING_NAME.fullmatch(entry.name):
+            continue
+        try:
+            info = _plain_stat(entry)
+            if info is None or not stat.S_ISDIR(info.st_mode):
+                continue
+            target = entry.resolve(strict=True)
+            if target == entry and target.parent == exports and _ordinary_tree(target, exports_info.st_dev):
+                shutil.rmtree(target)
+        except (OSError, RuntimeError):
+            # A locked or inaccessible entry can be retried next time Bacchus starts.
+            continue
 
 
 def _paths(folder, record):

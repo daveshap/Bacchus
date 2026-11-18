@@ -484,6 +484,8 @@ class Studio:
                 project = self._read(path.parent.name)
             except WorkflowError:
                 continue
+            if project.get("id") == path.parent.name:
+                delivery.remove_abandoned_staging(self.root, path.parent)
             changed = bool(self._catalog_legacy_deliveries(project) or project["busy"])
             if project["busy"]:
                 stage = project["busy"]
@@ -1720,7 +1722,7 @@ class Studio:
         result = {}
         try:
             output_dir.mkdir(exist_ok=True)
-            with TemporaryDirectory(prefix=".bacchus-delivery-", dir=output_dir) as work:
+            with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=output_dir) as work:
                 bundle = Path(work) / "bundle"
                 bundle.mkdir()
                 paths = delivery.bundle_paths(bundle)
