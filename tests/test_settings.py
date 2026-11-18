@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from bacchus import planning, providers, settings
+from bacchus import audio, planning, providers, settings
 
 
 class SettingsTests(unittest.TestCase):
@@ -39,12 +39,47 @@ class SettingsTests(unittest.TestCase):
 
     def test_provider_preferences_apply_to_existing_adapters(self):
         setup = settings.Settings(self.root)
+        self.assertEqual(setup.get()["plannerProvider"], "anthropic")
+        self.assertEqual(setup.get()["claudeModel"], "claude-sonnet-5-5")
         setup.save({"anthropicKey": "claude-session", "claudeModel": "claude-test", "plannerProvider": "anthropic"})
         self.assertEqual(planning.planner_provider(), "anthropic")
         self.assertNotIn("ANTHROPIC_API_KEY", os.environ)
-        setup.save({"plannerProvider": "auto", "imageModel": "test-image"})
+        setup.save({"plannerProvider": "openai", "imageModel": "test-image"})
         self.assertEqual(planning.planner_provider(), "openai")
         self.assertEqual(providers.image_request("ink", "an-asset", "A bird.")["model"], "test-image")
+
+    def test_legacy_auto_planning_normalizes_to_anthropic(self):
+        with patch.dict(os.environ, {"BACCHUS_PLANNER_PROVIDER": "auto"}):
+            self.assertEqual(settings.Settings(self.root).get()["plannerProvider"], "anthropic")
+        path = self.root / "settings.json"
+        path.write_text('{"plannerProvider":"auto"}', encoding="utf-8")
+        with patch.dict(os.environ, {"BACCHUS_PLANNER_PROVIDER": "openai"}):
+            setup = settings.Settings(self.root)
+            self.assertEqual(setup.get()["plannerProvider"], "anthropic")
+            with self.assertRaises(settings.SettingsError):
+                setup.save({"plannerProvider": "auto"})
+        setup.save({"plannerProvider": "openai"})
+        self.assertEqual(settings.Settings(self.root).get()["plannerProvider"], "openai")
+
+    def test_optional_cloud_stages_require_independent_opt_in(self):
+        setup = settings.Settings(self.root)
+        with patch.object(audio, "audio_available", return_value=True):
+            self.assertFalse(audio.transcriber_available())
+            self.assertFalse(providers.image_available())
+            view = setup.save({"useOpenAIImages": True, "useOpenAITranscription": False})
+            self.assertTrue(view["useOpenAIImages"])
+            self.assertFalse(view["useOpenAITranscription"])
+            self.assertTrue(providers.image_available())
+            with patch.dict(os.environ, {"BACCHUS_USE_OPENAI_TRANSCRIPTION": "1"}):
+                restored = settings.Settings(self.root)
+                self.assertFalse(audio.transcriber_available())
+                restored.save({"useOpenAITranscription": True, "useOpenAIImages": False})
+                self.assertTrue(audio.transcriber_available())
+                self.assertFalse(providers.image_available())
+        with patch.object(providers, "openai_json") as transport:
+            with self.assertRaisesRegex(providers.ProviderError, "Enable OpenAI artwork"):
+                providers.request_image({})
+            transport.assert_not_called()
 
     def test_invalid_settings_do_not_persist_or_change_credentials(self):
         setup = settings.Settings(self.root)

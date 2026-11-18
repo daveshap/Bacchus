@@ -60,7 +60,11 @@ class AudioTests(unittest.TestCase):
         opener = MagicMock()
         opener.open.return_value.__enter__.return_value = response
         with TemporaryDirectory(prefix="bacchus-transcribe-test-") as work, patch.dict(
-            "os.environ", {"OPENAI_API_KEY": "test-only", "BACCHUS_TRANSCRIBE_MODEL": "gpt-transcribe-fixed"},
+            "os.environ", {
+                "OPENAI_API_KEY": "test-only",
+                "BACCHUS_TRANSCRIBE_MODEL": "gpt-transcribe-fixed",
+                "BACCHUS_USE_OPENAI_TRANSCRIPTION": "1",
+            },
         ), patch.object(audio, "build_opener", return_value=opener):
             original = Path(work) / "private name.wav"
             original.write_bytes(stereo_wav())
@@ -78,6 +82,17 @@ class AudioTests(unittest.TestCase):
             response.read.return_value = b'{"text":" "}'
             with self.assertRaisesRegex(audio.AudioError, "no narration"):
                 audio.transcribe(original)
+
+    def test_disabled_transcription_stops_before_encoding(self):
+        with (
+            patch.dict("os.environ", {"OPENAI_API_KEY": "test-only", "BACCHUS_USE_OPENAI_TRANSCRIPTION": "0"}),
+            patch.object(audio, "_convert") as convert,
+            patch.object(audio, "build_opener") as opener,
+        ):
+            with self.assertRaisesRegex(audio.AudioError, "Enable OpenAI transcription"):
+                audio.transcribe(Path("recording.wav"))
+            convert.assert_not_called()
+            opener.assert_not_called()
 
 
 if __name__ == "__main__":

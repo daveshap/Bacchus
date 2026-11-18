@@ -1,8 +1,9 @@
 import hashlib
 import json
+
 from . import RESOURCES
 from .providers import ProviderError, openai_json, post_json
-from .settings import DEFAULT_OPENAI_MODEL, provider_value
+from .settings import DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, planner_choice, provider_value
 
 
 PACK_FOLDER = RESOURCES / "packs" / "editorial"
@@ -52,15 +53,9 @@ class PlannerError(Exception):
 
 
 def planner_provider():
-    preferred = provider_value("BACCHUS_PLANNER_PROVIDER", "auto").strip().lower()
-    anthropic = bool(provider_value("ANTHROPIC_API_KEY", "").strip()
-                     and provider_value("BACCHUS_CLAUDE_MODEL", "").strip())
-    openai = bool(provider_value("OPENAI_API_KEY", "").strip())
-    if openai and preferred in ("openai", "auto", ""):
-        return "openai"
-    if anthropic and preferred in ("anthropic", "auto", ""):
-        return "anthropic"
-    return None
+    choice = planner_choice()
+    key = "OPENAI_API_KEY" if choice == "openai" else "ANTHROPIC_API_KEY"
+    return choice if provider_value(key, "").strip() else None
 
 
 def planner_available():
@@ -110,7 +105,7 @@ def plan_request(project, reusable=()):
         "Use the existing layout and motion choices to design meaningful visual beats."
     )
     content = json.dumps(context, ensure_ascii=False)
-    if planner_provider() == "openai":
+    if planner_choice() == "openai":
         return {
             "model": provider_value("BACCHUS_OPENAI_MODEL", "").strip() or DEFAULT_OPENAI_MODEL,
             "max_output_tokens": OUTPUT_TOKENS, "store": False,
@@ -118,7 +113,7 @@ def plan_request(project, reusable=()):
             "text": {"format": {"type": "json_schema", "name": "scene_plan", "strict": True, "schema": OUTPUT_SCHEMA}},
         }
     return {
-        "model": provider_value("BACCHUS_CLAUDE_MODEL", "").strip(),
+        "model": provider_value("BACCHUS_CLAUDE_MODEL", "").strip() or DEFAULT_CLAUDE_MODEL,
         "max_tokens": OUTPUT_TOKENS,
         "system": system,
         "messages": [{"role": "user", "content": content}],
@@ -139,7 +134,7 @@ def request_plan(payload):
         else:
             key = provider_value("ANTHROPIC_API_KEY", "").strip()
             if not key or not payload["model"]:
-                raise PlannerError("Add an Anthropic API key and Claude model in Settings.")
+                raise PlannerError("Add an Anthropic API key in Settings.")
             result, request_id = post_json(
                 "https://api.anthropic.com/v1/messages", payload,
                 {"x-api-key": key, "anthropic-version": "2023-06-01"}, "Anthropic",

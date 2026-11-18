@@ -12,7 +12,7 @@ import uuid
 import wave
 
 from . import media_tools
-from .settings import DEFAULT_TRANSCRIBE_MODEL, provider_value
+from .settings import DEFAULT_TRANSCRIBE_MODEL, openai_transcription_enabled, provider_value
 
 
 FORMATS = {".mp3": "mp3", ".flac": "flac", ".wav": "wav"}
@@ -37,7 +37,7 @@ def audio_available():
 
 
 def transcriber_available():
-    return audio_available() and bool(provider_value("OPENAI_API_KEY", "").strip())
+    return openai_transcription_enabled() and bool(provider_value("OPENAI_API_KEY", "").strip()) and audio_available()
 
 
 def transcription_model():
@@ -135,6 +135,8 @@ def _transcription_request(encoded_audio, key, model):
 
 def transcribe(wav_path):
     """Send a compact narration copy and return an editable transcript draft."""
+    if not openai_transcription_enabled():
+        raise AudioError("Enable OpenAI transcription in Settings to transcribe.")
     key = provider_value("OPENAI_API_KEY", "").strip()
     if not key:
         raise AudioError("Add an OpenAI API key in Settings to transcribe.")

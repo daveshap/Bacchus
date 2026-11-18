@@ -256,17 +256,29 @@ function mediaSettingsNotice(detail) {
   </div>`;
 }
 
-function readiness(label, available, waitingLabel, readyLabel = "Ready") {
-  return `<li><span>${label}</span>${badge(available ? readyLabel : waitingLabel, available ? "good" : "warm")}</li>`;
+function providerNotice(detail, label) {
+  return `<div class="cluster provider-notice">
+    <p class="hint">${detail}</p>
+    <button class="button quiet small" type="button" data-view="settings">${label}</button>
+  </div>`;
+}
+
+function readiness(label, available, waitingLabel, readyLabel = "Ready", waitingStyle = "warm") {
+  return `<li><span>${label}</span>${badge(available ? readyLabel : waitingLabel, available ? "good" : waitingStyle)}</li>`;
 }
 
 function readinessList(settings) {
+  const planner = settings.plannerProvider === "openai" ? "OpenAI" : "Anthropic";
+  const transcriptionEnabled = Boolean(settings.useOpenAITranscription);
+  const imagesEnabled = Boolean(settings.useOpenAIImages);
   return [
     readiness("Audio tools", settings.audioAvailable, "Install FFmpeg and ffprobe"),
     readiness("Video export", settings.renderAvailable, "Install FFmpeg and ffprobe"),
-    readiness("Automatic transcription", state.config.transcriberAvailable, "Set an OpenAI key", "Configured"),
-    readiness("AI scene planning", state.config.plannerAvailable, "Configure a planner key", "Configured"),
-    readiness("AI image generation", state.config.imageAvailable, "Set an OpenAI key", "Configured"),
+    readiness(`Scene planning · ${planner}`, state.config.plannerAvailable, `Needs ${planner} key`, "Configured"),
+    readiness("OpenAI transcription", state.config.transcriberAvailable, transcriptionEnabled ? "Needs OpenAI key" : "Off",
+      "Configured", transcriptionEnabled ? "warm" : ""),
+    readiness("OpenAI image generation", state.config.imageAvailable, imagesEnabled ? "Needs OpenAI key" : "Off",
+      "Configured", imagesEnabled ? "warm" : ""),
   ].join("");
 }
 
@@ -305,45 +317,52 @@ function settingsView() {
   const settings = state.settings;
   if (!settings) return heading("Settings", "Loading studio settings.");
   const setup = !settings.completed;
-  const provider = settings.plannerProvider;
-  const keyStatus = value => badge(value ? "Key available" : "Key needed", value ? "good" : "");
+  const provider = settings.plannerProvider === "openai" ? "openai" : "anthropic";
+  const keyStatus = value => badge(value ? "Key available" : "No key set", value ? "good" : "");
   return `
     ${heading(setup ? "Set up Bacchus" : "Settings", "Check the local media tools and choose the providers you want to use.")}
     <div class="columns">
       <form class="panel stack" data-form="settings" autocomplete="off">
-        <div><h2>AI providers</h2>
-          <p class="hint">Use OpenAI to transcribe narration and create images. Scene planning can use OpenAI or Anthropic.</p>
+        <div><h2>Scene planning</h2>
+          <p class="hint">Bacchus uses Claude from Anthropic to draft scene plans by default.</p>
         </div>
         <div class="field">
           <label for="plannerProvider">Scene planner</label>
           <select id="plannerProvider" name="plannerProvider">
             ${[
-              ["auto", "Automatic"],
+              ["anthropic", "Anthropic (Claude)"],
               ["openai", "OpenAI"],
-              ["anthropic", "Anthropic"],
             ].map(([value, label]) => `<option value="${value}"${provider === value ? " selected" : ""}>${label}</option>`).join("")}
           </select>
-        </div>
-        <div class="field">
-          <label for="openAIKey">OpenAI API key ${keyStatus(settings.hasOpenAIKey)}</label>
-          <input id="openAIKey" type="password" name="openAIKey" autocomplete="new-password" spellcheck="false">
-          ${settings.hasOpenAIKey ? '<label class="music-option hint"><input type="checkbox" name="clearOpenAIKey"> Clear session key</label>' : ""}
         </div>
         <div class="field">
           <label for="anthropicKey">Anthropic API key ${keyStatus(settings.hasAnthropicKey)}</label>
           <input id="anthropicKey" type="password" name="anthropicKey" autocomplete="new-password" spellcheck="false">
           ${settings.hasAnthropicKey ? '<label class="music-option hint"><input type="checkbox" name="clearAnthropicKey"> Clear session key</label>' : ""}
-          <p class="hint">Keys entered here apply to the current Bacchus session.</p>
         </div>
-        <details class="timing-panel">
-          <summary>Model names</summary>
-          <div class="stack settings-note">
-            ${settingsModel("openAIModel", "OpenAI scene model", settings.openAIModel)}
-            ${settingsModel("claudeModel", "Anthropic scene model", settings.claudeModel)}
-            ${settingsModel("transcribeModel", "Transcription model", settings.transcribeModel)}
-            ${settingsModel("imageModel", "Image model", settings.imageModel)}
+        ${settingsModel("claudeModel", "Claude model", settings.claudeModel)}
+        <fieldset class="setup-fieldset stack optional-settings">
+          <legend>Optional OpenAI features</legend>
+          <div class="stack provider-switches">
+            <label class="music-option"><input type="checkbox" name="useOpenAITranscription"${settings.useOpenAITranscription === true ? " checked" : ""}> Transcribe recordings with OpenAI</label>
+            <label class="music-option"><input type="checkbox" name="useOpenAIImages"${settings.useOpenAIImages === true ? " checked" : ""}> Generate artwork with OpenAI</label>
           </div>
-        </details>
+          <div class="field">
+            <label for="openAIKey">OpenAI API key ${keyStatus(settings.hasOpenAIKey)}</label>
+            <input id="openAIKey" type="password" name="openAIKey" autocomplete="new-password" spellcheck="false">
+            ${settings.hasOpenAIKey ? '<label class="music-option hint"><input type="checkbox" name="clearOpenAIKey"> Clear session key</label>' : ""}
+            <p class="hint">An OpenAI key is needed for these features or when you choose OpenAI as the scene planner.</p>
+          </div>
+          <details class="timing-panel">
+            <summary>OpenAI model names</summary>
+            <div class="stack settings-note">
+              ${settingsModel("openAIModel", "OpenAI scene model", settings.openAIModel)}
+              ${settingsModel("transcribeModel", "Transcription model", settings.transcribeModel)}
+              ${settingsModel("imageModel", "Image model", settings.imageModel)}
+            </div>
+          </details>
+        </fieldset>
+        <p class="hint settings-key-note">API keys apply to the current Bacchus session.</p>
         <div class="cluster">
           <button class="button primary">${setup ? "Finish setup" : "Save settings"}</button>
           ${setup ? button("Continue offline", "skip-setup", { style: "quiet" }) :
@@ -583,7 +602,9 @@ function intakeView(project) {
           ${audio && state.config.transcriberAvailable
             ? `<div class="cluster">${button(project.transcript ? "Transcribe again" : "Transcribe recording", "transcribe-audio", { disabled: busy || !attempts })}
                 <span class="hint">${attempts ? "Sends the recording to OpenAI for transcription." : "This project has used its transcription requests."}</span></div>`
-            : audio ? '<p class="hint">Automatic transcription requires an OpenAI API key. You can paste your transcript below.</p>' :
+            : audio ? providerNotice(state.settings?.useOpenAITranscription
+              ? "Paste a transcript, import word timings, or add an OpenAI key to draft it here."
+              : "Paste a transcript or import recording-matched word timings.", "Transcription settings") :
             '<p class="hint">Import a recording to transcribe it, or paste your transcript below.</p>'}
           ${project.busy === "transcribing" ? '<p class="hint">Transcription is in progress.</p>' :
           sourceTimings ? '<p class="hint"><strong>Recording-matched word timings.</strong> Editing the cue text switches to estimated timing.</p>' :
@@ -717,9 +738,9 @@ function planView(project) {
           ${button(plan ? "Replace with starter plan" : "Start with a basic plan", "starter-plan", { disabled: busy })}
           ${libraryShortcut("Browse reusable artwork")}
         </div>
-        <p class="hint actions">${!state.config.plannerAvailable
-          ? "Configure an API key for AI planning. You can make a basic plan locally."
-          : `${remaining === null ? "" : `${remaining} AI ${remaining === 1 ? "request remains" : "requests remain"} for this project. `}Generation sends the transcript and brief to ${escapeHtml(provider)}.`}</p>
+        ${!state.config.plannerAvailable
+          ? providerNotice(`Add an ${provider} key to draft scene plans, or use a basic plan locally.`, "Planner settings")
+          : `<p class="hint actions">${remaining === null ? "" : `${remaining} AI ${remaining === 1 ? "request remains" : "requests remain"} for this project. `}Generation sends the transcript and brief to ${escapeHtml(provider)}.</p>`}
         ${plannerReceipt(project)}
       </section>
       <section class="panel">
@@ -730,8 +751,7 @@ function planView(project) {
 }
 
 function plannerProvider() {
-  const provider = state.config.plannerProvider;
-  return ({ anthropic: "Anthropic", claude: "Anthropic", openai: "OpenAI" })[String(provider).toLowerCase()] || provider || "the configured provider";
+  return state.config.plannerProvider === "openai" ? "OpenAI" : "Anthropic";
 }
 
 function artworkView(project) {
@@ -778,7 +798,11 @@ function artworkView(project) {
           ${libraryShortcut()}
           <span class="hint">Approving artwork saves it to the shared art library.</span>
         </div>
-        ${state.config.imageAvailable && project.missing.length ? `<p class="hint actions">${callsRemaining ? "Image generation sends one art brief at a time to OpenAI." : "This project has used its image generation requests."}</p>` : ""}
+        ${project.missing.length ? state.config.imageAvailable
+          ? `<p class="hint actions">${callsRemaining ? "Image generation sends one art brief at a time to OpenAI." : "This project has used its image generation requests."}</p>`
+          : providerNotice(state.settings?.useOpenAIImages
+            ? "Import your images or add an OpenAI key to generate them in Bacchus."
+            : "Copy the combined request into your image tool, then import the files here.", "Image settings") : ""}
         ${!pending ? afterArtworkButton(project) : ""}
       </section>
       <div class="stack">
@@ -1368,6 +1392,8 @@ function settingsPayload(data) {
   const payload = {
     completed: true,
     plannerProvider: data.get("plannerProvider"),
+    useOpenAITranscription: data.has("useOpenAITranscription"),
+    useOpenAIImages: data.has("useOpenAIImages"),
     clearOpenAIKey: data.has("clearOpenAIKey"),
     clearAnthropicKey: data.has("clearAnthropicKey"),
   };

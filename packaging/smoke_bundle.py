@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 from runpy import run_path
 import subprocess
@@ -12,6 +13,10 @@ from urllib.request import Request, urlopen
 
 
 APP_VERSION = run_path(str(Path(__file__).resolve().parents[1] / "bacchus" / "runtime.py"))["APP_VERSION"]
+PROVIDER_SETTINGS = (
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "BACCHUS_PLANNER_PROVIDER", "BACCHUS_CLAUDE_MODEL",
+    "BACCHUS_USE_OPENAI_TRANSCRIPTION", "BACCHUS_USE_OPENAI_IMAGES",
+)
 
 
 def request(url, path, data=None):
@@ -57,6 +62,25 @@ def run_export(url, project):
     raise RuntimeError("The example export exceeded its time limit.")
 
 
+def check_provider_defaults(url):
+    settings = json.loads(request(url, "/api/settings"))
+    if settings["plannerProvider"] != "anthropic" or settings["claudeModel"] != "claude-sonnet-5-5":
+        raise RuntimeError("Fresh setup must default to Claude Sonnet 5.5.")
+
+    # Exercise readiness only. No test key is ever sent to a provider.
+    request(url, "/api/settings", {"openAIKey": "test-local-openai-key"})
+    config = json.loads(request(url, "/api/config"))
+    if config["plannerAvailable"] or config["transcriberAvailable"] or config["imageAvailable"]:
+        raise RuntimeError("An OpenAI key alone enabled an AI stage.")
+    request(url, "/api/settings", {"anthropicKey": "test-local-anthropic-key"})
+    config = json.loads(request(url, "/api/config"))
+    if config["plannerProvider"] != "anthropic" or not config["plannerAvailable"]:
+        raise RuntimeError("A Claude key alone must enable the default planner.")
+    if config["transcriberAvailable"] or config["imageAvailable"]:
+        raise RuntimeError("OpenAI media features must remain opt-in.")
+    request(url, "/api/settings", {"clearAnthropicKey": True, "clearOpenAIKey": True})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
@@ -65,7 +89,10 @@ def main():
     with TemporaryDirectory(prefix="bacchus-bundle-smoke-") as data:
         root = Path(data)
         command = [str(args.executable.resolve()), "--no-browser", "--data", data, "--port", "0"]
-        process = subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        env = os.environ.copy()
+        for variable in PROVIDER_SETTINGS:
+            env.pop(variable, None)
+        process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             url = endpoint(root, process)
             config = json.loads(request(url, "/api/config"))
@@ -76,6 +103,7 @@ def main():
             for asset in ("/static/app.js", "/static/styles.css"):
                 if not request(url, asset):
                     raise RuntimeError(f"Missing embedded asset {asset}.")
+            check_provider_defaults(url)
             project = json.loads(request(url, "/api/demo", {}))
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")
@@ -88,7 +116,7 @@ def main():
             if process.poll() is None:
                 process.kill()
                 process.wait(10)
-    print("Verified packaged startup, interface, offline example, and clean shutdown"
+    print("Verified packaged startup, Claude-first setup, offline example, and clean shutdown"
           + (", including MP4 export." if args.render else "."))
 
 

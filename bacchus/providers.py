@@ -6,7 +6,7 @@ import json
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .settings import DEFAULT_IMAGE_MODEL, provider_value
+from .settings import DEFAULT_IMAGE_MODEL, openai_images_enabled, provider_value
 
 
 class ProviderError(Exception):
@@ -51,7 +51,7 @@ def openai_json(endpoint, payload, **options):
 
 
 def image_available():
-    return bool(provider_value("OPENAI_API_KEY", "").strip())
+    return openai_images_enabled() and bool(provider_value("OPENAI_API_KEY", "").strip())
 
 
 def image_request(project_style, asset_id, brief):
@@ -68,6 +68,8 @@ def image_request(project_style, asset_id, brief):
 
 
 def request_image(payload):
+    if not openai_images_enabled():
+        raise ProviderError("Enable OpenAI artwork generation in Settings to generate images.")
     result, request_id = openai_json("images/generations", payload, timeout=160, limit=16 * 1024 * 1024)
     try:
         image = base64.b64decode(result["data"][0]["b64_json"], validate=True)

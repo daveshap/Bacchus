@@ -747,7 +747,7 @@ class Studio:
             if project["input"] or not project["audio"]:
                 raise WorkflowError("Import a recording and leave intake unlocked before transcribing.", 409)
             if not audio.transcriber_available():
-                raise WorkflowError("Configure the transcription API to transcribe the recording.", 409)
+                raise WorkflowError("Enable OpenAI transcription and add an OpenAI key in Settings to transcribe here.", 409)
             if len(project["transcriptionRuns"]) >= MAX_TRANSCRIPTIONS:
                 raise WorkflowError("This project reached its transcription request limit.", 409)
             recording_hash = project["audio"]["hash"]
@@ -816,7 +816,7 @@ class Studio:
             if not brief:
                 raise WorkflowError("This artwork ID has no pending brief.", 409)
             if not providers.image_available():
-                raise WorkflowError("Configure the image API to generate artwork.", 409)
+                raise WorkflowError("Enable OpenAI image generation and add an OpenAI key in Settings to generate here.", 409)
             if len(project["artRuns"]) >= MAX_ART_GENERATIONS:
                 raise WorkflowError("This project reached its artwork generation limit.", 409)
             payload = providers.image_request(STYLES[project["style"]], asset_id, brief)
@@ -990,7 +990,7 @@ class Studio:
             if not project["input"]:
                 raise WorkflowError("Lock the narration before planning.", 409)
             if not planning.planner_available():
-                raise WorkflowError("The AI planner has not been configured.", 409)
+                raise WorkflowError("Add an API key for the selected scene planner in Settings.", 409)
             if len(project["plannerRuns"]) >= planning.MAX_PLANNER_CALLS:
                 raise WorkflowError("This project reached its AI planning request limit.", 409)
             reusable = self._reusable_art(project)

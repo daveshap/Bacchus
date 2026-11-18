@@ -9,23 +9,33 @@ from tempfile import NamedTemporaryFile
 from threading import RLock
 
 
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 DEFAULT_TRANSCRIBE_MODEL = "gpt-transcribe"
 DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare-2026-09-08"
 
 _MODELS = {
-    "claudeModel": ("BACCHUS_CLAUDE_MODEL", ""),
+    "claudeModel": ("BACCHUS_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
     "openAIModel": ("BACCHUS_OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
     "transcribeModel": ("BACCHUS_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL),
     "imageModel": ("BACCHUS_IMAGE_MODEL", DEFAULT_IMAGE_MODEL),
 }
 _PROVIDER_KEY = "BACCHUS_PLANNER_PROVIDER"
-_PROVIDERS = ("auto", "openai", "anthropic")
+_PROVIDERS = ("anthropic", "openai")
+_FEATURES = {
+    "useOpenAITranscription": "BACCHUS_USE_OPENAI_TRANSCRIPTION",
+    "useOpenAIImages": "BACCHUS_USE_OPENAI_IMAGES",
+}
+_BOOLEANS = {
+    "completed": "Choose whether setup is complete.",
+    "useOpenAITranscription": "Choose whether to enable OpenAI transcription.",
+    "useOpenAIImages": "Choose whether to enable OpenAI artwork generation.",
+}
 _KEYS = {
     "OPENAI_API_KEY": ("openAIKey", "clearOpenAIKey", "OpenAI"),
     "ANTHROPIC_API_KEY": ("anthropicKey", "clearAnthropicKey", "Anthropic"),
 }
-_PREFERENCES = {"completed", "plannerProvider", *_MODELS}
+_PREFERENCES = {"plannerProvider", *_BOOLEANS, *_MODELS}
 _INPUT_FIELDS = _PREFERENCES | {field for key, clear, _ in _KEYS.values() for field in (key, clear)}
 _MODEL_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _LOCK = RLock()
@@ -45,6 +55,23 @@ def provider_value(name, default=None):
             value = _OVERRIDES[name]
             return default if value is None else value
         return os.environ.get(name, default)
+
+
+def _normalize_planner(value):
+    return "openai" if value.strip().lower() == "openai" else "anthropic"
+
+
+def planner_choice():
+    """Resolve the configured planner; provider readiness never changes this choice."""
+    return _normalize_planner(provider_value(_PROVIDER_KEY, ""))
+
+
+def openai_transcription_enabled():
+    return provider_value(_FEATURES["useOpenAITranscription"], "").strip() == "1"
+
+
+def openai_images_enabled():
+    return provider_value(_FEATURES["useOpenAIImages"], "").strip() == "1"
 
 
 def _model(value, default, secrets):
@@ -89,10 +116,12 @@ class Settings:
         if not isinstance(stored, dict):
             return {}
         preferences = {}
-        if type(stored.get("completed")) is bool:
-            preferences["completed"] = stored["completed"]
-        if stored.get("plannerProvider") in _PROVIDERS:
-            preferences["plannerProvider"] = stored["plannerProvider"]
+        for field in _BOOLEANS:
+            if type(stored.get(field)) is bool:
+                preferences[field] = stored[field]
+        selected = stored.get("plannerProvider")
+        if isinstance(selected, str) and selected.strip().lower() in (*_PROVIDERS, "", "auto"):
+            preferences["plannerProvider"] = _normalize_planner(selected)
         secrets = {provider_value(name) for name in _KEYS}
         for field, (_, default) in _MODELS.items():
             if field in stored:
@@ -106,16 +135,20 @@ class Settings:
     def _apply_preferences(preferences):
         if "plannerProvider" in preferences:
             _OVERRIDES[_PROVIDER_KEY] = preferences["plannerProvider"]
+        for field, name in _FEATURES.items():
+            if field in preferences:
+                _OVERRIDES[name] = "1" if preferences[field] else "0"
         for field, (name, _) in _MODELS.items():
             if field in preferences:
                 _OVERRIDES[name] = preferences[field]
 
     def get(self):
         with _LOCK:
-            provider = provider_value(_PROVIDER_KEY, "auto").strip().lower()
             view = {
                 "completed": self.preferences.get("completed", False),
-                "plannerProvider": provider if provider in _PROVIDERS else "auto",
+                "plannerProvider": planner_choice(),
+                "useOpenAITranscription": openai_transcription_enabled(),
+                "useOpenAIImages": openai_images_enabled(),
                 "hasOpenAIKey": bool(provider_value("OPENAI_API_KEY", "").strip()),
                 "hasAnthropicKey": bool(provider_value("ANTHROPIC_API_KEY", "").strip()),
             }
@@ -133,13 +166,14 @@ class Settings:
         with _LOCK:
             credentials = _credential_changes(data)
             preferences = self.preferences.copy()
-            if "completed" in data:
-                if type(data["completed"]) is not bool:
-                    raise SettingsError("Choose whether setup is complete.")
-                preferences["completed"] = data["completed"]
+            for field, message in _BOOLEANS.items():
+                if field in data:
+                    if type(data[field]) is not bool:
+                        raise SettingsError(message)
+                    preferences[field] = data[field]
             if "plannerProvider" in data:
                 if data["plannerProvider"] not in _PROVIDERS:
-                    raise SettingsError("Choose Auto, OpenAI, or Anthropic for the planner.")
+                    raise SettingsError("Choose Anthropic or OpenAI for the planner.")
                 preferences["plannerProvider"] = data["plannerProvider"]
             secrets = {provider_value(name) for name in _KEYS} | set(credentials.values())
             for field, (_, default) in _MODELS.items():

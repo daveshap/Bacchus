@@ -178,6 +178,12 @@ code { overflow-wrap: anywhere; }
 .receipt dd { margin: 0; overflow-wrap: anywhere; }
 .setup-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 .setup-fieldset legend { padding: 0; margin-bottom: 11px; font-weight: 650; }
+.optional-settings { margin-top: 3px; }
+.provider-switches { gap: 4px; }
+.settings-key-note { margin: 0; }
+.provider-notice { margin-top: 13px; }
+.provider-notice p { flex: 1 1 210px; margin: 0; }
+.transcription-control .provider-notice { margin-top: 0; }
 .settings-note { margin-top: 13px; }
 .storage-paths h3 { margin-bottom: 2px; }
 .storage-paths code { display: block; color: var(--muted); font-size: .82rem; }
