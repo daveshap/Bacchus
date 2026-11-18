@@ -19,7 +19,7 @@ MAX_EVIDENCE_CHARS = 500
 STATUSES = ("pass", "fail", "unclear")
 CHECKLISTS = {
     "asset": {
-        "subject-and-style": "The rendered asset depicts the intended subject in the specified visual treatment.",
+        "subject-and-style": "The rendered asset depicts the intended subject and matches the relevant spoken facts, labels, quantities and visual treatment. Flag a visible contradiction or mark uncertain details unclear.",
         "placement-and-orientation": "Placement, facing, scale and layers support the intended scene relationship.",
         "edges-and-readability": "At the sampled display size, the subject and labels read clearly, with clean edges and no unintended fragments.",
         "behavior-in-use": "The visible states support the intended use or motion. Mark unobserved parts of a requested action unclear.",

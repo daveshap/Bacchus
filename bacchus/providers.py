@@ -122,10 +122,11 @@ def image_available():
 def image_request(project_style, asset_id, brief, *, guide="", visual_notes="", palette=None, references=()):
     payload = {
         "model": provider_value("BACCHUS_IMAGE_MODEL", "").strip() or DEFAULT_IMAGE_MODEL,
-        "size": "1024x1024", "quality": "medium", "n": 1, "output_format": "png",
+        "size": "1024x1024", "quality": "high", "n": 1, "output_format": "png",
         "prompt": (
             f"Create one illustration for a narrated video in this visual style: {project_style}. "
             "Use clear silhouettes and an unfussy composition that reads at a small size. "
+            "Use a transparent background for an isolated subject and retain backgrounds for complete scenes. "
             "Use the following brief as visual reference. Do not add lettering, logos, or captions. "
             f"Artwork ID: {asset_id}. Visual brief: {brief}"
         ),

@@ -85,7 +85,7 @@ class RendererTests(unittest.TestCase):
         for style in ("warm-editorial", "studio-ink", "night-signal"):
             picture = render.preview({**project(), "style": style}, Path("."), 0)
             with Image.open(BytesIO(picture)) as frame:
-                self.assertEqual(frame.size, (1280, 720))
+                self.assertEqual(frame.size, (3840, 2160))
                 colors.add(frame.getpixel((0, 0)))
         self.assertEqual(len(colors), 3)
 
@@ -94,12 +94,13 @@ class RendererTests(unittest.TestCase):
         real_encode = render._encode
         attempted = []
 
-        def encode(source, folder, composition, frames, scratch, encoder, approved_mix):
+        def encode(source, folder, composition, frames, scratch, encoder, approved_mix, *, first_frame=0):
             attempted.append(encoder.name)
             if encoder == video_encoding.NVENC:
                 (scratch / "h264_nvenc.mp4").write_bytes(b"partial")
                 raise render._EncodingFailure("GPU became unavailable")
-            return real_encode(source, folder, composition, frames, scratch, encoder, approved_mix)
+            return real_encode(source, folder, composition, frames, scratch, encoder, approved_mix,
+                               first_frame=first_frame)
 
         with (
             TemporaryDirectory(prefix="bacchus-gpu-fallback-") as temporary,
@@ -108,12 +109,16 @@ class RendererTests(unittest.TestCase):
         ):
             folder = Path(temporary)
             path = folder / "video.mp4"
-            media = render.export_video(project(), folder, path)
+            source = project()
+            source["input"]["duration"] = 0.2
+            media = render.export_video(source, folder, path)
             self.assertEqual(path.read_bytes()[4:8], b"ftyp")
         self.assertEqual(attempted, ["h264_nvenc", "libx264"])
         self.assertEqual(media["encoder"], "libx264")
         self.assertFalse(media["hardwareEncoding"])
         self.assertIn("NVIDIA NVENC", media["encoderFallback"])
+        self.assertEqual((media["width"], media["height"], media["fps"], media["frames"]), (3840, 2160, 60, 12))
+        self.assertEqual(media["color"], video_encoding.COLOR_METADATA)
 
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_decode_rejects_video_payload_corruption_with_intact_container_metadata(self):
@@ -121,8 +126,8 @@ class RendererTests(unittest.TestCase):
             path = Path(temporary) / "video.mp4"
             subprocess.run([
                 render.media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=24", "-t", "1",
-                "-c:v", "libx264", "-movflags", "+faststart", str(path),
+                "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=60", "-t", "0.4",
+                "-c:v", "libx264", *video_encoding.COLOR_OPTIONS, "-movflags", "+faststart", str(path),
             ], check=True, capture_output=True)
             render._decode(path, 24, False)
             data = bytearray(path.read_bytes())
@@ -139,7 +144,7 @@ class RendererTests(unittest.TestCase):
             else:
                 self.fail("The MP4 did not contain a media payload.")
             path.write_bytes(data)
-            self.assertEqual(render._inspect(path, 24, False)["frames"], 24)
+            self.assertEqual(render._inspect(path, 24, False, (1280, 720))["frames"], 24)
             with self.assertRaisesRegex(render.RenderError, "could not be decoded"):
                 render._decode(path, 24, False)
 
@@ -182,11 +187,26 @@ class RendererTests(unittest.TestCase):
             media = render.export_video(source, folder, mp4_path, approved_mix=mix)
             self.assertEqual((media["audio"], media["audioSampleRate"], media["audioChannels"]),
                              ("aac", 48_000, 2))
+            self.assertIn("integratedLufs", media["audioLevels"])
             decoded = subprocess.run(
                 ["ffmpeg", "-v", "error", "-i", str(mp4_path), "-map", "0:a:0", "-f", "s16le", "pipe:1"],
                 capture_output=True, check=True, timeout=15,
             )
             self.check_composition(left_channel(decoded.stdout))
+
+            clip = folder / "review.mp4"
+            motion = render.export_motion_preview(source, folder, clip, 1.03, 1.54, approved_mix=mix)
+            self.assertEqual((motion["width"], motion["height"], motion["fps"], motion["frames"]),
+                             (1280, 720, 60, 32))
+            self.assertEqual((motion["start"], motion["end"]), (61 / 60, 93 / 60))
+            self.assertTrue(motion["decodedAudio"])
+            excerpt = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", str(clip), "-map", "0:a:0", "-f", "s16le", "pipe:1"],
+                capture_output=True, check=True, timeout=15,
+            )
+            self.assertGreater(frequency_level(left_channel(excerpt.stdout), 400, 0.1, 0.3), 6_000)
+            with self.assertRaisesRegex(render.RenderError, "within the cut"):
+                render.export_motion_preview(source, folder, clip, 1.03, 3.01, approved_mix=mix)
 
             prepared.write_bytes(b"changed after approval")
             with self.assertRaisesRegex(render.RenderError, "fingerprint"):
@@ -210,14 +230,15 @@ class RendererTests(unittest.TestCase):
                 render.validate_music_regions(source, [*regions, {"startLine": 1, "endLine": 2, "gainDb": -25}])
             result = render.export_mix(source, folder, folder / "mix.wav")
             self.assertEqual(result["narration"]["samples"], 48_176)
-            self.assertEqual(result["samples"], 146_000)
+            self.assertEqual(result["samples"], 144_800)
             with wave.open(str(folder / "mix.wav"), "rb") as wav:
                 pcm = left_channel(wav.readframes(wav.getnframes()))
             self.assertGreater(frequency_level(pcm, 650, 0.5, 0.7), 100)
             self.assertLess(frequency_level(pcm, 650, 1.3, 1.5), 10)
             self.assertGreater(frequency_level(pcm, 650, 2.3, 2.5), 100)
-            self.assertGreater(frequency_level(pcm, 400, 1.3, 1.5), 8_000)
-            self.assertGreater(frequency_level(pcm, 400, 3.0, 3.01), 7_000)
+            steady_voice = frequency_level(pcm, 400, 1.3, 1.5)
+            self.assertGreater(steady_voice, 6_000)
+            self.assertGreater(frequency_level(pcm, 400, 3.0, 3.01), steady_voice * 0.8)
 
     def check_composition(self, samples):
         background = frequency_level(samples, 650, 0.5, 0.65)

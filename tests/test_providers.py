@@ -26,6 +26,7 @@ class ProviderTests(TestCase):
         ) as call:
             providers.request_image(payload)
         self.assertEqual(call.call_args.args[0], "images/edits")
+        self.assertEqual(payload["quality"], "high")
         self.assertIn("Muted colors.", payload["prompt"])
         self.assertEqual(payload["images"], [{"image_url": "data:image/png;base64,ZXhhbXBsZQ=="}])
 

@@ -1,6 +1,6 @@
 # Source workflow comparison
 
-This document records the animation workflows that informed Bacchus and compares them with v0.6.0. The paths in the source table are relative to the projects reviewed. The [README](../README.md) covers installation and day-to-day use.
+This document records the animation workflows that informed Bacchus and compares them with v0.7.0. The paths in the source table are relative to the projects reviewed. The [README](../README.md) covers installation and day-to-day use.
 
 ## Production workflows reviewed
 
@@ -12,7 +12,7 @@ This document records the animation workflows that informed Bacchus and compares
 | LaborZero_MiniCourse | The shared studio uses `course-ink` with approved lesson text and accepted voice narration. The voice checklist covers the upstream reread rule and preserves existing narration and completed lessons. | `animation/PLAYBOOK.md`, `voice/CHECKLIST.md`, `CLAUDE.md` |
 | BFG_Animations | The standalone briefing studio uses the same five-stage pattern. Its technical style supports Paper, Blueprint, and Glass, with reusable drawing components and semantic colors for equipment states. | `README.md`, `docs/styles/bfg-technical.md`, `docs/playbooks/00-narration.md` |
 
-## How Bacchus v0.6.0 applies those workflows
+## How Bacchus v0.7.0 applies those workflows
 
 **Keep the recording and bind cues to it.** The source workflows preserve the accepted recording, including wording that differs from the script. Bacchus retains the original upload and checks the recording hash and duration on imported cue sheets. Its local Parakeet runtime can derive word spans from the waveform. Intake lets the operator correct word text and timings and review them against the recording before locking them. Stable word IDs let a scene refer to a particular occurrence of a repeated word. [Local recognition](../bacchus/local_timing.py) · [Cue validation](../bacchus/timing.py)
 
@@ -20,9 +20,9 @@ This document records the animation workflows that informed Bacchus and compares
 
 **Use style guidance and typed scene actions together.** A project pins a guide revision with its visual treatment, palette, reference images, and audio preferences. Bacchus renders title, editorial, and illustration scenes and supports layered text, images, bar charts, and flow diagrams. Layers can reveal or move on spoken cues. The legacy technical profiles add reusable equipment components, articulated poses, and richer operational states. Those remain differences in scene vocabulary. [Style catalog](../bacchus/styles.py) · [Layer schema](../bacchus/layer_spec.py)
 
-**Review the soundtrack before animation.** Bacchus preserves the narration timing while adding optional music and timed effects. It applies narration-first ducking, supports music levels by cue range, measures the mix, and lets the operator listen to and approve the WAV. MP4 export consumes the exact approved WAV. Bacchus delivers 720p24 with a stereo 48 kHz mix. The shared studio generally delivers 4K60 and records its own soundtrack format and source evidence. [Mix preparation](../bacchus/mixing.py) · [Encoding](../bacchus/render.py)
+**Review the soundtrack before animation.** Bacchus preserves the original recording and its timing while mixing optional music and timed effects. Based on the BFG and shared studio approaches, original synth scores arrange sections around scene turns and pauses. The mixer makes room for speech, supports levels by cue range, and masters toward −14 LUFS integrated. The operator listens to and approves the WAV. The 4K60 MP4 consumes that WAV, then measures the encoded 48 kHz stereo AAC and verifies true peak. The PunchAndRoll recording workflow's upstream levels govern narration input. [Score arrangement](../bacchus/score.py) · [Mix preparation](../bacchus/mixing.py) · [Encoding](../bacchus/render.py)
 
-**Freeze the cut, inspect motion, and verify the delivery.** The shared review samples entrances, cues, busiest frames, tails, and joins. Bacchus generates timed per-scene contact sheets, provides a scrubber and the approved mix, and binds the operator's decisions to the candidate. It checks the encoded stream properties and decodes the complete MP4 before marking delivery ready. The MP4, captions, and receipt are fingerprinted. A new render can reuse the accepted candidate and preserve the previous verified delivery. The source workflow also calls for visual sampling of the encoded file. Bacchus's proof sheets come from the prepared composition, while its encoded-file checks verify the stream and file integrity. [Proof generation](../bacchus/gates.py) · [Decode checks](../bacchus/render.py) · [Delivery verification](../bacchus/delivery.py)
+**Freeze the cut, inspect motion, and verify the delivery.** The shared review samples entrances, cues, busiest frames, tails, and joins. Bacchus generates per-scene contact sheets and plays short review clips on the same 60 fps clock with the approved mix. Operator decisions bind to the candidate. Delivery verifies the encoded streams, BT.709 metadata, audio levels, and complete playback by decoding the MP4. The MP4, captions, and receipt are fingerprinted. The source workflow also samples the final encoded picture for visual QC. [Proof generation](../bacchus/gates.py) · [Motion and decode checks](../bacchus/render.py) · [Delivery verification](../bacchus/delivery.py)
 
 ## Production comparison points
 

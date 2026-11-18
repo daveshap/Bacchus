@@ -18,7 +18,11 @@ from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
 
 from . import layer_spec, media_tools, mixing, video_encoding
 
-WIDTH, HEIGHT, FPS = 1280, 720, 24
+# Measure layouts in one coordinate space and draw at the destination's pixel density.
+DESIGN_WIDTH, DESIGN_HEIGHT = 1280, 720
+DELIVERY_SCALE = 3
+WIDTH, HEIGHT, FPS = DESIGN_WIDTH * DELIVERY_SCALE, DESIGN_HEIGHT * DELIVERY_SCALE, 60
+MAX_PREVIEW_SECONDS = 12
 SAMPLE_RATE = mixing.SAMPLE_RATE
 CHANNELS = mixing.CHANNELS
 MAX_MUSIC_REGIONS = mixing.MAX_MUSIC_REGIONS
@@ -146,7 +150,11 @@ def _text_block(text, role, max_size, min_size, width, height):
     raise RenderError(f"{label} text does not fit this layout.")
 
 
-def _paint_text(draw, scene, palette, rectangle, title_size, title_height, *, center=False):
+def _scaled(values, scale):
+    return tuple(value * scale for value in values)
+
+
+def _paint_text(draw, scene, palette, rectangle, title_size, title_height, scale, *, center=False):
     x0, y0, x1, y1 = rectangle
     width = x1 - x0
     title = _text_block(scene["title"], palette.title_font, title_size, 32, width, title_height)
@@ -162,12 +170,13 @@ def _paint_text(draw, scene, palette, rectangle, title_size, title_height, *, ce
     y = y0 + (y1 - y0 - title_height_used - gap - body_height) / 2
     x = (x0 + x1) / 2 if center else x0
     anchor = "ma" if center else "la"
-    for block, color in ((title, palette.ink), (body, palette.muted)):
+    for block, color, role in ((title, palette.ink, palette.title_font), (body, palette.muted, "body")):
         if block is None:
             continue
         font, lines, step = block
+        font = _font(role, font.size * scale)
         for line in lines:
-            draw.text((x, y), line, font=font, fill=color, anchor=anchor)
+            draw.text(_scaled((x, y), scale), line, font=font, fill=color, anchor=anchor)
             y += step
         y += gap
 
@@ -193,80 +202,85 @@ def _read_asset(asset_id, assets, folder):
         raise RenderError(f"Approved artwork {asset_id!r} could not be opened.") from error
 
 
-def _paste_art(frame, art, palette, area):
-    x0, y0, x1, y1 = area
+def _paste_art(frame, art, palette, area, scale):
+    x0, y0, x1, y1 = _scaled(area, scale)
     draw = ImageDraw.Draw(frame)
-    draw.rounded_rectangle(area, radius=24, fill=palette.matte, outline=palette.rule, width=2)
-    art = ImageOps.contain(art, (x1 - x0 - 36, y1 - y0 - 36), Image.Resampling.LANCZOS)
+    draw.rounded_rectangle((x0, y0, x1, y1), radius=24 * scale, fill=palette.matte,
+                           outline=palette.rule, width=2 * scale)
+    art = ImageOps.contain(art, (x1 - x0 - 36 * scale, y1 - y0 - 36 * scale), Image.Resampling.LANCZOS)
     frame.paste(art, ((x0 + x1 - art.width) // 2, (y0 + y1 - art.height) // 2), art)
 
 
-def _draw_scene(scene, assets, folder, palette):
-    frame = Image.new("RGB", (WIDTH, HEIGHT), palette.paper)
+def _draw_scene(scene, assets, folder, palette, scale):
+    frame = Image.new("RGB", _scaled((DESIGN_WIDTH, DESIGN_HEIGHT), scale), palette.paper)
     draw = ImageDraw.Draw(frame)
-    draw.rectangle((44, 44, WIDTH - 44, HEIGHT - 44), outline=palette.rule, width=2)
-    draw.rounded_rectangle((98, 82, 162, 88), radius=3, fill=palette.accent)
+    draw.rectangle(_scaled((44, 44, DESIGN_WIDTH - 44, DESIGN_HEIGHT - 44), scale),
+                   outline=palette.rule, width=2 * scale)
+    draw.rounded_rectangle(_scaled((98, 82, 162, 88), scale), radius=3 * scale, fill=palette.accent)
     art_id = scene.get("artId")
     art = _read_asset(art_id, assets, folder) if art_id else None
 
     if scene["layout"] == "illustration":
         if art is None:
             raise RenderError("This illustration needs approved artwork.")
-        _paste_art(frame, art, palette, (230, 106, 1050, 461))
-        _paint_text(draw, scene, palette, (145, 478, 1135, 647), 46, 105, center=True)
+        _paste_art(frame, art, palette, (230, 106, 1050, 461), scale)
+        _paint_text(draw, scene, palette, (145, 478, 1135, 647), 46, 105, scale, center=True)
     elif scene["layout"] in {"title", "editorial"}:
         if art is not None:
-            _paste_art(frame, art, palette, (700, 114, 1170, 610))
+            _paste_art(frame, art, palette, (700, 114, 1170, 610), scale)
             _paint_text(
-                draw, scene, palette, (100, 116, 644, 594), 62, 294,
+                draw, scene, palette, (100, 116, 644, 594), 62, 294, scale,
                 center=scene["layout"] == "title",
             )
         elif scene["layout"] == "title":
-            _paint_text(draw, scene, palette, (158, 120, 1122, 600), 82, 260, center=True)
+            _paint_text(draw, scene, palette, (158, 120, 1122, 600), 82, 260, scale, center=True)
         else:
-            _paint_text(draw, scene, palette, (102, 120, 1040, 600), 76, 254)
+            _paint_text(draw, scene, palette, (102, 120, 1040, 600), 76, 254, scale)
     else:
         raise RenderError(f"Unsupported layout {scene['layout']!r}.")
     return frame
 
 
-def _draw_block(image, text, box, color, role="body", maximum=33, minimum=18, *, center=False):
+def _draw_block(image, text, box, color, role="body", maximum=33, minimum=18, *, scale, center=False):
     x, y, width, height = box
     font, lines, step = _text_block(text, role, maximum, minimum, width, height)
     draw = ImageDraw.Draw(image)
     x = x + width / 2 if center else x
     y += (height - len(lines) * step) / 2
+    font = _font(role, font.size * scale)
     for line in lines:
-        draw.text((x, y), line, fill=color, font=font, anchor="ma" if center else "la")
+        draw.text(_scaled((x, y), scale), line, fill=color, font=font, anchor="ma" if center else "la")
         y += step
 
 
-def _layered_background(scene, palette, preset):
-    frame = Image.new("RGB", (WIDTH, HEIGHT), palette.paper)
+def _layered_background(scene, palette, preset, scale):
+    frame = Image.new("RGB", _scaled((DESIGN_WIDTH, DESIGN_HEIGHT), scale), palette.paper)
     draw = ImageDraw.Draw(frame)
-    draw.rectangle((47, 43, WIDTH - 47, HEIGHT - 43), outline=palette.rule, width=2)
-    draw.line((91, 140, WIDTH - 91, 140), fill=palette.rule, width=2)
-    draw.rounded_rectangle((92, 74, 128, 79), radius=2, fill=palette.accent)
+    draw.rectangle(_scaled((47, 43, DESIGN_WIDTH - 47, DESIGN_HEIGHT - 43), scale),
+                   outline=palette.rule, width=2 * scale)
+    draw.line(_scaled((91, 140, DESIGN_WIDTH - 91, 140), scale), fill=palette.rule, width=2 * scale)
+    draw.rounded_rectangle(_scaled((92, 74, 128, 79), scale), radius=2 * scale, fill=palette.accent)
     heading = "warm-heading" if preset == "warm-editorial" else palette.title_font
-    _draw_block(frame, scene["title"], (149, 65, 1039, 67), palette.ink, heading, 44, 23)
+    _draw_block(frame, scene["title"], (149, 65, 1039, 67), palette.ink, heading, 44, 23, scale=scale)
     caption = scene.get("caption", "")
     if caption:
-        draw.line((91, 599, WIDTH - 91, 599), fill=palette.rule, width=2)
-        _draw_block(frame, caption, (94, 606, 1092, 56), palette.muted, "body", 23, 17)
+        draw.line(_scaled((91, 599, DESIGN_WIDTH - 91, 599), scale), fill=palette.rule, width=2 * scale)
+        _draw_block(frame, caption, (94, 606, 1092, 56), palette.muted, "body", 23, 17, scale=scale)
     return frame
 
 
-def _draw_chart(tile, layer, palette, preset):
+def _draw_chart(tile, layer, palette, preset, scale):
     draw = ImageDraw.Draw(tile)
-    width, height = tile.size
+    width, height = tile.width // scale, tile.height // scale
     items = layer["items"]
     header = 38 if layer["text"] else 6
     row_height = (height - header - 18) // len(items)
     if width < 240 or row_height < 25:
         raise RenderError("The chart needs more room for its bars, labels and values.")
-    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=13, fill=palette.matte, outline=palette.rule)
+    draw.rounded_rectangle((0, 0, tile.width - 1, tile.height - 1), radius=13 * scale, fill=palette.matte,
+                           outline=palette.rule, width=scale)
     if layer["text"]:
-        _draw_block(tile, layer["text"], (14, 3, width - 28, 34), palette.ink, maximum=23, minimum=16)
+        _draw_block(tile, layer["text"], (14, 3, width - 28, 34), palette.ink, maximum=23, minimum=16, scale=scale)
     label_width, value_width = round(width * .27), round(width * .22)
     bar_left, bar_right = label_width + 24, width - value_width - 22
     values = [item["value"] for item in items]
@@ -277,34 +291,36 @@ def _draw_chart(tile, layer, palette, preset):
         return round(bar_left + (value - low) / span * (bar_right - bar_left))
 
     baseline = position(0)
-    draw.line((baseline, header, baseline, height - 18), fill=palette.muted, width=1)
+    draw.line(_scaled((baseline, header, baseline, height - 18), scale), fill=palette.muted, width=scale)
     colors = (palette.accent, palette.muted)
     warm = PALETTES["warm-editorial"]
     if preset == "warm-editorial" and colors == (warm.accent, warm.muted):
         colors = ("#5f8377", "#a95d44", "#658095", "#a88039")
     for index, item in enumerate(items):
         top = header + row_height * index
-        _draw_block(tile, item["label"], (12, top, label_width, row_height), palette.ink, maximum=20, minimum=13)
+        _draw_block(tile, item["label"], (12, top, label_width, row_height), palette.ink,
+                    maximum=20, minimum=13, scale=scale)
         value = item["value"]
         label = str(int(value)) if value == int(value) else str(value)
         if layer["unit"]:
             label += f" {layer['unit']}"
-        _draw_block(tile, label, (bar_right + 11, top, value_width, row_height), palette.ink, maximum=20, minimum=13)
+        _draw_block(tile, label, (bar_right + 11, top, value_width, row_height), palette.ink,
+                    maximum=20, minimum=13, scale=scale)
         if value:
             x0, x1 = sorted((baseline, position(value)))
             inset = max(4, row_height // 4)
             draw.rounded_rectangle(
-                (x0, top + inset, max(x0 + 1, x1), top + row_height - inset),
-                radius=4, fill=colors[index % len(colors)],
+                _scaled((x0, top + inset, max(x0 + 1, x1), top + row_height - inset), scale),
+                radius=4 * scale, fill=colors[index % len(colors)],
             )
 
 
-def _draw_flow(tile, layer, palette):
+def _draw_flow(tile, layer, palette, scale):
     draw = ImageDraw.Draw(tile)
-    width, height = tile.size
+    width, height = tile.width // scale, tile.height // scale
     header = 42 if layer["text"] else 4
     if layer["text"]:
-        _draw_block(tile, layer["text"], (4, 2, width - 8, 36), palette.ink, maximum=25, minimum=16)
+        _draw_block(tile, layer["text"], (4, 2, width - 8, 36), palette.ink, maximum=25, minimum=16, scale=scale)
     count = len(layer["items"])
     space = 22
     horizontal = width >= (height - header) * 1.7
@@ -321,22 +337,24 @@ def _draw_flow(tile, layer, palette):
         raise RenderError("The flow diagram needs more room for its steps and arrows.")
     for index, ((x, y, w, h), item) in enumerate(zip(boxes, layer["items"], strict=True)):
         draw.rounded_rectangle(
-            (x, y, x + w - 1, y + h - 1), radius=12, fill=palette.matte, outline=palette.rule, width=2,
+            (x * scale, y * scale, (x + w) * scale - 1, (y + h) * scale - 1), radius=12 * scale,
+            fill=palette.matte, outline=palette.rule, width=2 * scale,
         )
-        _draw_block(tile, item["label"], (x + 8, y + 3, w - 16, h - 6), palette.ink, maximum=23, minimum=14, center=True)
+        _draw_block(tile, item["label"], (x + 8, y + 3, w - 16, h - 6), palette.ink,
+                    maximum=23, minimum=14, scale=scale, center=True)
         if index == count - 1:
             continue
         if horizontal:
             cx, cy = x + w + space - 4, y + h // 2
-            draw.line((x + w + 3, cy, cx, cy), fill=palette.accent, width=2)
-            draw.polygon(((cx, cy), (cx - 6, cy - 4), (cx - 6, cy + 4)), fill=palette.accent)
+            draw.line(_scaled((x + w + 3, cy, cx, cy), scale), fill=palette.accent, width=2 * scale)
+            draw.polygon(_scaled((cx, cy, cx - 6, cy - 4, cx - 6, cy + 4), scale), fill=palette.accent)
         else:
             cx, cy = x + w // 2, y + h + space - 4
-            draw.line((cx, y + h + 3, cx, cy), fill=palette.accent, width=2)
-            draw.polygon(((cx, cy), (cx - 4, cy - 6), (cx + 4, cy - 6)), fill=palette.accent)
+            draw.line(_scaled((cx, y + h + 3, cx, cy), scale), fill=palette.accent, width=2 * scale)
+            draw.polygon(_scaled((cx, cy, cx - 4, cy - 6, cx + 4, cy - 6), scale), fill=palette.accent)
 
 
-CONTENT = (92, 154, WIDTH - 92, 584)
+CONTENT = (92, 154, DESIGN_WIDTH - 92, 584)
 
 
 @dataclass
@@ -348,6 +366,7 @@ class _PaintedLayer:
     settled: float
     end: float
     effect: str
+    scale: int
 
     def phase(self, elapsed):
         if not self.start <= elapsed < self.end:
@@ -370,7 +389,7 @@ class _PaintedLayer:
             visible = image.crop((0, 0, shown, image.height))
             frame.paste(visible, (x, y), visible)
         elif self.effect == "rise":
-            offset = round(min(52, image.height // 4) * (1 - phase) ** 2)
+            offset = round(min(52 * self.scale, image.height // 4) * (1 - phase) ** 2)
             visible = image.crop((0, 0, image.width, image.height - offset))
             frame.paste(visible, (x, y + offset), visible)
 
@@ -390,10 +409,12 @@ def frame_at_or_after(time):
 
 
 class _Composition:
-    def __init__(self, project, folder):
+    def __init__(self, project, folder, *, scale=DELIVERY_SCALE):
         self.source = project["input"]
         self.duration = self.source["duration"]
         self.folder = folder
+        self.scale = scale
+        self.size = _scaled((DESIGN_WIDTH, DESIGN_HEIGHT), scale)
         self.scenes = project["plan"]["scenes"]
         self.preset = project_visual_preset(project)
         self.palette = project_palette(project)
@@ -415,7 +436,7 @@ class _Composition:
             scene = self.scenes[index]
             if scene["layout"] == "layered":
                 return self._prepare_layers(scene, self.positions[index])
-            return _PreparedScene(_draw_scene(scene, self.assets, self.folder, self.palette))
+            return _PreparedScene(_draw_scene(scene, self.assets, self.folder, self.palette, self.scale))
         except (RenderError, layer_spec.LayerError) as error:
             raise RenderError(f"Scene {index + 1}. {error}") from error
 
@@ -428,29 +449,30 @@ class _Composition:
             y = round(y0 + box["y"] * (y1 - y0) / 100)
             width = round(box["w"] * (x1 - x0) / 100)
             height = round(box["h"] * (y1 - y0) / 100)
-            tile = Image.new("RGBA", (width, height))
+            tile = Image.new("RGBA", _scaled((width, height), self.scale))
             start, settled, end = layer_spec.schedule(self.source, scene, layer)
             try:
                 if frame_at_or_after(settled) / FPS >= end:
                     raise RenderError("The layer leaves before any fully visible output frame.")
                 if kind == "text":
                     inset = min(12, width // 5, height // 5)
-                    _draw_block(tile, layer["text"], (inset, inset, width - 2 * inset, height - 2 * inset), self.palette.ink)
+                    _draw_block(tile, layer["text"], (inset, inset, width - 2 * inset, height - 2 * inset),
+                                self.palette.ink, scale=self.scale)
                 elif kind == "art":
                     image = _read_asset(layer["artId"], self.assets, self.folder)
                     fitted = ImageOps.contain(image, tile.size, Image.Resampling.LANCZOS)
-                    tile.alpha_composite(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+                    tile.alpha_composite(fitted, ((tile.width - fitted.width) // 2, (tile.height - fitted.height) // 2))
                 elif kind == "bar-chart":
-                    _draw_chart(tile, layer, self.palette, self.preset)
+                    _draw_chart(tile, layer, self.palette, self.preset, self.scale)
                 elif kind == "flow":
-                    _draw_flow(tile, layer, self.palette)
+                    _draw_flow(tile, layer, self.palette, self.scale)
             except RenderError as error:
                 raise RenderError(f"Layer {layer['id']!r}. {error}") from error
             layers.append(_PaintedLayer(
-                layer["id"], tile, (x, y), start - scene_start, settled - scene_start, end - scene_start,
-                layer["enter"]["effect"],
+                layer["id"], tile, _scaled((x, y), self.scale), start - scene_start, settled - scene_start,
+                end - scene_start, layer["enter"]["effect"], self.scale,
             ))
-        return _PreparedScene(_layered_background(scene, self.palette, self.preset), tuple(layers))
+        return _PreparedScene(_layered_background(scene, self.palette, self.preset, self.scale), tuple(layers))
 
     def visual_state(self, index, elapsed, prepared):
         if prepared.layers:
@@ -505,12 +527,13 @@ class _Composition:
                 return Image.blend(Image.new("RGB", frame.size, self.palette.paper), frame, progress)
             return frame
         eased = 1 - (1 - progress) ** 3
-        inset = round(WIDTH * eased * 0.012)
+        width, height = frame.size
+        inset = round(width * eased * 0.012)
         if inset:
-            top = inset * HEIGHT / WIDTH
+            top = inset * height / width
             return frame.resize(
-                (WIDTH, HEIGHT), Image.Resampling.BICUBIC,
-                box=(inset, top, WIDTH - inset, HEIGHT - top),
+                frame.size, Image.Resampling.BICUBIC,
+                box=(inset, top, width - inset, height - top),
             )
         return frame
 
@@ -555,10 +578,10 @@ def verify_mix(folder, metadata, narration_duration):
         raise RenderError(str(error)) from error
 
 
-def _video_frames(composition, frame_count):
+def _video_frames(composition, frame_count, first_frame=0):
     last_index = None
     last_phase = None
-    for number in range(frame_count):
+    for number in range(first_frame, first_frame + frame_count):
         index, elapsed = composition.at(number / FPS)
         if index != last_index:
             prepared = composition.prepare(index)
@@ -575,7 +598,7 @@ class _EncodingFailure(RenderError):
     pass
 
 
-def _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix):
+def _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix, *, first_frame=0):
     output = scratch / f"{encoder.name}.mp4"
     log = scratch / f"{encoder.name}.log"
     duration = frame_count / FPS
@@ -585,12 +608,18 @@ def _encode(project, folder, composition, frame_count, scratch, encoder, approve
     audio_options = []
     if approved_mix is not None:
         audio_path = verify_mix(folder, approved_mix, composition.duration)
-        audio_options = ["-f", "wav", "-i", str(audio_path), "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
+        audio_options = [
+            "-f", "wav", "-i", str(audio_path), "-map", "1:a:0", "-c:a", "aac", "-b:a", mixing.AAC_BITRATE,
+        ]
+        if first_frame or frame_count != _frame_count(composition.duration):
+            first_sample = first_frame * SAMPLE_RATE // FPS
+            end_sample = (first_frame + frame_count) * SAMPLE_RATE // FPS
+            audio_options.extend(("-af", f"atrim=start_sample={first_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS"))
     command = [
         encoder.executable or media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
-        *encoder.input_options, *video_encoding.raw_input(WIDTH, HEIGHT, FPS),
-        *audio_options, "-map", "0:v:0",
-        "-c:v", encoder.name, *encoder.options, "-movflags", "+faststart",
+        "-filter_threads", "4", *encoder.input_options, *video_encoding.raw_input(*composition.size, FPS),
+        *audio_options, "-map", "0:v:0", *video_encoding.encoding_options(encoder),
+        "-movflags", "+faststart+write_colr",
         str(output),
     ]
     with log.open("w+b") as errors:
@@ -599,12 +628,12 @@ def _encode(project, folder, composition, frame_count, scratch, encoder, approve
                                        **media_tools.process_options())
         except OSError as error:
             raise RenderError("FFmpeg could not start.") from error
-        watchdog = Timer(max(45, min(3600, duration * 3 + 45)), process.kill)
+        watchdog = Timer(duration * 12 + 90, process.kill)
         watchdog.daemon = True
         watchdog.start()
         try:
             with process.stdin:
-                for frame in _video_frames(composition, frame_count):
+                for frame in _video_frames(composition, frame_count, first_frame):
                     process.stdin.write(frame)
             return_code = process.wait()
         except BrokenPipeError:
@@ -629,7 +658,7 @@ def _probe(output):
     return json.loads(result.stdout)
 
 
-def _inspect(output, frame_count, has_audio):
+def _inspect(output, frame_count, has_audio, size=(WIDTH, HEIGHT)):
     try:
         probe = _probe(output)
         video = [stream for stream in probe["streams"] if stream["codec_type"] == "video"]
@@ -637,8 +666,9 @@ def _inspect(output, frame_count, has_audio):
         duration = float(probe["format"]["duration"])
         valid = (
             len(video) == 1 and len(audio) == int(has_audio)
-            and (video[0]["width"], video[0]["height"], video[0]["codec_name"]) == (WIDTH, HEIGHT, "h264")
+            and (video[0]["width"], video[0]["height"], video[0]["codec_name"]) == (*size, "h264")
             and video[0].get("pix_fmt") == "yuv420p"
+            and all(video[0].get(field) == value for field, value in video_encoding.COLOR_METADATA.items())
             and video[0]["avg_frame_rate"] == f"{FPS}/1"
             and int(video[0]["nb_frames"]) == frame_count
             and abs(duration - frame_count / FPS) < 0.08
@@ -652,10 +682,11 @@ def _inspect(output, frame_count, has_audio):
         raise RenderError("FFprobe could not verify the encoded video.") from error
     if not valid:
         raise RenderError("The encoded file did not match the approved video and audio settings.")
-    return {"width": WIDTH, "height": HEIGHT, "fps": FPS, "frames": frame_count,
+    return {"width": size[0], "height": size[1], "fps": FPS, "frames": frame_count,
             "duration": duration, "codec": "h264", "audio": "aac" if has_audio else None,
             "audioSampleRate": SAMPLE_RATE if has_audio else None,
-            "audioChannels": CHANNELS if has_audio else None}
+            "audioChannels": CHANNELS if has_audio else None,
+            "color": dict(video_encoding.COLOR_METADATA)}
 
 
 def _frame_count(duration):
@@ -676,7 +707,7 @@ def _decode(output, frame_count, has_audio):
     ]
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True,
-                                timeout=max(45, min(3600, frame_count / FPS * 3 + 45)),
+                                timeout=frame_count / FPS * 12 + 90,
                                 **media_tools.process_options())
     except subprocess.CalledProcessError as error:
         details = (error.stderr or "").strip().splitlines()
@@ -689,10 +720,12 @@ def _decode(output, frame_count, has_audio):
         raise RenderError("The decoded delivery does not contain every approved picture frame.")
 
 
-def _encode_verified(project, folder, composition, frame_count, scratch, encoder, approved_mix):
-    output, has_audio = _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix)
+def _encode_verified(project, folder, composition, frame_count, scratch, encoder, approved_mix, *, first_frame=0):
+    output, has_audio = _encode(
+        project, folder, composition, frame_count, scratch, encoder, approved_mix, first_frame=first_frame,
+    )
     try:
-        media = _inspect(output, frame_count, has_audio)
+        media = _inspect(output, frame_count, has_audio, composition.size)
         _decode(output, frame_count, has_audio)
         media.update(decodedFrames=frame_count, decodedAudio=has_audio)
         return output, media
@@ -717,10 +750,38 @@ def export_video(project, folder: Path, destination: Path, *, approved_mix=None,
             fallback = f"{encoder.label} failed the export or its output checks. Bacchus retried on the CPU."
             encoder = video_encoding.CPU
             output, media = _encode_verified(*args, encoder, approved_mix)
+        if approved_mix is not None:
+            try:
+                media["audioLevels"] = mixing.verify_delivery(output, media["duration"], approved_mix)
+            except mixing.MixError as error:
+                raise RenderError(str(error)) from error
         output.replace(destination)
     media.update(encoder=encoder.name, hardwareEncoding=encoder != video_encoding.CPU,
                  encoderMode=encoder_mode, encoderFallback=fallback)
     return media
+
+
+def export_motion_preview(project, folder: Path, destination: Path, start: float, end: float, *, approved_mix=None) -> dict:
+    """Export a bounded review clip on the same frame and audio clocks as the finished film."""
+    if not render_available():
+        raise RenderError("Motion preview needs FFmpeg and FFprobe.")
+    composition = _Composition(project, folder, scale=1)
+    if (
+        any(type(value) not in (int, float) or not math.isfinite(value) for value in (start, end))
+        or not 0 <= start < end <= composition.duration
+        or end - start > MAX_PREVIEW_SECONDS + 1e-9
+    ):
+        raise RenderError(f"Select a motion preview range of up to {MAX_PREVIEW_SECONDS} seconds within the cut.")
+    first = min(math.floor(start * FPS), _frame_count(composition.duration) - 1)
+    last = min(frame_at_or_after(end), first + MAX_PREVIEW_SECONDS * FPS)
+    count = max(1, last - first)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".bacchus-render-", dir=destination.parent) as work:
+        output, media = _encode_verified(
+            project, folder, composition, count, Path(work), video_encoding.CPU, approved_mix, first_frame=first,
+        )
+        output.replace(destination)
+    return {**media, "start": first / FPS, "end": (first + count) / FPS}
 
 
 def export_mix(project, folder: Path, destination: Path) -> dict:

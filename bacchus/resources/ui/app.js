@@ -39,6 +39,8 @@ const state = {
   pending: false,
   newTitle: "",
   newStyleId: "",
+  newMusicChoice: "style",
+  newMusicStyle: "",
   newRecording: null,
   styles: [],
   stylesError: "",
@@ -808,6 +810,33 @@ function kickoffStyleSummary(style) {
   </div>`;
 }
 
+function styleMusicLabel(style) {
+  const label = "Use style preference";
+  return style?.answers ? `${label} (${style.answers.music ? "original score" : "no music"})` : label;
+}
+
+function musicChoiceFields(prefix, choice, selectedStyle, projectStyle) {
+  const choices = { style: styleMusicLabel(projectStyle), none: "No music",
+    original: "Compose an original score", generic: "Use a generic soundtrack", custom: "Compose in a custom music style",
+    upload: "Import my own music" };
+  const custom = choice === "custom";
+  const styles = state.config.musicStyles ?? [];
+  return `<div class="field">
+      <label for="${prefix}-music-choice">Music</label>
+      <select id="${prefix}-music-choice" data-music-choice name="musicChoice">
+        ${choice === "legacy" ? '<option value="legacy" selected disabled>Keep current music settings</option>' : ""}
+        ${Object.entries(choices).map(([key, label]) => `<option value="${key}"${key === choice ? " selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+      </select>
+    </div>
+    <div class="field" data-custom-music${custom ? "" : " hidden"}>
+      <label for="${prefix}-music-style">Music style</label>
+      <select id="${prefix}-music-style" name="musicStyle" required${custom ? "" : " disabled"}>
+        <option value="">Choose a music style</option>
+        ${styles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === selectedStyle ? " selected" : ""}>${escapeHtml(style.name)}</option>`).join("")}
+      </select>
+    </div>`;
+}
+
 const visualBases = { "warm-editorial": "Warm editorial", "studio-ink": "Studio ink", "night-signal": "Night signal" };
 const paletteFields = {
   paper: ["Background", "#f8efe0"], ink: ["Text", "#26372d"], muted: ["Secondary text", "#505c50"],
@@ -899,7 +928,7 @@ function styleForm(style) {
     ${styleTextarea("sceneNotes", "Any other considerations about how the scenes are constructed?", answers.sceneNotes)}
     ${styleYesNo("music", "Do you want music?", answers.music)}
     ${styleTextarea("musicNotes", "Music guidance", answers.musicNotes, 2)}
-    <div class="field"><label for="style-music-preset">Music preset</label>
+    <div class="field"><label for="style-music-preset">Music mood</label>
       <select id="style-music-preset" name="musicPreset">
         <option value="ambient"${answers.musicPreset === "ambient" ? " selected" : ""}>Ambient</option>
         <option value="pulse"${answers.musicPreset === "pulse" ? " selected" : ""}>Pulse</option>
@@ -990,6 +1019,7 @@ function startView() {
             </select>
             <div id="kickoff-style-details" aria-live="polite">${kickoffStyleSummary(styleById(state.newStyleId))}</div>
           </div>
+          ${musicChoiceFields("new", state.newMusicChoice, state.newMusicStyle, styleById(state.newStyleId))}
           ${state.config.audioAvailable ? `<div class="field">
             <label for="new-recording">Narration recording (optional)</label>
             <input id="new-recording" type="file" accept="audio/wav,audio/mpeg,audio/flac,.mp3,.flac,.wav">
@@ -1321,7 +1351,7 @@ function layerEditor(layer, sceneIndex, index, count, project) {
     </div>`}
     ${chart || diagram ? `<div class="field"><label for="${prefix}-items">${chart ? "Bar labels and values" : "Flow steps"}</label>
       <textarea id="${prefix}-items" data-layer-field="items" rows="3" required>${escapeHtml(layer.items.map(item => chart ? `${item.label} | ${item.value}` : item.label).join("\n"))}</textarea>
-      <p class="hint">${chart ? "Enter 1–6 lines in the form Label | Value." : "Enter 2–5 steps, one per line."}</p>
+      <p class="hint">${chart ? "Enter 1–6 lines in the form Label | Value. Use labels, values, and units supported by the narration or project brief." : "Enter 2–5 steps, one per line."}</p>
     </div>` : ""}
     ${chart ? layerInput(prefix, "unit", "Chart unit", layer.unit, 'maxlength="24"') : ""}
     <div class="stack scene-fields">
@@ -1473,10 +1503,12 @@ function assetUseReview(project) {
       </section>
       <section class="panel stack" id="asset-proof-detail" tabindex="-1">
         <div class="panel-header"><h2>${escapeHtml(selected.title)}</h2>${proofStatus(selected.status)}</div>
+        ${selected.narrationText ? `<details class="timing-panel" open><summary>Narration for this use</summary>
+          <blockquote class="proof-narration">${escapeHtml(selected.narrationText)}</blockquote></details>` : ""}
         ${selected.proofUrl ? `<div class="proof-comparison">
           ${proofImage(original?.url, "Original artwork")}
           ${proofImage(selected.proofUrl, "Rendered scene proof")}
-        </div><p class="hint">Check framing, legibility, and the image’s fit with the approved scene plan.</p>` :
+        </div><p class="hint">Confirm that the image depicts the correct subject and details for the spoken cue. Check framing and legibility in the rendered scene.</p>` :
           selected.status === "error" ? "" : '<p class="hint">Prepare the scene proof to review this use.</p>'}
         ${reviewReason(selected)}
         ${selected.status === "failed" ? '<p class="hint">Fix the artwork or update the scene plan, then prepare a new proof.</p>' : ""}
@@ -1612,6 +1644,12 @@ function hasAudibleTracks(project) {
   return Boolean(project.audio || project.mix?.musicMode === "track" || project.mix?.effects.length);
 }
 
+function musicReady(project) {
+  const mix = project.mix;
+  return mix?.musicMode === "none" || (mix?.musicMode === "track" &&
+    Boolean(mix.music || ["original", "custom", "generic"].includes(project.musicPreference?.effectiveChoice)));
+}
+
 function previewAudio(url, label) {
   const src = localMedia(url);
   return src ? `<audio controls preload="none" aria-label="${escapeHtml(label)}" src="${src}"></audio>` : "";
@@ -1682,6 +1720,8 @@ function mixEvidence(rendered) {
       <dt>Format</dt><dd>${escapeHtml(rendered.sampleRate)} Hz · ${escapeHtml(rendered.channels)} channels</dd>
       <dt>Integrated loudness</dt><dd>${measuredValue(rendered.levels?.integratedLufs, "LUFS")}</dd>
       <dt>True peak</dt><dd>${measuredValue(rendered.levels?.truePeakDbtp, "dBTP")}</dd>
+      ${rendered.mastering ? `<dt>Delivery target</dt><dd>${measuredValue(rendered.mastering.targetLufs, "LUFS")}
+        · ${measuredValue(rendered.mastering.deliveryCeilingDbtp, "dBTP")} ceiling</dd>` : ""}
     </dl>
     ${rendered.warnings?.length ? `<ul class="read-list">${rendered.warnings.map(warning => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
   </div>`;
@@ -1713,7 +1753,11 @@ function compositionView(project) {
   const audioDisabled = busy || state.config.audioAvailable === false;
   const effects = mix.effects;
   const duration = project.input.duration;
-  const hasDecision = mix.musicMode === "none" || (mix.musicMode === "track" && mix.music);
+  const preference = project.musicPreference;
+  const musicChoice = preference?.choice ?? "legacy";
+  const choice = preference?.effectiveChoice;
+  const hasDecision = musicReady(project);
+  const arranged = ["original", "custom"].includes(choice);
   const canListen = Boolean(rendered?.sha256 && hasAudibleTracks(project));
   const full = effects.length >= (state.config.maxEffects ?? 12);
   return `
@@ -1726,23 +1770,19 @@ function compositionView(project) {
             ${approved ? badge("Approved", "good") : ""}
           </div>
           <div class="stack">
-            <div class="cluster">
-              <label class="music-option">
-                <input data-mix-setting type="radio" name="musicMode" value="track"${values.musicMode === "track" ? " checked" : ""}${!mix.music ? " disabled" : ""}> Use music track
-              </label>
-              <label class="music-option">
-                <input data-mix-setting type="radio" name="musicMode" value="none"${values.musicMode === "none" ? " checked" : ""}> No music
-              </label>
-            </div>
+            <input type="hidden" name="musicMode" value="${escapeHtml(values.musicMode)}">
             ${mix.music ? `<div class="mix-item">
               <h3>${escapeHtml(mix.music.name)}</h3>
-              <p class="hint">${timecode(mix.music.duration)} source · looped to fit the narration</p>
+              <p class="hint">${timecode(mix.music.duration)} source${arranged ? " · arranged for this film" : ""}</p>
               ${previewAudio(mix.music.url, "Listen to the music source")}
               <div class="field">
                 <label for="music-gain">Music level (dB)</label>
                 <input id="music-gain" data-mix-setting name="musicGainDb" type="number" min="-48" max="0" step=".1" value="${escapeHtml(values.musicGainDb)}" required>
               </div>
-            </div>` : '<p class="hint">Import a track or create a soundtrack to add music.</p>'}
+            </div>` : `<p class="hint">${choice === "none" ? "No music selected." :
+              arranged ? "Preparing the mix will arrange a score for the approved scene plan." :
+                choice === "generic" ? "Preparing the mix will add the generic soundtrack." :
+                  choice === "upload" ? "Import your music file to continue." : "Choose a music plan or import a track."}</p>`}
             ${mix.music ? `<section class="stack">
               <h3>Music regions</h3>
               <p class="hint">Set a music level or mute it from the first selected cue through the last selected cue.</p>
@@ -1763,7 +1803,7 @@ function compositionView(project) {
             ${mixEvidence(rendered)}
             ${canListen ? previewAudio(mixPreviewUrl(project), "Listen to the verified mix") : ""}
             ${rendered && !canListen ? '<p class="hint">This cut is silent.</p>' : ""}
-            ${!hasDecision ? '<p class="hint">Save a music choice before preparing the mix.</p>' :
+            ${!hasDecision ? `<p class="hint">${choice === "upload" ? "Import your music before preparing the mix." : "Save a music choice before preparing the mix."}</p>` :
               !rendered ? '<p class="hint">Prepare the WAV and measure its audio before approving it for export.</p>' : ""}
             ${rendered && !approved ? `<label class="music-option"><input id="confirm-mix-review" type="checkbox">
               ${canListen ? "I listened to and checked the verified mix." : "I checked the silent deliverable."}</label>` : ""}
@@ -1781,15 +1821,18 @@ function compositionView(project) {
         </section>
       </form>
       <div class="stack">
-        ${styleSoundGuidance(project)}
-        <form class="panel stack" data-form="mix-preset">
-          <h2>Create soundtrack</h2>
-          <p class="hint">Create original background music and place effects at scene changes. This replaces the current soundtrack.</p>
+        <form class="panel stack" data-form="music-choice">
+          <h2>Music plan</h2>
+          ${musicChoiceFields("composition", musicChoice, preference?.style, project.styleSnapshot)}
+          <div><button class="button" data-save-music-choice${busy || musicChoice === "legacy" ? " disabled" : ""}>Save music choice</button></div>
+        </form>
+        ${choice === "generic" ? `<form class="panel stack" data-form="mix-preset">
+          <h2>Generic soundtrack</h2>
           <div class="field"><label for="soundtrack-preset">Soundtrack style</label>
             <select id="soundtrack-preset" name="preset"><option value="ambient">Ambient</option><option value="pulse">Pulse</option></select>
           </div>
-          <div><button class="button"${audioDisabled ? " disabled" : ""}>Create soundtrack</button></div>
-        </form>
+          <div><button class="button"${audioDisabled ? " disabled" : ""}>Use this soundtrack</button></div>
+        </form>` : ""}
         <form class="panel stack" data-form="mix-music">
           <h2>Import music</h2>
           <div class="field"><label for="music-file">Music file</label>
@@ -1806,6 +1849,7 @@ function compositionView(project) {
           </div>
           <div><button class="button"${audioDisabled || full ? " disabled" : ""}>Add sound effect</button></div>
         </form>
+        ${styleSoundGuidance(project)}
         ${sceneTiming(project)}
       </div>
     </div>`;
@@ -1843,22 +1887,30 @@ function currentAnimationReview(project) {
 
 function animationPlayer(project, proof) {
   const range = reviewRange(proof, project.input.duration);
+  const canPrepareMotion = project.qc?.status === "passed" && state.config.renderAvailable;
   return `<section class="panel" id="animation-player" tabindex="-1">
         ${proof ? `<div class="proof-preview-title"><h2>${escapeHtml(proof.title)}</h2>
           <span class="proof-range">${proofSeconds(range.start)} to ${proofSeconds(range.end)}</span></div>` : ""}
         <div class="preview-frame">
           <img id="preview-image" alt="Current animation frame">
+          <video id="motion-preview-video" aria-label="Full-speed motion preview" controls playsinline preload="metadata" hidden></video>
         </div>
         <div class="player-controls">
-          <button class="button small" type="button" id="play-preview" aria-pressed="false">${proof ? "Play review range" : "Play silent preview"}</button>
+          <button class="button small" type="button" id="play-preview" aria-pressed="false">Play stills</button>
           <input id="preview-time" type="range" min="${escapeHtml(range.start)}" max="${escapeHtml(range.end)}" step=".001" value="${escapeHtml(range.start)}" aria-label="Preview position">
           <span class="timecode"><span id="current-time">${timecode(range.start)}</span> / ${timecode(range.end)}</span>
         </div>
         ${hasAudibleTracks(project) ? `<div class="narration-preview">
           <audio id="preview-narration" preload="none" src="${localMedia(mixPreviewUrl(project))}"></audio>
-          <button class="button small quiet" type="button" id="play-narration" aria-pressed="false">${proof ? "Play range with mix" : "Play with mix"}</button>
+          <button class="button small quiet" type="button" id="play-narration" aria-pressed="false">Play stills with mix</button>
         </div>` : ""}
         <p id="preview-feedback" class="hint player-feedback" role="status" hidden></p>
+        <div class="cluster motion-preview-controls">
+          <button id="prepare-motion-preview" class="button small primary" type="button"${canPrepareMotion && !project.busy ? "" : " disabled"}>Play full-speed clip</button>
+          <p id="motion-preview-status" class="hint" role="status">${canPrepareMotion ?
+            "Play up to 12 seconds at 60 fps. Seek to preview a different point." :
+            state.config.renderAvailable ? "Pass the animation checks to play a full-speed clip." : "Set up the media tools to play a full-speed clip."}</p>
+        </div>
         ${proof ? `<ul class="shot-list" aria-label="Jump to a proof sample">
           ${proof.samples.map(sample => `<li><button class="button small" type="button" data-review-sample="${escapeHtml(sample.time)}">
             ${escapeHtml(sample.label)} · ${proofSeconds(sample.time)}</button></li>`).join("")}
@@ -1875,7 +1927,7 @@ function animationProof(proof, busy) {
   return `<section class="panel stack" id="animation-proof-detail">
     <div class="panel-header"><h2>Scene and transition proof</h2>${proofStatus(proof.status)}</div>
     ${proof.proofUrl ? `<div class="proof-stills">${proofImage(proof.proofUrl, "Rendered frame samples")}</div>
-      <p class="hint">Play the review range or jump to exact samples to check motion, timing, readability, and the cuts on either side.</p>` :
+      <p class="hint">Use full-speed playback to check motion and cuts. Use the frame samples to check readability and artwork detail.</p>` :
       proof.status === "error" ? "" : '<p class="hint">Run the animation checks to create this proof.</p>'}
     ${reviewReason(proof)}
     ${proof.status === "failed" ? '<p class="hint">Fix the scene or its adjoining transition, then prepare and check the revised animation.</p>' : ""}
@@ -2072,12 +2124,16 @@ function exportView(project) {
       <dl class="receipt">
         <dt>Candidate</dt><dd>${shortHash(project.qc?.candidateHash)}</dd>
         <dt>Duration</dt><dd>${timecode(project.input.duration)}</dd>
+        <dt>Format</dt><dd>${media?.width && media?.height && media?.fps ?
+          `${escapeHtml(media.width)} × ${escapeHtml(media.height)} · ${escapeHtml(media.fps)} fps` : "3840 × 2160 · 60 fps"}</dd>
         <dt>Narration</dt><dd>${project.audio ? escapeHtml(project.audio.name) : "No recording"}</dd>
         ${project.mix ? `<dt>Music</dt><dd>${project.mix.musicMode === "track" ? escapeHtml(project.mix.music?.name) : "No music"}</dd>
           <dt>Sound effects</dt><dd>${project.mix.effects.length}</dd>` : ""}
         ${media?.encoder ? `<dt>Video encoder</dt><dd><code>${escapeHtml(media.encoder)}</code></dd>` : ""}
         ${typeof media?.hardwareEncoding === "boolean"
           ? `<dt>Encoding mode</dt><dd>${media.hardwareEncoding ? "Hardware encoding" : "CPU encoding"}</dd>` : ""}
+        ${media?.audioLevels ? `<dt>Delivered loudness</dt><dd>${measuredValue(media.audioLevels.integratedLufs, "LUFS")}</dd>
+          <dt>Delivered true peak</dt><dd>${measuredValue(media.audioLevels.truePeakDbtp, "dBTP")}</dd>` : ""}
         ${complete ? deliveryCaptionSummary(output) : ""}
       </dl>
       ${deliveryNotices(output)}
@@ -2106,6 +2162,9 @@ function attachPreview(project) {
   const narration = content.querySelector("#preview-narration");
   const playNarration = content.querySelector("#play-narration");
   const feedback = content.querySelector("#preview-feedback");
+  const motion = content.querySelector("#motion-preview-video");
+  const playMotion = content.querySelector("#prepare-motion-preview");
+  const motionStatus = content.querySelector("#motion-preview-status");
   const shots = Array.from(content.querySelectorAll("[data-preview-time]"));
   const samples = Array.from(content.querySelectorAll("[data-review-sample]"));
   const starts = project.plan.scenes.map(scene => Number(sceneStart(project, scene)));
@@ -2123,6 +2182,8 @@ function attachPreview(project) {
   let frameUrl = null;
   let playbackId = 0;
   let hasSeeked = Boolean(savedPosition?.hasSeeked);
+  let motionController = null;
+  let motionKey;
 
   async function requestFrame() {
     if (disposed || fetchController || queued == null) return;
@@ -2152,6 +2213,11 @@ function attachPreview(project) {
   }
 
   function show(time, throttle = false) {
+    if (!motion.hidden) {
+      motion.pause();
+      motion.hidden = true;
+      image.hidden = false;
+    }
     time = Math.max(range.start, Math.min(range.end, time));
     state.previewPosition = { key, time, hasSeeked };
     seek.value = time;
@@ -2170,10 +2236,10 @@ function attachPreview(project) {
     clearInterval(timer);
     timer = null;
     narration?.pause();
-    play.textContent = proof ? "Play review range" : "Play silent preview";
+    play.textContent = "Play stills";
     play.setAttribute("aria-pressed", "false");
     if (playNarration) {
-      playNarration.textContent = proof ? "Play range with mix" : "Play with mix";
+      playNarration.textContent = "Play stills with mix";
       playNarration.setAttribute("aria-pressed", "false");
     }
   }
@@ -2206,6 +2272,66 @@ function attachPreview(project) {
     show(offset);
   }
 
+  function motionMessage(text, error = false) {
+    motionStatus.textContent = text;
+    motionStatus.classList.toggle("player-feedback", error);
+  }
+
+  async function loadMotion() {
+    pause();
+    const position = hasSeeked ? Number(seek.value) : range.start;
+    const start = Math.max(range.start, Math.min(position, range.end - 1));
+    const end = Math.min(range.end, start + 12);
+    const clip = `${start}/${end}`;
+    if (clip !== motionKey) {
+      motion.pause();
+      motion.hidden = true;
+      image.hidden = false;
+      playMotion.disabled = true;
+      motionController = new AbortController();
+      motionMessage("Preparing a full-speed clip…");
+      try {
+        const result = await api(projectPath("/motion-preview", project), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ revision: project.revision, start, end }),
+          signal: motionController.signal,
+        });
+        if (disposed) return;
+        const url = new URL(result.url, window.location.origin);
+        if (url.origin !== window.location.origin || !url.pathname.startsWith("/api/")) {
+          throw new Error("The studio returned an invalid motion preview.");
+        }
+        motion.src = url.href;
+        motionKey = clip;
+        motionMessage(`${proofSeconds(result.start)} to ${proofSeconds(result.end)} · ${result.fps} fps`);
+      } catch (error) {
+        if (!disposed && error.name !== "AbortError") motionMessage(error.message, true);
+        return;
+      } finally {
+        motionController = null;
+        if (!disposed) playMotion.disabled = false;
+      }
+    }
+    image.hidden = true;
+    motion.hidden = false;
+    if (motion.ended) motion.currentTime = 0;
+    motion.play().catch(error => {
+      if (!disposed && !motion.hidden && error.name !== "AbortError") {
+        motionMessage("Use the video controls to start playback.");
+      }
+    });
+  }
+
+  playMotion.addEventListener("click", loadMotion);
+  motion.addEventListener("play", pause);
+  motion.addEventListener("error", () => {
+    if (disposed || !motion.getAttribute("src")) return;
+    motionKey = null;
+    motion.hidden = true;
+    image.hidden = false;
+    motionMessage("The full-speed clip could not be played. Prepare it again to retry.", true);
+  });
   play.addEventListener("click", () => {
     if (play.getAttribute("aria-pressed") === "true") pause();
     else start();
@@ -2241,6 +2367,10 @@ function attachPreview(project) {
     disposed = true;
     clearTimeout(frameTimer);
     fetchController?.abort();
+    motionController?.abort();
+    motion.pause();
+    motion.removeAttribute("src");
+    motion.load();
     if (frameUrl) URL.revokeObjectURL(frameUrl);
     pause();
   };
@@ -2911,10 +3041,7 @@ function updateMixDraft(form) {
   if (dirty && confirmed) confirmed.checked = false;
   if (approve) approve.disabled = busy || dirty || !confirmed?.checked;
   const prepare = control('[data-action="prepare-mix"]');
-  if (prepare) {
-    const choice = project.mix.musicMode === "none" || (project.mix.musicMode === "track" && project.mix.music);
-    prepare.disabled = busy || dirty || !choice || state.config.audioAvailable === false;
-  }
+  if (prepare) prepare.disabled = busy || dirty || !musicReady(project) || state.config.audioAvailable === false;
   const saved = control("[data-mix-saved-review]");
   saved.hidden = dirty;
   if (dirty) saved.querySelector("audio")?.pause();
@@ -2959,8 +3086,20 @@ document.addEventListener("change", event => {
       openStudioView("styles");
     } else {
       state.newStyleId = control.value;
-      content.querySelector("#kickoff-style-details").innerHTML = kickoffStyleSummary(styleById(state.newStyleId));
+      const style = styleById(state.newStyleId);
+      content.querySelector("#kickoff-style-details").innerHTML = kickoffStyleSummary(style);
+      content.querySelector('#new-music-choice option[value="style"]').textContent = styleMusicLabel(style);
     }
+  } else if (control.matches("[data-music-choice]")) {
+    const custom = control.value === "custom";
+    const field = control.form.querySelector("[data-custom-music]");
+    field.hidden = !custom;
+    field.querySelector("select").disabled = !custom;
+    const save = control.form.querySelector("[data-save-music-choice]");
+    if (save) save.disabled = Boolean(state.project.busy);
+    else state.newMusicChoice = control.value;
+  } else if (control.id === "new-music-style") {
+    state.newMusicStyle = control.value;
   } else if (control.id === "new-recording") {
     state.newRecording = control.files[0] ?? null;
     content.querySelector("#kickoff-recording-details").innerHTML = kickoffRecordingSummary();
@@ -3064,7 +3203,7 @@ function importFile(name, data) {
   perform(() => upload(path, file), { busy: "Importing file…", success: "File imported." });
 }
 
-async function createProject(title, style) {
+async function createProject(title, style, musicChoice, musicStyle) {
   const recording = state.newRecording;
   const limit = state.config.maxAudioBytes;
   if (recording && !recording.size) {
@@ -3080,7 +3219,9 @@ async function createProject(title, style) {
   await perform(async () => {
     let project;
     try {
-      project = await post("/api/projects", { title, styleId: style.id, styleRevision: style.revision });
+      const request = { title, styleId: style.id, styleRevision: style.revision, musicChoice };
+      if (musicChoice === "custom") request.musicStyle = musicStyle;
+      project = await post("/api/projects", request);
     } catch (error) {
       styleChanged = error.status === 409;
       throw error;
@@ -3152,7 +3293,7 @@ document.addEventListener("submit", event => {
       setMessage("Choose a style for this project.", "error");
       return;
     }
-    createProject(title, style);
+    createProject(title, style, data.get("musicChoice"), data.get("musicStyle"));
   } else if (name === "derive-timings") {
     if (!canDeriveTimings()) return;
     if (state.project.transcript && !window.confirm("Replace the current word timings with new timings from the recording?")) return;
@@ -3192,10 +3333,18 @@ document.addEventListener("submit", event => {
     if (settings.musicMode && state.mixDraft) {
       perform(() => mutate("/mix", settings), { success: "Composition saved." });
     }
+  } else if (name === "music-choice") {
+    const choice = data.get("musicChoice");
+    if (!choice || choice === "legacy") return;
+    const style = data.get("musicStyle") ?? "";
+    const project = state.project;
+    if (choice === project.musicPreference?.choice && style === (project.musicPreference?.style ?? "")) return;
+    if (state.mixDraft && !window.confirm("Change the music choice and discard unsaved mix edits?")) return;
+    perform(() => mutate("/mix/music-choice", { choice, style }), { success: "Music choice saved." });
   } else if (name === "mix-preset") {
     const mix = state.project.mix;
-    if ((mix.music || mix.effects.length || state.mixDraft)
-        && !window.confirm("Replace the music and all sound effects with the new soundtrack?")) return;
+    if ((mix.music || state.mixDraft)
+        && !window.confirm("Replace the current music with the selected generic soundtrack?")) return;
     perform(() => mutate("/mix/preset", { preset: data.get("preset") }), {
       busy: "Creating the soundtrack…",
       success: "Soundtrack ready to review.",
@@ -3264,6 +3413,8 @@ document.addEventListener("click", event => {
     state.project = null;
     state.newTitle = "";
     state.newStyleId = "";
+    state.newMusicChoice = "style";
+    state.newMusicStyle = "";
     state.newRecording = null;
     state.returnToKickoff = false;
     openStage("intake", false);

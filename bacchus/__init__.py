@@ -3,5 +3,5 @@
 from pathlib import Path
 
 
-ENGINE_VERSION = "0.3.0"
+ENGINE_VERSION = "0.4.0"
 RESOURCES = Path(__file__).resolve().parent / "resources"

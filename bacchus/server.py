@@ -11,7 +11,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, style_archive, styles, timing_models, visual_review
+from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, score, style_archive, styles, timing_models, visual_review
 from .library import LibraryError
 from .runtime import APP_VERSION
 from .settings import SettingsError, directory_preference, provider_secrets, timing_model_directory
@@ -64,7 +64,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(error)}, error.status)
         except render.RenderError as error:
             self._json({"error": str(error)}, 422)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             pass
         except Exception:
             self.log_error("Request failed unexpectedly.")
@@ -102,6 +102,7 @@ class Handler(BaseHTTPRequestHandler):
                 "maxStyleReferenceImages": styles.MAX_REFERENCE_IMAGES,
                 "localTimingAvailable": self._timing_status()["ready"],
                 "styles": [{"id": style, "name": label} for style, label in STYLES.items()],
+                "musicStyles": [{"id": style, "name": label} for style, label in score.ARRANGEMENT_STYLES.items()],
                 "maxEffects": MAX_EFFECTS, "maxFxDuration": MAX_FX_DURATION,
                 "maxArtGenerations": MAX_ART_GENERATIONS, "maxTranscriptionCalls": MAX_TRANSCRIPTIONS,
                 "version": APP_VERSION,
@@ -167,6 +168,8 @@ class Handler(BaseHTTPRequestHandler):
             self._bytes(studio.preview(project_id, time), "image/png")
         elif tail == ["mix", "preview"]:
             self._file(studio.mix_preview(project_id), "audio/wav", "audio")
+        elif len(tail) == 2 and tail[0] == "motion-preview":
+            self._file(studio.motion_preview_file(project_id, tail[1]), "video/mp4", "video")
         elif len(tail) == 4 and tail[1] == "checks" and tail[3] == "proof":
             self._file(studio.review_proof(project_id, tail[0], tail[2]), "image/png", "art")
         elif len(tail) == 3 and tail[0] == "media":
@@ -275,15 +278,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/projects":
             data = self._body()
-            if isinstance(data, dict) and "styleId" in data:
-                fields(data, ("title", "styleId", "styleRevision"))
+            expected = ("title",)
+            if isinstance(data, dict):
+                if "styleId" in data or "styleRevision" in data:
+                    expected += ("styleId", "styleRevision")
+                expected += tuple(key for key in ("musicChoice", "musicStyle") if key in data)
+            fields(data, expected)
+            if "styleId" in data:
                 if type(data["styleRevision"]) is not int or data["styleRevision"] < 1:
                     raise WorkflowError("Choose a saved style revision.")
-                self._json(studio.create(data["title"], style_id=data["styleId"],
-                                         style_revision=data["styleRevision"]), 201)
-            else:
-                fields(data, ("title",))
-                self._json(studio.create(data["title"]), 201)
+            self._json(studio.create(
+                data["title"], style_id=data.get("styleId", "warm-editorial"), style_revision=data.get("styleRevision"),
+                music_choice=data.get("musicChoice", "style"), music_style=data.get("musicStyle"),
+            ), 201)
             return
         if path == "/api/demo":
             fields(self._body(), ())
@@ -292,6 +299,8 @@ class Handler(BaseHTTPRequestHandler):
         project_id, tail = self._project_route(path)
         if tail == ["library", "pin"]:
             self._json(studio.pin_library(project_id, self._body()))
+        elif tail == ["motion-preview"]:
+            self._json(studio.motion_preview(project_id, self._body()))
         elif tail == ["audio"]:
             self._json(studio.upload_audio(
                 project_id, self._revision(query), query.get("name", ["recording.wav"])[0],
@@ -354,7 +363,7 @@ class Handler(BaseHTTPRequestHandler):
     def _quit(self):
         studio = self.server.studio
         with studio.lock:
-            if (studio.jobs or studio.providers_in_use() or media_tools.INSTALL_LOCK.locked()
+            if (studio.jobs or studio.motion_jobs or studio.providers_in_use() or media_tools.INSTALL_LOCK.locked()
                     or studio.timing_models.installing or self.server.active_archive_transfers):
                 raise WorkflowError("Wait for the current operation to finish before quitting.", 409)
             self.server.closing = True

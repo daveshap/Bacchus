@@ -137,6 +137,38 @@ class StudioWorkflowTests(unittest.TestCase):
         self.upload_art("tan")
         self.approve_art()
 
+    def test_chart_requires_source_evidence_before_plan_can_pass(self):
+        self.lock_input()
+        scenes = two_scenes()
+        scenes[0].update(layout="layered", motion="still", layers=[{
+            "id": "made-up", "kind": "bar-chart", "box": {"x": 0, "y": 0, "w": 100, "h": 100},
+            "text": "", "artId": "", "artBrief": "", "unit": "million",
+            "items": [{"label": "cup", "value": 90}],
+            "enter": {"line": 0, "word": 0, "effect": "show", "duration": 0},
+            "leave": {"line": 0, "word": 0},
+        }])
+        self.change("plan", scenes=scenes)
+        with self.assertRaisesRegex(WorkflowError, "could not match 'cup' to 90 million"):
+            self.change("plan/approve")
+        self.assertFalse(self.studio.get(self.project_id)["plan"]["approved"])
+
+    def test_project_can_compose_original_music_and_keep_uploaded_effects(self):
+        self.assertEqual(self.project["musicPreference"]["effectiveChoice"], "original")
+        self.plan_with_art()
+        self.assertIsNone(self.project["mix"]["music"])
+        self.upload_mix("effects", "chime.wav", wav_tone(660, 0.3))
+        effects = [track["id"] for track in self.project["mix"]["effects"]]
+        self.change("mix/music-choice", choice="custom", style="warm")
+        self.change("mix/prepare")
+        music = self.project["mix"]["music"]
+        self.assertEqual(music["arrangement"]["style"], "warm")
+        self.assertEqual(music["arrangement"]["duration"], 2)
+        self.assertEqual([track["id"] for track in self.project["mix"]["effects"]], effects)
+        self.change("mix/approve", reviewed=True)
+        self.change("mix/music-choice", choice="generic", style=None)
+        self.assertNotIn("arrangement", self.project["mix"]["music"])
+        self.assertFalse(self.project["mix"]["approved"])
+
     def upload_art(self, color):
         self.project = self.studio.upload_art(
             self.project_id, self.project["revision"], "cup", "cup.jpg", jpeg(color),
@@ -606,6 +638,12 @@ class StudioWorkflowTests(unittest.TestCase):
         self.plan_with_art()
         self.approve_dry_mix()
         self.prepare_animation()
+        clip = self.studio.motion_preview(self.project_id, {
+            "revision": self.project["revision"], "start": 0.75, "end": 1.25,
+        })
+        self.assertEqual((clip["width"], clip["height"], clip["fps"], clip["frames"]), (1280, 720, 60, 30))
+        self.assertTrue(clip["decodedAudio"])
+        self.assertTrue(self.studio.motion_preview_file(self.project_id, clip["url"].rsplit("/", 1)[-1]).is_file())
         self.pass_animation_review()
         report = self.project["captionReview"]
         self.assertEqual(report["method"], "timed-words-v1")
@@ -637,8 +675,9 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertEqual(delivered["input"]["lines"], self.project["input"]["lines"])
         self.assertEqual(delivered["plan"]["hash"], self.project["plan"]["hash"])
         self.assertEqual(file["media"]["audio"], "aac")
-        self.assertEqual(file["media"]["frames"], 48)
-        self.assertEqual(file["media"]["decodedFrames"], 48)
+        self.assertEqual((file["media"]["width"], file["media"]["height"], file["media"]["fps"]), (3840, 2160, 60))
+        self.assertEqual(file["media"]["frames"], 120)
+        self.assertEqual(file["media"]["decodedFrames"], 120)
         self.assertTrue(file["media"]["decodedAudio"])
         self.assertAlmostEqual(file["media"]["duration"], 2, places=2)
         self.assertEqual(len(file["review"]["assets"]), 1)
@@ -655,6 +694,17 @@ class StudioWorkflowTests(unittest.TestCase):
         spoken = [word for cue in sections for line in cue.splitlines()[2:] for word in line.split()]
         self.assertEqual(spoken, SCRIPT.split())
         self.assertEqual(len(sections), report["cueCount"])
+
+        saved = self.studio._read(self.project_id)
+        saved["renderEngine"] = "0.3.0"
+        self.studio._save(saved)
+        reopened = Studio(self.studio.root)
+        upgraded = reopened.get(self.project_id)
+        self.assertFalse(upgraded["accepted"])
+        self.assertFalse(upgraded["mix"]["approved"])
+        self.assertIsNone(upgraded["export"])
+        self.assertEqual(upgraded["lastDelivery"]["deliveryId"], delivery_id)
+        self.assertEqual(reopened.media(self.project_id, "video", delivery_id)[0], video)
 
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_delivery_rerender_and_repair_keep_acceptance_and_last_good_files(self):

@@ -16,26 +16,40 @@ class Encoder:
     options: tuple[str, ...]
     input_options: tuple[str, ...] = ()
     executable: str | None = None
+    pixel_format: str = "yuv420p"
+    hardware_upload: bool = False
 
 
-CPU = Encoder("libx264", "CPU", ("-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"))
+COLOR_METADATA = {
+    "color_range": "tv", "color_space": "bt709", "color_transfer": "bt709", "color_primaries": "bt709",
+}
+COLOR_OPTIONS = (
+    "-color_range", "tv", "-colorspace", "bt709", "-color_trc", "bt709", "-color_primaries", "bt709",
+    # Write the VUI explicitly for encoders that do not preserve all stream color fields.
+    "-bsf:v", "h264_metadata=video_full_range_flag=0:matrix_coefficients=1:"
+    "colour_primaries=1:transfer_characteristics=1",
+)
+
+CPU = Encoder("libx264", "CPU", ("-preset", "veryfast", "-crf", "18"))
 NVENC = Encoder(
     "h264_nvenc", "NVIDIA NVENC",
     ("-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", "17", "-b:v", "0",
-     "-spatial-aq", "1", "-rc-lookahead", "32", "-profile:v", "high", "-pix_fmt", "yuv420p"),
+     "-spatial-aq", "1", "-rc-lookahead", "32", "-profile:v", "high"),
 )
 QUICK_SYNC = Encoder(
     "h264_qsv", "Intel Quick Sync",
-    ("-global_quality", "18", "-preset", "slow", "-pix_fmt", "nv12"),
+    ("-global_quality", "18", "-preset", "slow"),
     ("-init_hw_device", "qsv=bacchus,child_device_type=d3d11va"),
+    pixel_format="nv12",
 )
 AMF = Encoder(
     "h264_amf", "AMD AMF",
-    ("-quality", "quality", "-rc", "cqp", "-qp_i", "17", "-qp_p", "18", "-qp_b", "20", "-pix_fmt", "nv12"),
+    ("-quality", "quality", "-rc", "cqp", "-qp_i", "17", "-qp_p", "18", "-qp_b", "20"),
+    pixel_format="nv12",
 )
 VIDEO_TOOLBOX = Encoder(
     "h264_videotoolbox", "Apple VideoToolbox",
-    ("-allow_sw", "0", "-b:v", "8M", "-profile:v", "high", "-pix_fmt", "yuv420p"),
+    ("-allow_sw", "0", "-b:v", "35M", "-profile:v", "high"),
 )
 
 
@@ -46,8 +60,9 @@ def hardware_candidates(platform):
         return (VIDEO_TOOLBOX,)
     if platform.startswith("linux"):
         return (NVENC, *(
-            Encoder("h264_vaapi", "VAAPI", ("-vf", "format=nv12,hwupload", "-qp", "18"),
-                    ("-init_hw_device", f"vaapi=bacchus:{device}", "-filter_hw_device", "bacchus"))
+            Encoder("h264_vaapi", "VAAPI", ("-qp", "18"),
+                    ("-init_hw_device", f"vaapi=bacchus:{device}", "-filter_hw_device", "bacchus"),
+                    pixel_format="nv12", hardware_upload=True)
             for device in sorted(Path("/dev/dri").glob("renderD*"))
         ))
     return ()
@@ -70,12 +85,20 @@ def raw_input(width, height, fps):
             "-video_size", f"{width}x{height}", "-framerate", str(fps), "-i", "pipe:0"]
 
 
+def encoding_options(encoder):
+    # The renderer supplies full-range RGB. Convert to limited-range BT.709 before encoding or hardware upload.
+    conversion = f"scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format={encoder.pixel_format}"
+    if encoder.hardware_upload:
+        conversion += ",hwupload"
+    return ["-vf", conversion, "-c:v", encoder.name, *encoder.options, *COLOR_OPTIONS]
+
+
 def _trial(encoder, width, height, fps):
     try:
         result = subprocess.run(
             [encoder.executable or media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
              *encoder.input_options, *raw_input(width, height, fps), "-frames:v", "1",
-             "-an", "-c:v", encoder.name, *encoder.options, "-f", "h264", "pipe:1"],
+             "-an", *encoding_options(encoder), "-f", "h264", "pipe:1"],
             input=bytes(width * height * 3), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=10, **media_tools.process_options(),
         )

@@ -42,6 +42,18 @@ class VideoEncodingTests(unittest.TestCase):
         available.assert_not_called()
         trial.assert_not_called()
 
+    def test_conversion_and_tags_apply_to_software_and_hardware(self):
+        with patch.object(video_encoding.Path, "glob", return_value=[PurePosixPath("/dev/dri/renderD128")]):
+            for platform in ("win32", "darwin", "linux"):
+                for encoder in (video_encoding.CPU, *video_encoding.hardware_candidates(platform)):
+                    with self.subTest(encoder=encoder.name):
+                        args = video_encoding.encoding_options(encoder)
+                        self.assertEqual(args[-len(video_encoding.COLOR_OPTIONS):], list(video_encoding.COLOR_OPTIONS))
+                        expected = f"scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format={encoder.pixel_format}"
+                        if encoder.name == "h264_vaapi":
+                            expected += ",hwupload"
+                        self.assertEqual(args[args.index("-vf") + 1], expected)
+
     def test_auto_selects_nvidia_first_and_probes_the_requested_format(self):
         candidates = video_encoding.hardware_candidates("win32")
         with (

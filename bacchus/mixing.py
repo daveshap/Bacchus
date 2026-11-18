@@ -12,6 +12,15 @@ from . import media_tools
 SAMPLE_RATE = 48_000
 CHANNELS = 2
 MAX_MUSIC_REGIONS = 24
+TARGET_LUFS = -14.0
+DIALOGUE_LUFS = -16.0
+DELIVERY_CEILING_DBTP = -1.5
+MASTER_CEILING_DBTP = -2.0  # Leave room for the AAC encoder's intersample peaks.
+LOUDNESS_TOLERANCE_LU = 1.0
+AAC_BITRATE = "384k"
+_METER_BLOCK_SECONDS = 0.4
+_MASTER_ATTEMPTS = 4
+_MAX_GAIN_DB = 24.0
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _METER_NUMBER = r"(?:-?\d+(?:\.\d+)?|-inf)"
 
@@ -113,7 +122,7 @@ def _music_volume(project, gain):
     return f"volume='if(isnan(t),{base:.12f},max(0,{expression}))':eval=frame"
 
 
-def _sound_options(project, folder, samples):
+def _sound_options(project, folder, samples, voice_gain):
     window = f"apad=whole_len={samples},atrim=end_sample={samples}"
     audio_format = f"aformat=sample_fmts=fltp:sample_rates={SAMPLE_RATE}:channel_layouts=stereo"
     options, filters, outputs = [], [], []
@@ -134,12 +143,15 @@ def _sound_options(project, folder, samples):
     if mix.get("musicMode") == "track" and not music:
         raise MixError("The selected music track is missing.")
 
-    narration_path = None
     if voice:
         narration_path = _verified_wav(folder, "audio", voice["hash"], "Narration")
         narration = source(narration_path)
         split = ",asplit=2[voice][sidechain]" if music else "[voice]"
-        filters.append(f"{narration},volume=-3dB,{window}{split}")
+        filters.append(
+            f"{narration},highpass=f=70,volume={voice_gain:.3f}dB,"
+            "acompressor=threshold=0.178:ratio=2.2:attack=5:release=90:knee=2.8:"
+            f"link=maximum:detection=peak,{window}{split}"
+        )
         outputs.append("[voice]")
 
     if music:
@@ -148,17 +160,19 @@ def _sound_options(project, folder, samples):
         music_samples, music_rate, _, _ = _wav_format(music_path)
         if not music_samples:
             raise MixError("The music track has no samples.")
-        loop_samples = music_samples if music_samples * SAMPLE_RATE < samples * music_rate else None
+        loop_samples = None
+        if not music.get("arrangement") and music_samples * SAMPLE_RATE < samples * music_rate:
+            loop_samples = music_samples
         backing = source(music_path, loop_samples=loop_samples)
         volume = _music_volume(project, gain)
         fade = min(int(SAMPLE_RATE * 0.33), samples // 4)
         fades = f",afade=t=in:ns={fade},afade=t=out:ss={samples - fade}:ns={fade}"
         track = f"{backing},{volume},{window}{fades}"
         if voice:
-            filters.append(f"{track}[music]")
+            filters.append(f"{track},equalizer=f=2300:t=o:w=2:g=-4[music]")
             filters.append(
                 "[music][sidechain]sidechaincompress=threshold=0.035:ratio=6:"
-                "attack=12:release=240:link=maximum:detection=rms[backing]"
+                "attack=12:release=900:link=maximum:detection=rms[backing]"
             )
         else:
             filters.append(f"{track}[backing]")
@@ -178,16 +192,13 @@ def _sound_options(project, folder, samples):
         return [
             "-f", "lavfi", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=stereo",
             "-filter_complex", f"[0:a]{window}[mix]",
-        ], narration_path
+        ]
 
     graph = "".join(outputs)
     if len(outputs) > 1:
         graph += f"amix=inputs={len(outputs)}:duration=longest:normalize=0,"
-    filters.append(
-        f"{graph}{window},alimiter=limit=0.8912509:attack=5:"
-        f"release=50:level=false:latency=true,{window},asetpts=N/SR/TB[mix]"
-    )
-    return [*options, "-filter_complex", ";".join(filters)], narration_path
+    filters.append(f"{graph}{window},asetpts=N/SR/TB[mix]")
+    return [*options, "-filter_complex", ";".join(filters)]
 
 
 def measure_levels(path, duration):
@@ -213,6 +224,121 @@ def measure_levels(path, duration):
             raise MixError("FFmpeg did not report complete soundtrack levels.")
         number = measured[1]
         levels[key] = None if number == "-inf" else float(number)
+    # A soundtrack shorter than one BS.1770 gating block has no integrated reading.
+    if duration < _METER_BLOCK_SECONDS or levels["integratedLufs"] == -70.0:
+        levels["integratedLufs"] = None
+    return levels
+
+
+def _render_audio(inputs, output, duration, *options):
+    command = [
+        media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror",
+        "-y", *inputs, *options, "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+        "-fflags", "+bitexact", "-flags:a", "+bitexact", str(output),
+    ]
+    try:
+        subprocess.run(command, check=True, timeout=max(45, duration * 2), capture_output=True,
+                       **media_tools.process_options())
+    except (OSError, subprocess.SubprocessError) as error:
+        raise MixError("FFmpeg could not produce the soundtrack.") from error
+
+
+def _gain_to(target, measured):
+    return 0.0 if measured is None else min(_MAX_GAIN_DB, target - measured)
+
+
+def _master_pass(source, output, duration, samples, gain, peak, ceiling):
+    filters = [f"volume={gain:.4f}dB"]
+    if peak is not None and peak + gain > ceiling:
+        limit = 10 ** (ceiling / 20)
+        filters.extend((
+            "aresample=192000",
+            f"alimiter=limit={limit:.9f}:attack=5:release=120:level=false:latency=true",
+            f"aresample={SAMPLE_RATE}",
+        ))
+    filters.append(f"apad=whole_len={samples},atrim=end_sample={samples}")
+    _render_audio(["-i", str(source)], output, duration, "-af", ",".join(filters), "-c:a", "pcm_s16le")
+    return measure_levels(output, duration)
+
+
+def _aac_levels(master, work, duration):
+    preview = work / "aac-check.m4a"
+    _render_audio(["-i", str(master)], preview, duration, "-c:a", "aac", "-b:a", AAC_BITRATE)
+    return measure_levels(preview, duration)
+
+
+def _master(source, work, duration, samples, input_levels):
+    gain = _gain_to(TARGET_LUFS, input_levels["integratedLufs"])
+    ceiling = MASTER_CEILING_DBTP
+    candidate, master = work / "trial.wav", work / "master.wav"
+    best = float("inf")
+    chosen = None
+    for _ in range(_MASTER_ATTEMPTS):
+        levels = _master_pass(source, candidate, duration, samples, gain,
+                              input_levels["truePeakDbtp"], ceiling)
+        loudness = levels["integratedLufs"]
+        peak = levels["truePeakDbtp"]
+        if peak is not None and peak > MASTER_CEILING_DBTP:
+            ceiling -= peak - MASTER_CEILING_DBTP + 0.1
+            continue
+        error = 0 if loudness is None else TARGET_LUFS - loudness
+        if abs(error) < best:
+            best = abs(error)
+            candidate.replace(master)
+            chosen = levels, gain
+        if abs(error) <= 0.2:
+            break
+        next_gain = min(_MAX_GAIN_DB, gain + error)
+        if abs(next_gain - gain) < 0.05:
+            break
+        gain = next_gain
+    if chosen is None:
+        raise MixError("The soundtrack could not be mastered within the true-peak limit.")
+
+    levels, gain = chosen
+    encoded = _aac_levels(master, work, duration)
+    peak = encoded["truePeakDbtp"]
+    if peak is not None and peak > DELIVERY_CEILING_DBTP:
+        correction = DELIVERY_CEILING_DBTP - peak - 0.2
+        levels = _master_pass(master, candidate, duration, samples, correction, levels["truePeakDbtp"],
+                              MASTER_CEILING_DBTP)
+        candidate.replace(master)
+        gain += correction
+        encoded = _aac_levels(master, work, duration)
+        if encoded["truePeakDbtp"] is not None and encoded["truePeakDbtp"] > DELIVERY_CEILING_DBTP:
+            raise MixError("The soundtrack's AAC encode exceeds the true-peak ceiling.")
+
+    loudness = encoded["integratedLufs"]
+    status = "target"
+    if loudness is None:
+        status = "silence" if encoded["truePeakDbtp"] is None else "unmetered"
+    elif abs(loudness - TARGET_LUFS) > LOUDNESS_TOLERANCE_LU:
+        status = "outside-target"
+    record = {
+        "targetLufs": TARGET_LUFS, "masterCeilingDbtp": MASTER_CEILING_DBTP,
+        "deliveryCeilingDbtp": DELIVERY_CEILING_DBTP, "appliedGainDb": round(gain, 3),
+        "status": status, "aacCheck": encoded,
+    }
+    return master, levels, record
+
+
+def verify_delivery(path, duration, approved_mix):
+    """Verify the actual encoded AAC against the mix and its recorded mastering check."""
+    levels = measure_levels(path, duration)
+    if not (record := approved_mix.get("mastering")):
+        return levels
+    loudness, peak = levels["integratedLufs"], levels["truePeakDbtp"]
+    expected = record["aacCheck"]["integratedLufs"]
+    if (loudness is None) != (expected is None) or (
+        loudness is not None and abs(loudness - expected) > LOUDNESS_TOLERANCE_LU
+    ):
+        raise MixError("The encoded audio loudness differs from the approved soundtrack.")
+    if (peak is not None and peak > DELIVERY_CEILING_DBTP) or (
+        record["status"] == "target" and (
+            loudness is None or abs(loudness - TARGET_LUFS) > LOUDNESS_TOLERANCE_LU
+        )
+    ):
+        raise MixError("The encoded audio did not meet the approved loudness and true-peak targets.")
     return levels
 
 
@@ -221,50 +347,51 @@ def prepare_mix(project, folder, destination, frame_count, fps):
         raise MixError("Preparing the soundtrack needs FFmpeg and FFprobe.")
     samples = _sample_count(frame_count, fps)
     duration = samples / SAMPLE_RATE
-    options, narration_path = _sound_options(project, folder, samples)
+    voice = project.get("audio")
     narration = None
-    if narration_path:
+    voice_gain = 0.0
+    if voice:
+        narration_path = _verified_wav(folder, "audio", voice["hash"], "Narration")
         voice_samples, voice_rate, _, _ = _wav_format(narration_path)
         voice_duration = voice_samples / voice_rate
         if (not voice_samples or voice_duration > duration
                 or abs(voice_duration - project["input"]["duration"]) > 1 / voice_rate):
             raise MixError("The cut does not cover the complete recording.")
         voice_levels = measure_levels(narration_path, voice_duration)
+        voice_gain = _gain_to(DIALOGUE_LUFS, voice_levels["integratedLufs"])
         narration = {
             "samples": voice_samples, "sampleRate": voice_rate, "duration": voice_duration,
             "integratedLufs": voice_levels["integratedLufs"], "truePeakDbtp": voice_levels["truePeakDbtp"],
         }
+    options = _sound_options(project, folder, samples, voice_gain)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".bacchus-mix-", dir=destination.parent) as work:
-        output = Path(work) / "mix.wav"
-        command = [
-            media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror",
-            *options, "-map", "[mix]", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-            "-c:a", "pcm_s16le", "-fflags", "+bitexact", "-flags:a", "+bitexact", str(output),
-        ]
-        try:
-            subprocess.run(command, check=True, timeout=max(45, duration), capture_output=True,
-                           **media_tools.process_options())
-        except (OSError, subprocess.SubprocessError) as error:
-            raise MixError("FFmpeg could not produce the soundtrack.") from error
+        work = Path(work)
+        combined = work / "combined.wav"
+        _render_audio(options, combined, duration, "-map", "[mix]", "-c:a", "pcm_f32le", "-rf64", "auto")
+        combined_levels = measure_levels(combined, duration)
+        output, levels, mastering = _master(combined, work, duration, samples, combined_levels)
         if _wav_format(output) != (samples, SAMPLE_RATE, CHANNELS, 2):
             raise MixError("The soundtrack does not cover the complete cut in PCM.")
-        levels = measure_levels(output, duration)
         warnings = []
         if narration and narration["truePeakDbtp"] is None:
             warnings.append("The narration recording has no measurable peak signal.")
-        if levels["truePeakDbtp"] is None and narration:
+        if mastering["status"] == "silence" and narration:
             warnings.append("The soundtrack has no measurable peak signal.")
-        elif levels["truePeakDbtp"] is not None and levels["truePeakDbtp"] >= 0:
-            warnings.append("The soundtrack reaches or exceeds 0 dB true peak.")
+        elif mastering["status"] == "unmetered":
+            warnings.append("This soundtrack has no reliable integrated loudness reading.")
+        elif mastering["status"] == "outside-target":
+            warnings.append(
+                f"The AAC check measured {mastering['aacCheck']['integratedLufs']:.1f} LUFS. "
+                f"The target is {TARGET_LUFS:.0f} LUFS. Listen before approving the soundtrack."
+            )
         if narration and (project["mix"].get("musicMode") == "track" or project["mix"].get("effects")):
-            voice_loudness = narration["integratedLufs"]
-            mix_loudness = levels["integratedLufs"]
-            if voice_loudness is not None and mix_loudness is not None and mix_loudness > voice_loudness + 3:
-                warnings.append("The mix measures much louder than the recording. Listen for music or effects masking words.")
+            unmastered = combined_levels["integratedLufs"]
+            if unmastered is not None and unmastered > DIALOGUE_LUFS + 3:
+                warnings.append("Listen for music or effects masking words.")
         digest = _sha256(output)
         output.replace(destination)
     return {
         "sha256": digest, "duration": duration, "sampleRate": SAMPLE_RATE, "channels": CHANNELS,
-        "samples": samples, "levels": levels, "narration": narration, "warnings": warnings,
+        "samples": samples, "levels": levels, "narration": narration, "warnings": warnings, "mastering": mastering,
     }

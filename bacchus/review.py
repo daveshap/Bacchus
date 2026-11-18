@@ -273,15 +273,16 @@ def animation_proof_png(project, folder: Path, check) -> bytes:
     )
     draw = ImageDraw.Draw(sheet)
     _text(draw, (margin, 18), selected["title"], 27, width=sheet.width - 2 * margin)
-    bases = {}
+    previous_index = None
     for tile, sample in enumerate(selected["samples"]):
         row, column = divmod(tile, columns)
         x = margin + column * (width + margin)
         y = header + row * (height + caption + margin)
         index, elapsed = composition.at(sample["time"])
-        if index not in bases:
-            bases[index] = composition.prepare(index)
-        frame = composition.draw_prepared(index, elapsed, bases[index])
+        if index != previous_index:
+            prepared = composition.prepare(index)
+            previous_index = index
+        frame = composition.draw_prepared(index, elapsed, prepared)
         sheet.paste(frame.resize((width, height), Image.Resampling.LANCZOS), (x, y))
         _text(
             draw, (x, y + height + 7), f"{_timecode(sample['time'])}  {sample['label']}", 20,

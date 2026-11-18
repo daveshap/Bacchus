@@ -65,8 +65,10 @@ def available():
 @lru_cache(maxsize=8)
 def _supports_bacchus(encoder, modified):
     requirements = {
-        "-encoders": ("libx264", "aac", "pcm_s16le"),
-        "-filters": ("sidechaincompress", "alimiter", "aloop", "ebur128"),
+        "-encoders": ("libx264", "aac", "pcm_s16le", "pcm_f32le"),
+        "-filters": ("sidechaincompress", "acompressor", "highpass", "equalizer", "alimiter",
+                     "aresample", "aloop", "ebur128", "scale"),
+        "-bsfs": ("h264_metadata",),
     }
     try:
         for flag, needed in requirements.items():

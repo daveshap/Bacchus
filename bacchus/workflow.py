@@ -13,7 +13,7 @@ from tempfile import TemporaryDirectory
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from . import ENGINE_VERSION, api_log, audio, captions, delivery, gates, local_timing, planning, providers, render, score, styles, timing, timing_models, visual_review
+from . import ENGINE_VERSION, api_log, audio, captions, chart_evidence, delivery, gates, local_timing, planning, providers, render, score, styles, timing, timing_models, visual_review
 from .library import Library, LibraryError
 from .settings import timing_model_directory, video_encoder_mode
 
@@ -29,6 +29,7 @@ MAX_TRANSCRIPTIONS = 3
 MAX_PROJECT_ASSETS = 128
 MAX_LIBRARY_CHOICES = 20
 MAX_CACHED_CAPTIONS = 8
+MAX_MOTION_PREVIEWS = 4
 LIBRARY_STOP_WORDS = set("about across also and are can for from has have how into its more that the their them then there these this those was were what when where which who will with would you your".split())
 STYLES = {
     "warm-editorial": "Warm editorial",
@@ -40,6 +41,8 @@ PROJECT_ID = re.compile(r"[0-9a-f]{32}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 PACK_PIN = {"name": planning.PACK["name"], "version": planning.PACK["version"], "hash": planning.PACK_HASH}
 PREVIOUS_PACK_HASH = "4d632b120c258a10e2da5f3ee7d9a3263f7b6415c12b1d8b81ec8022d3a6cba8"
+PREVIOUS_PROMPT_HASH = "cb0e1e2db7f2578dd8638fe2845bc3cc374702754c3e95c08b00b93a352f3c45"
+MUSIC_CHOICES = ("style", "none", "original", "generic", "custom", "upload")
 
 
 class WorkflowError(Exception):
@@ -255,6 +258,26 @@ def new_mix(decision=None):
     return {"musicMode": decision, "music": None, "effects": [], "musicRegions": [], "approved": False}
 
 
+def music_preference(style, choice, music_style=None):
+    if not isinstance(choice, str) or choice not in MUSIC_CHOICES:
+        raise WorkflowError("Choose how to use music in this project.")
+    if choice == "custom":
+        if not isinstance(music_style, str) or music_style not in score.ARRANGEMENT_STYLES:
+            raise WorkflowError("Choose an available style for the original score.")
+    else:
+        music_style = None
+    answers = style["answers"]
+    effective = ("original" if answers["music"] else "none") if choice == "style" else choice
+    return {"choice": choice, "style": music_style, "effectiveChoice": effective}
+
+
+def require_chart_evidence(source, scenes):
+    findings = chart_evidence.chart_findings(source, scenes)
+    if findings:
+        extra = f" ({len(findings) - 1} other chart items need review.)" if len(findings) > 1 else ""
+        raise WorkflowError(findings[0] + extra, 422)
+
+
 def number(value, label, low, high):
     if type(value) not in (float, int) or not low <= value <= high:
         raise WorkflowError(f"{label} must be between {low} and {high}.")
@@ -317,8 +340,10 @@ def candidate(project, folder, verify=True, require_mix=True):
     if verify:
         if make_input(project, source["script"], source["intention"]) != source:
             raise WorkflowError("The locked narration does not match its recorded fingerprint.", 409)
-        if digest(encoded(validate_scenes(project, plan["scenes"]))) != plan["hash"]:
+        checked = validate_scenes(project, plan["scenes"])
+        if digest(encoded(checked)) != plan["hash"]:
             raise WorkflowError("The approved scene plan does not match its recorded fingerprint.", 409)
+        require_chart_evidence(source, checked)
         if audio and file_digest(folder / "audio" / f"{audio['hash']}.wav") != audio["hash"]:
             raise WorkflowError("The locked narration recording is missing or no longer matches.", 409)
         if audio and audio.get("originalHash"):
@@ -364,6 +389,10 @@ def set_plan(project, scenes, source):
     if project["plan"] and project["plan"]["hash"] == plan["hash"]:
         return
     project["plan"] = plan
+    if (project.get("musicPreference") or {}).get("effectiveChoice") in ("original", "custom"):
+        mix = project["mix"]
+        mix.update(music=None, approved=False)
+        mix.pop("rendered", None)
     reset_candidate(project)
 
 
@@ -422,6 +451,7 @@ class Studio:
         self.mix_lock = threading.Lock()
         self.active_style_drafts = 0
         self.jobs = set()
+        self.motion_jobs = set()
         self._recover_jobs()
 
     @property
@@ -502,6 +532,20 @@ class Studio:
                 for name in ("transcriptionRuns", "artRuns"):
                     if project[name] and project[name][-1]["status"] == "running":
                         project[name][-1].update(status="interrupted", finishedAt=now())
+            if project.get("renderEngine") != ENGINE_VERSION:
+                active = project.get("export") or {}
+                if active.get("status") == "complete" and active.get("deliveryId"):
+                    previous = project.setdefault("deliveries", [])
+                    if not any(record["deliveryId"] == active["deliveryId"] for record in previous):
+                        previous.append(active)
+                project["renderEngine"] = ENGINE_VERSION
+                project["mix"].update(approved=False)
+                project["mix"].pop("rendered", None)
+                reset_candidate(project)
+                plan = project["plan"]
+                if project["input"] and plan and chart_evidence.chart_findings(project["input"], plan["scenes"]):
+                    plan["approved"] = False
+                changed = True
             if changed:
                 self._save(project)
 
@@ -561,6 +605,8 @@ class Studio:
                             project["transcript"] = {**transcript, **records}
                     except (OSError, timing.TimingError):
                         pass
+            elif project.get("pack", {}).get("hash") == PREVIOUS_PROMPT_HASH:
+                project["pack"] = PACK_PIN
             if "review" not in project:
                 if not project["busy"] and (project["export"] or {}).get("status") != "complete":
                     reset_candidate(project)
@@ -614,6 +660,10 @@ class Studio:
             view.update(captionReview=None, captionReviewError=str(error))
         folder = self._folder(project_id)
         view["assetChecks"] = gates.view(view, folder, "assets")
+        for check in view["assetChecks"]:
+            scene = view["plan"]["scenes"][check["scene"] - 1]
+            lines = view["input"]["lines"][scene["startLine"] - 1:scene["endLine"]]
+            check["narrationText"] = " ".join(line["text"] for line in lines)
         view.pop("review")
         for asset in view["assets"]:
             uses = [check for check in view["assetChecks"] if check["assetId"] == asset["id"]]
@@ -632,6 +682,9 @@ class Studio:
         )
         chosen_style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
         view["styleSnapshot"] = self.style_view(chosen_style, include_count=False)
+        if not view.get("musicPreference"):
+            decision = "upload" if mix["music"] else ("none" if mix["musicMode"] == "none" else "style")
+            view["musicPreference"] = music_preference(chosen_style, decision)
         planner_runs = view.pop("plannerRuns")
         view["plannerCalls"] = len(planner_runs)
         view["plannerLastRun"] = planner_runs[-1] if planner_runs else None
@@ -728,7 +781,8 @@ class Studio:
                     continue
             return False
 
-    def create(self, title, demo=False, *, style_id="warm-editorial", style_revision=None):
+    def create(self, title, demo=False, *, style_id="warm-editorial", style_revision=None,
+               music_choice="style", music_style=None):
         chosen = self.styles.get(style_id, style_revision)
         project = {
             "id": uuid.uuid4().hex, "title": text_value(title, "Project title", 120, True),
@@ -737,7 +791,8 @@ class Studio:
             "plannerRuns": [], "approvals": [],
             "style": chosen["visualPreset"], "styleSnapshot": chosen, "mix": new_mix("none") if demo else new_mix(),
             "demo": demo, "transcript": None, "transcriptionRuns": [], "artRuns": [],
-            "review": gates.new_review(),
+            "review": gates.new_review(), "renderEngine": ENGINE_VERSION,
+            "musicPreference": music_preference(chosen, "none" if demo else music_choice, music_style),
         }
         if demo:
             script = (
@@ -808,23 +863,21 @@ class Studio:
         return version["hash"] == asset["hash"]
 
     def _approve_plan(self, project):
-        require_source_cues(project)
+        source = require_source_cues(project)
         plan = project["plan"]
         if not plan:
             raise WorkflowError("Save a scene plan first.", 409)
+        require_chart_evidence(source, plan["scenes"])
         if not plan["approved"]:
             plan["approved"] = True
             project["approvals"].append({"kind": "plan", "hash": plan["hash"], "at": now()})
             style = project.get("styleSnapshot")
-            if style and project["mix"]["musicMode"] is None and not project["mix"]["effects"]:
+            if style and project["mix"]["musicMode"] is None:
                 folder = self._folder(project["id"])
-                answers = style["answers"]
-                if answers["music"]:
-                    self._preset_mix(project, folder, answers["musicPreset"])
-                else:
-                    mix = new_mix("none")
-                    if answers["soundEffects"]:
-                        mix["effects"] = self._transition_accents(project, folder)
+                preference = project.setdefault("musicPreference", music_preference(style, "style"))
+                self._select_music(project, folder, preference)
+                if style["answers"]["soundEffects"] and not project["mix"]["effects"]:
+                    mix = {**project["mix"], "effects": self._transition_accents(project, folder)}
                     self._update_mix(project, mix)
 
     def change(self, project_id, action, data):
@@ -841,6 +894,8 @@ class Studio:
             params = ("reviewed",)
         if action == "mix/preset":
             params = ("preset",)
+        if action == "mix/music-choice":
+            params = ("choice", "style")
         if action == "export" and isinstance(data, dict) and "rerender" in data:
             params = ("rerender",)
         fields(data, ("revision", *params))
@@ -897,6 +952,9 @@ class Studio:
                 self._approve_plan(project)
             elif action == "mix":
                 self._edit_mix(project, data)
+            elif action == "mix/music-choice":
+                style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+                self._select_music(project, folder, music_preference(style, data["choice"], data["style"]))
             elif action == "mix/approve":
                 if data["reviewed"] is not True:
                     raise WorkflowError("Review and confirm the prepared soundtrack before approving it.", 409)
@@ -985,7 +1043,8 @@ class Studio:
             raise WorkflowError("Lock the narration before composing audio.", 409)
         mix = deepcopy(project["mix"])
         mode = data["musicMode"]
-        if mode not in ("none", "track") or mode == "track" and not mix["music"]:
+        generated = (project.get("musicPreference") or {}).get("effectiveChoice") in ("original", "custom")
+        if mode not in ("none", "track") or mode == "track" and not (mix["music"] or generated):
             raise WorkflowError("Choose no music or import a soundtrack.")
         gain = number(data["musicGainDb"], "Music gain", -48, 0)
         if mix["music"]:
@@ -1005,12 +1064,31 @@ class Studio:
         if set(updates) != {effect["id"] for effect in mix["effects"]}:
             raise WorkflowError("The sound effects changed. Refresh and try again.", 409)
         mix["effects"] = [{**effect, **updates[effect["id"]]} for effect in mix["effects"]]
+        if mode == "none" and mix["musicMode"] != "none":
+            style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+            project["musicPreference"] = music_preference(style, "none")
         mix["musicMode"] = mode
         try:
             mix["musicRegions"] = render.validate_music_regions(project, data.get("musicRegions", mix.get("musicRegions", [])))
         except render.RenderError as error:
             raise WorkflowError(str(error)) from error
         self._update_mix(project, mix)
+
+    def _select_music(self, project, folder, preference):
+        style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+        mix = project["mix"]
+        selected = preference["effectiveChoice"]
+        if selected == "generic" and not (project.get("plan") or {}).get("approved"):
+            raise WorkflowError("Approve the scene plan before creating a soundtrack.", 409)
+        if preference == project.get("musicPreference") and mix["musicMode"] is not None:
+            return
+        project["musicPreference"] = preference
+        if selected == "generic":
+            self._preset_mix(project, folder, style["answers"]["musicPreset"])
+        else:
+            self._update_mix(project, {
+                **mix, "musicMode": "none" if selected == "none" else "track", "music": None, "musicRegions": [],
+            })
 
     def _preset_mix(self, project, folder, preset):
         if not isinstance(preset, str) or preset not in score.PRESETS:
@@ -1019,9 +1097,9 @@ class Studio:
             raise WorkflowError("Approve the scene plan before creating a soundtrack.", 409)
         raw_music, music_duration = score.soundtrack(preset)
         music = self._store_track(folder, score.PRESETS[preset], raw_music, music_duration, -16)
-        style = project.get("styleSnapshot")
-        effects = self._transition_accents(project, folder) if not style or style["answers"]["soundEffects"] else []
-        self._update_mix(project, {"musicMode": "track", "music": music, "effects": effects,
+        style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+        project["musicPreference"] = music_preference(style, "generic")
+        self._update_mix(project, {"musicMode": "track", "music": music, "effects": project["mix"]["effects"],
                                    "musicRegions": [], "approved": False})
 
     def _transition_accents(self, project, folder):
@@ -1052,6 +1130,8 @@ class Studio:
             mix = deepcopy(project["mix"])
             if kind == "music":
                 mix.update(musicMode="track", music=self._store_track(folder, name, normalized, duration, -24))
+                style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+                project["musicPreference"] = music_preference(style, "upload")
             else:
                 if len(mix["effects"]) >= MAX_EFFECTS:
                     raise WorkflowError(f"Use at most {MAX_EFFECTS} sound effects.")
@@ -1094,12 +1174,26 @@ class Studio:
         with self.lock:
             project = self._edit(project_id, revision)
             folder = self._folder(project_id)
-            recipe = mix_record(project, folder, require_approval=False)
+            require_source_cues(project)
+            mix = project["mix"]
+            preference = project.get("musicPreference") or {}
+            arrangement = None
+            if mix["musicMode"] == "track" and preference.get("effectiveChoice") in ("original", "custom"):
+                if not (project.get("plan") or {}).get("approved"):
+                    raise WorkflowError("Approve the scene plan before composing an original score.", 409)
+                style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+                arrangement = score.arrangement(project, preference.get("style") or style["answers"]["musicPreset"])
+            track = mix["music"] or {}
+            compose = arrangement is not None and (
+                track.get("arrangement") != arrangement
+                or file_digest(folder / "audio" / f"{track['hash']}.wav") != track["hash"]
+            )
+            if not compose:
+                recipe = mix_record(project, folder, require_approval=False)
             if project["audio"] and file_digest(folder / "audio" / f"{project['audio']['hash']}.wav") != project["audio"]["hash"]:
                 raise WorkflowError("The narration changed before soundtrack preparation.", 409)
-            key = mix_key(project, recipe)
-            previous = project["mix"].get("rendered")
-            if previous and previous.get("recipeHash") == key:
+            previous = mix.get("rendered")
+            if not compose and previous and previous.get("recipeHash") == mix_key(project, recipe):
                 try:
                     render.verify_mix(folder, previous, project["input"]["duration"])
                     return self._view(project)
@@ -1108,25 +1202,42 @@ class Studio:
             project["busy"] = "preparing soundtrack"
             self._save(project)
         directory = folder / "mixes"
-        temporary = directory / f".{uuid.uuid4().hex}.wav"
+        staging = folder / "exports"
         try:
             directory.mkdir(exist_ok=True)
-            result = render.export_mix(project, folder, temporary)
-            if mix_record(project, folder, require_approval=False) != recipe or (
-                project["audio"] and file_digest(folder / "audio" / f"{project['audio']['hash']}.wav") != project["audio"]["hash"]
-            ):
-                raise WorkflowError("An audio source changed during preparation.", 409)
-            output = directory / f"{result['sha256']}.wav"
-            if not output.exists() or file_digest(output) != result["sha256"]:
-                temporary.replace(output)
+            staging.mkdir(exist_ok=True)
+            with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=staging) as work:
+                if compose:
+                    track = Path(work) / "score.wav"
+                    duration = score.write_arrangement(track, arrangement)
+                    content_hash = file_digest(track)
+                    if not content_hash:
+                        raise WorkflowError("The composed score could not be saved.", 422)
+                    target = folder / "audio" / f"{content_hash}.wav"
+                    target.parent.mkdir(exist_ok=True)
+                    if file_digest(target) != content_hash:
+                        track.replace(target)
+                    name = score.ARRANGEMENT_STYLES[arrangement["style"]]
+                    mix["music"] = {"name": f"Original score · {name}", "hash": content_hash, "duration": duration,
+                                    "gainDb": (mix["music"] or {}).get("gainDb", -22), "arrangement": arrangement}
+                    recipe = mix_record(project, folder, require_approval=False)
+                key = mix_key(project, recipe)
+                temporary = Path(work) / "mix.wav"
+                result = render.export_mix(project, folder, temporary)
+                if mix_record(project, folder, require_approval=False) != recipe or (
+                    project["audio"] and file_digest(folder / "audio" / f"{project['audio']['hash']}.wav") != project["audio"]["hash"]
+                ):
+                    raise WorkflowError("An audio source changed during preparation.", 409)
+                output = directory / f"{result['sha256']}.wav"
+                if file_digest(output) != result["sha256"]:
+                    temporary.replace(output)
             result["recipeHash"] = key
             render.verify_mix(folder, result, project["input"]["duration"])
             project["mix"].update(rendered=result, approved=False)
             reset_candidate(project)
-        except render.RenderError as error:
+        except (render.RenderError, OSError, ValueError) as error:
             raise WorkflowError(str(error), 422) from error
         finally:
-            temporary.unlink(missing_ok=True)
             with self.lock:
                 project["busy"] = None
                 self._save(project)
@@ -1707,6 +1818,56 @@ class Studio:
             folder = self._folder(project_id)
             self._require_prepared(project, folder, verify=False)
         return render.preview(project, folder, time)
+
+    def motion_preview(self, project_id, data):
+        fields(data, ("revision", "start", "end"))
+        start, end = data["start"], data["end"]
+        if (type(start) not in (int, float) or type(end) not in (int, float)
+                or not 0 <= start < end <= MAX_DURATION or end - start > render.MAX_PREVIEW_SECONDS + 1e-6):
+            raise WorkflowError("Choose up to 12 seconds of motion to preview.")
+        with self.lock:
+            project = self._edit(project_id, data["revision"])
+            source = require_source_cues(project)
+            if end > source["duration"] + 1e-6:
+                raise WorkflowError("The motion preview must fit within the approved recording.")
+            if project_id in self.motion_jobs:
+                raise WorkflowError("Wait for the current motion preview to finish.", 409)
+            folder = self._folder(project_id)
+            record = self._require_prepared(project, folder)
+            directory = folder / "review" / "motion"
+            key = digest(uuid.uuid4().bytes)
+            destination = directory / f"{key}.mp4"
+            self.motion_jobs.add(project_id)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            staging = folder / "exports"
+            staging.mkdir(exist_ok=True)
+            with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=staging) as work:
+                clip = Path(work) / "preview.mp4"
+                result = render.export_motion_preview(project, folder, clip, start, min(end, source["duration"]),
+                                                      approved_mix=record["mix"]["rendered"])
+                with self.lock:
+                    current = self._edit(project_id, data["revision"])
+                    if self._require_prepared(current, folder) != record:
+                        raise WorkflowError("The candidate changed. Prepare a preview of the current cut.", 409)
+                    clip.replace(destination)
+            return {**result, "url": f"/api/projects/{project_id}/motion-preview/{key}"}
+        finally:
+            with self.lock:
+                self.motion_jobs.discard(project_id)
+                try:
+                    files = sorted(directory.glob("*.mp4"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+                    for previous in files[MAX_MOTION_PREVIEWS:]:
+                        previous.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def motion_preview_file(self, project_id, key):
+        folder = self._folder(project_id)
+        path = folder / "review" / "motion" / f"{key}.mp4"
+        if not DIGEST.fullmatch(key) or not path.is_file():
+            raise WorkflowError("Motion preview expired. Generate it again.", 404)
+        return path
 
     def _queue_export(self, project_id, revision, *, rerender=False):
         with self.lock:

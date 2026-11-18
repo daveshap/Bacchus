@@ -167,12 +167,15 @@ code { overflow-wrap: anywhere; }
 .art-item img { display: block; max-width: min(100%, 190px); max-height: 115px; margin-top: 8px; border-radius: 5px; object-fit: contain; }
 .art-copy { margin-block: 4px 0; color: var(--muted); font-size: .87rem; overflow-wrap: anywhere; }
 .preview-frame { position: relative; isolation: isolate; display: grid; width: 100%; aspect-ratio: 16 / 9; min-height: 0; place-items: center; overflow: hidden; background: #100f0e; border: 1px solid var(--line-strong); border-radius: 8px; }
-.preview-frame img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.preview-frame :is(img, video) { display: block; width: 100%; height: 100%; object-fit: contain; }
 .preview-frame img:not([src]) { visibility: hidden; }
 .player-controls { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 11px; align-items: center; margin-top: 13px; }
 .narration-preview { margin-top: 7px; }
 .narration-preview audio { display: none; }
 .player-feedback { margin: 8px 0 0; color: var(--danger); }
+.motion-preview-controls { margin-top: 10px; }
+.motion-preview-controls p { margin: 0; }
+.proof-narration { margin: 8px 0 0; white-space: pre-wrap; }
 .finding-error { color: var(--danger); }
 .finding-warning { color: var(--accent); }
 .tag.error { color: var(--danger); border-color: #68433c; }
