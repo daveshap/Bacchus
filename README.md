@@ -4,7 +4,7 @@ Bacchus turns recorded narration and a creative brief into a reviewed MP4. AI ca
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.4.1 Windows installer](releases/0.4.1/Bacchus-0.4.1-windows-x64.msi) and its [SHA-256 checksum](releases/0.4.1/Bacchus-0.4.1-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.4.1` tag records the source and installer for this release.
+Download the [Bacchus 0.5.0 Windows installer](releases/0.5.0/Bacchus-0.5.0-windows-x64.msi) and its [SHA-256 checksum](releases/0.5.0/Bacchus-0.5.0-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.5.0` tag records the source and installer for this release.
 
 1. Run the MSI, then open **Bacchus** from the Start menu. Bacchus opens its local workspace in your default browser.
 2. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data.
@@ -14,9 +14,17 @@ Manual workflows work offline once the media tools are available. Add provider k
 
 ## Storage
 
-Bacchus stores projects, settings and the default art library in `%LOCALAPPDATA%\Bacchus` on Windows. **Settings** shows the active data and art library locations. The Windows installer manages the application files separately.
+Bacchus stores projects, settings, style guides, reference images and separate artwork libraries in `%LOCALAPPDATA%\Bacchus` on Windows. **Settings** shows the data and library locations. The Windows installer manages the application files separately.
 
-To back up Bacchus, quit the app, then copy its data folder and any separately configured art library. To restore a Bacchus 0.3.0 or 0.3.1 backup, copy its contents into an empty data folder with Bacchus closed. The application supports `--data <folder>` for a different storage location, such as an external drive.
+To back up Bacchus, quit the app and copy its data folder. To restore a backup, copy its contents into an empty data folder with Bacchus closed. The application supports `--data <folder>` for a different storage location, such as an external drive.
+
+## Styles and project kickoff
+
+Choose a saved style in **New project**. Bacchus shows the name of its artwork library and how many reusable assets it contains. Professional Corporate and Hand-drawn Explainer come with Markdown guides. Warm Editorial, Studio Ink, and Night Signal are also available.
+
+Open **Styles** to name a style and library, answer the music, effects, and visual questions, set palette colors, and attach example images. Write or import a Markdown guide, or ask Claude to draft one from the answers and reference images you choose to supply. Review and save the guide. Bacchus keeps the questionnaire answers as entered. Creating and editing styles works offline.
+
+Each project records its style revision. New projects can choose a later revision while existing projects keep the guide, colors, and reference images they started with. The style guides scene planning and illustration requests. Its music and sound-effects choices provide a starting composition that you can adjust and approve for the cut.
 
 ## Configure AI
 
@@ -27,7 +35,7 @@ To use an optional OpenAI feature, add an OpenAI API key in **Settings** or set 
 - **Image generation.** Enable OpenAI image generation in **Settings** or set `BACCHUS_USE_OPENAI_IMAGES=1`. When requested, Bacchus sends the selected artwork brief and style to generate an image. [Image generation API](https://developers.openai.com/api/reference/resources/images/methods/generate)
 - **Scene planning.** Choose OpenAI as your planning provider in **Settings** or set `BACCHUS_PLANNER_PROVIDER=openai`. [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 
-Each provider call starts at your request. Planning sends the transcript, brief, cue timings, and relevant approved artwork names and descriptions to the selected provider. In both review stages, **Ask Claude** sends one proof image with the relevant approved scene context for a second opinion. Bacchus uses high effort for that review with the default Claude model. A person records the decision for every proof. Keys entered in **Settings** last until Bacchus exits. Nonsecret preferences persist in the data folder.
+Each provider call starts at your request. Planning sends the transcript, brief, cue timings, style guide and its example images, and relevant approved artwork descriptions to the selected provider. Optional image generation can use the same examples. **Draft with Claude** sends style answers, guide text and selected examples. In both review stages, **Ask Claude** sends one proof image with the relevant approved scene context for a second opinion. Bacchus uses high effort for that review with the default Claude model. A person records the decision for every proof. Keys entered in **Settings** last until Bacchus exits. Nonsecret preferences persist in the data folder.
 
 ### API logs
 
@@ -37,7 +45,7 @@ Logs can contain prompts, transcripts, artwork, and audio. Bacchus omits authent
 
 ## Make a cut
 
-1. Import an MP3, FLAC, or WAV. Import a recording-matched cue sheet or derive word timings with the local Parakeet model. Check its words against the audio, correct any cues, then set the style and creative brief and lock intake.
+1. Choose a style and import an MP3, FLAC, or WAV. Import a recording-matched cue sheet or derive word timings with the local Parakeet model. Check its words against the audio, correct any cues, then set the creative brief and lock intake.
 2. Generate a plan or start from the local editable draft. A layered scene can reveal text, artwork, a bar chart, or a flow diagram on independently selected narration words. Review the whole plan and artwork requirements before approving it.
 3. Pin library artwork, upload prepared images, or make illustrations with optional OpenAI image generation. Approve the source versions for checking, then pass each planned use. Publish reusable assets after they pass. Record defective or incomplete artwork as an issue and replace the version or revise the planned use.
 4. Choose a built-in score, import music and place effects, or select no music. Set music levels or silence by narration cue range. Prepare and measure the soundtrack, listen to the prepared WAV, and approve that exact file. Once the artwork and soundtrack are approved, prepare the animation.
@@ -54,11 +62,11 @@ Bacchus keeps original recordings, normalized media, plans, review proofs, decis
 
 ## Reuse artwork
 
-After an uploaded or generated version passes its planned uses, publish it to the shared **Art library**. Publishing a corrected version under the same original project artwork ID creates a new revision when its image changes. Open the library to inspect earlier revisions and pin an eligible version to a project under its own scene ID. A project keeps a copy of that exact image and records its library revision in the render receipt. Flagging a published version as defective or incomplete prevents future reuse of that version and preserves its history.
+After an uploaded or generated version passes its planned uses, publish it to the project's **Art library**. Each style has a separate library. Publishing a corrected version under the same original project artwork ID creates a new revision when its image changes. Open the library to inspect earlier revisions and pin an eligible version to a project using that style. A project keeps a copy of that exact image and records its library revision in the render receipt. Flagging a published version as defective or incomplete prevents future reuse of that version and preserves its history.
 
 The planner receives a shortlist of up to 20 checked library images from the selected style, ranked by title, filename, and art description. If it selects a match, Bacchus pins that version when it saves the plan. Review those selections along with the scene plan. Requalify versions saved by older releases by passing their current uses and publishing that evidence.
 
-By default the art library lives in `library/` inside the Bacchus data folder. The launcher's `--library <folder>` option can point to a separate storage or backup location. Keep `entries/` and `blobs/` together. The library's JSON files store version histories, and the blobs are PNGs named by their content hash. A separate Git checkout can track those two directories and ignore `.library.lock` and temporary `.tmp` files.
+Style guides and reference images live in `styles/` and artwork versions in `style-libraries/` inside the Bacchus data folder. On upgrade, Bacchus copies versions from its old shared library into the original styles. Use `--library <folder>` to copy from a previously configured external Bacchus library. The legacy files stay available at their original locations. Keep each style's `entries/` and `blobs/` together for backup. The library's JSON files store version histories, and the blobs are PNGs named by content hash.
 
 ## Build and test
 

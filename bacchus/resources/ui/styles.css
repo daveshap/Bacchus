@@ -56,6 +56,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline-offs
 .stage-link[aria-current="step"]:not([data-state="complete"]) .dot { border-color: var(--accent); background: var(--accent); }
 .tool-icon { display: inline-block; width: 9px; height: 9px; border: 1px solid currentColor; }
 .library-icon { border-radius: 1px; box-shadow: 2px -2px 0 -1px var(--rail), 2px -2px 0 0 var(--subtle); }
+.style-icon { border-radius: 2px 4px 2px 4px; }
 .settings-icon { width: 8px; height: 8px; transform: rotate(45deg); border-radius: 1px; }
 .quit-icon { position: relative; width: 7px; border-right: 0; border-radius: 1px 0 0 1px; }
 .quit-icon::after { content: ""; position: absolute; top: 2px; left: 3px; width: 4px; height: 4px; border-top: 1px solid currentColor; border-right: 1px solid currentColor; transform: rotate(45deg); }
@@ -215,6 +216,17 @@ code { overflow-wrap: anywhere; }
 .settings-key-note { margin: 0; }
 .provider-notice { margin-top: 13px; }
 .provider-notice p { flex: 1 1 210px; margin: 0; }
+.style-summary { padding-top: 5px; color: var(--muted); font-size: .89rem; }
+.style-summary p { margin: 0 0 3px; }
+.style-palette, .style-references { display: grid; gap: 8px 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); }
+.style-color { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.style-color input[type="color"] { width: 40px; height: 27px; padding: 2px; }
+.style-references { margin: 0; padding: 0; list-style: none; }
+.style-references figure { margin: 0 0 7px; }
+.style-references img { display: block; width: 100%; height: 116px; object-fit: contain; background: var(--rail); border-radius: 5px; }
+.style-references figcaption { overflow-wrap: anywhere; font-size: .85rem; }
+.style-proposal { padding: 13px; border: 1px solid var(--line-strong); border-radius: 7px; }
+.style-guide-text { margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .84rem; }
 .transcription-control .provider-notice { margin-top: 0; }
 .settings-note { margin-top: 13px; }
 .storage-paths h3 { margin-bottom: 2px; }

@@ -1,4 +1,5 @@
 import os
+import json
 from unittest import TestCase, mock
 
 from bacchus import planning, providers
@@ -6,6 +7,28 @@ from bacchus.settings import DEFAULT_CLAUDE_MODEL
 
 
 class ProviderTests(TestCase):
+    def test_pinned_style_supplies_markdown_and_visual_reference_to_planner(self):
+        project = {"input": {"intention": "", "lines": []}, "assets": [],
+                   "styleSnapshot": {"name": "My style", "revision": 3, "guide": "# Use a small accent",
+                                     "answers": {"music": False}, "palette": {}}}
+        with mock.patch.object(planning, "planner_choice", return_value="anthropic"):
+            content = planning.plan_request(project, references=[b"example"])["messages"][0]["content"]
+        self.assertEqual(content[0]["source"]["data"], "ZXhhbXBsZQ==")
+        profile = json.loads(content[1]["text"])["styleProfile"]
+        self.assertEqual(profile["guide"], "# Use a small accent")
+        self.assertEqual(profile["revision"], 3)
+
+    def test_image_generation_with_style_reference_uses_image_edits(self):
+        payload = providers.image_request("My style", "lamp", "A lamp.", guide="Muted colors.", references=[b"example"])
+        result = {"data": [{"b64_json": "YXJ0"}]}
+        with mock.patch.object(providers, "openai_images_enabled", return_value=True), mock.patch.object(
+            providers, "openai_json", return_value=(result, "request"),
+        ) as call:
+            providers.request_image(payload)
+        self.assertEqual(call.call_args.args[0], "images/edits")
+        self.assertIn("Muted colors.", payload["prompt"])
+        self.assertEqual(payload["images"], [{"image_url": "data:image/png;base64,ZXhhbXBsZQ=="}])
+
     def test_default_planning_uses_claude_with_no_openai_fallback(self):
         project = {"input": {"intention": "Hold on the main subject.", "lines": []}, "assets": []}
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-test"}, clear=True):

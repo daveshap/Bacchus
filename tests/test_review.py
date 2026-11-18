@@ -32,6 +32,26 @@ def project():
 
 
 class ReviewTests(unittest.TestCase):
+    def test_checks_bind_pinned_style_revision_and_effective_palette(self):
+        edit = project()
+        edit["plan"]["scenes"][0].update(artId="cup", artBrief="Show a cup")
+        edit["assets"] = [{"id": "cup", "hash": "a" * 64, "approved": True}]
+
+        def checks():
+            return [review.asset_checks(edit)[0]["id"], review.animation_checks(edit)[0]["id"]]
+
+        legacy = checks()
+        edit["styleSnapshot"] = None
+        self.assertEqual(checks(), legacy)
+        edit["styleSnapshot"] = {"id": "custom", "revision": 1, "visualPreset": "warm-editorial", "palette": {}}
+        first = checks()
+        edit["styleSnapshot"]["revision"] = 2
+        second = checks()
+        edit["styleSnapshot"]["palette"] = {"paper": "#efefe9"}
+        third = checks()
+        for series in zip(legacy, first, second, third, strict=True):
+            self.assertEqual(len(set(series)), 4)
+
     def test_proofs_bind_relevant_art_cues_and_transitions(self):
         original = project()
         first, second, third, _ = original["plan"]["scenes"]

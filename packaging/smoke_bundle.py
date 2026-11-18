@@ -13,6 +13,7 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+import wave
 
 from PIL import Image
 
@@ -24,10 +25,10 @@ PROVIDER_SETTINGS = (
 )
 
 
-def request(url, path, data=None):
+def request(url, path, data=None, *, content_type="image/png"):
     options = {}
     if isinstance(data, bytes):
-        options = {"data": data, "headers": {"Content-Type": "image/png"}}
+        options = {"data": data, "headers": {"Content-Type": content_type}}
     elif data is not None:
         options = {"data": json.dumps(data).encode(), "headers": {"Content-Type": "application/json"}}
     with urlopen(Request(url + path, **options), timeout=25) as response:
@@ -61,7 +62,94 @@ def expect_conflict(url, path, data=None):
     raise RuntimeError(f"The app accepted {path} before the required review.")
 
 
-def run_export(url, project):
+def png(size, color):
+    with BytesIO() as buffer:
+        Image.new("RGBA", size, color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+def check_styles(url):
+    defaults = json.loads(request(url, "/api/styles"))["styles"]
+    expected = [("professional-corporate", "Professional Corporate"), ("hand-drawn-explainer", "Hand-drawn Explainer")]
+    if [(style["id"], style["name"]) for style in defaults[:2]] != expected or any(
+        not style["builtIn"] or not style["guide"].strip() or style["assetCount"] != 0 for style in defaults
+    ):
+        raise RuntimeError("Fresh setup did not load its guided built-in styles and empty libraries.")
+    if len({style["libraryName"] for style in defaults}) != len(defaults):
+        raise RuntimeError("Built-in styles did not have independently named libraries.")
+
+    image = json.loads(request(url, "/api/style-references?name=mood-board.png", png((1280, 640), "#548369")))
+    normalized = request(url, image["url"])
+    if hashlib.sha256(normalized).hexdigest() != image["sha256"]:
+        raise RuntimeError("The saved style reference did not match its fingerprint.")
+    with Image.open(BytesIO(normalized)) as picture:
+        if picture.size != (image["width"], image["height"]) or max(picture.size) > 1024:
+            raise RuntimeError("The style reference was not normalized to the configured size.")
+    del image["url"]
+    answers = {
+        "visualNotes": "  Wide margins.\r\nSoft green lines.  ", "colorNotes": "Keep the warm paper.",
+        "sceneNotes": "Reveal a diagram on the spoken cue.", "music": False, "musicNotes": "Speech only.  ",
+        "musicPreset": "pulse", "soundEffects": False, "effectsNotes": "",
+    }
+    guide = "# Smoke style\n\nQuiet margins and clear labels. Leave music off.\n"
+    custom = json.loads(request(url, "/api/styles", {
+        "name": "Smoke style", "libraryName": "Smoke style artwork", "description": "Local smoke fixture.",
+        "visualPreset": "warm-editorial", "palette": {"accent": "#548369"}, "answers": answers,
+        "guide": guide, "referenceImages": [image],
+    }))
+    style_id = custom["id"]
+    path = f"/api/styles/{style_id}"
+    saved = json.loads(request(url, path))
+    if saved != custom or saved["guide"] != guide or saved["answers"] != answers or saved["revision"] != 1:
+        raise RuntimeError("The style did not retain its written guide and verbatim answers.")
+    if saved["referenceImages"][0]["sha256"] != image["sha256"] or saved["assetCount"] != 0:
+        raise RuntimeError("The style did not bind its reference or opened a prepopulated art library.")
+    revised = json.loads(request(url, path, {"revision": saved["revision"], "guide": "# Revised Smoke style\n"}))
+    if revised["revision"] != 2 or revised["guide"] == guide:
+        raise RuntimeError("Editing the style did not create a new guide revision.")
+
+    project = json.loads(request(url, "/api/projects", {
+        "title": "Smoke style project", "styleId": style_id, "styleRevision": saved["revision"],
+    }))
+    pinned = project["styleSnapshot"]
+    if (pinned["id"], pinned["revision"], pinned["guide"], pinned["answers"]) != (style_id, 1, guide, answers):
+        raise RuntimeError("The project did not retain its selected revision and guide preferences.")
+    for scope, name in ((style_id, saved["libraryName"]), ("warm-editorial", "Warm Editorial Artwork")):
+        library = json.loads(request(url, f"/api/library?styleId={scope}"))
+        if library != {"assets": [], "styleId": scope, "libraryName": name}:
+            raise RuntimeError("An empty project did not have its own named style library.")
+    return project
+
+
+def check_style_mix(url, project):
+    route = f"/api/projects/{project['id']}"
+    with BytesIO() as buffer:
+        with wave.open(buffer, "wb") as recording:
+            recording.setparams((1, 2, 16_000, 0, "NONE", "PCM"))
+            recording.writeframes(b"\x00\x01" * 16_000)
+        wav = buffer.getvalue()
+    project = json.loads(request(
+        url, f"{route}/audio?revision={project['revision']}&name=test.wav", wav, content_type="audio/wav",
+    ))
+    cues = {
+        "audio": {"sha256": hashlib.sha256(wav).hexdigest()}, "duration": 1,
+        "words": [{"text": "Smoke", "start": 0, "end": 0.43}, {"text": "test.", "start": 0.51, "end": 0.91}],
+    }
+    project = json.loads(request(
+        url, f"{route}/timings?revision={project['revision']}", json.dumps(cues).encode(), content_type="application/json",
+    ))
+    for action, body in (
+        ("input", {"script": "Smoke test.", "intention": "", "confirmTiming": True}),
+        ("plan/starter", {}),
+        ("plan/approve", {}),
+    ):
+        project = json.loads(request(url, f"{route}/{action}", {"revision": project["revision"], **body}))
+    mix = project["mix"]
+    if mix["musicMode"] != "none" or mix["effects"] or mix["approved"]:
+        raise RuntimeError("Approving a plan did not apply the pinned style's speech-only mix preference.")
+
+
+def run_export(url, project, custom_style_id):
     route = f"/api/projects/{project['id']}"
 
     def action(name, **data):
@@ -72,11 +160,9 @@ def run_export(url, project):
     scenes[0].update(layout="illustration", artId=artwork, artBrief="A sample blue square.")
     project = action("plan", scenes=scenes)
     project = action("plan/approve")
-    with BytesIO() as buffer:
-        Image.new("RGBA", (96, 96), "#386e9e").save(buffer, format="PNG")
-        raw = buffer.getvalue()
     project = json.loads(request(
-        url, f"{route}/assets/{artwork}?revision={project['revision']}&name=smoke-art.png", raw,
+        url, f"{route}/assets/{artwork}?revision={project['revision']}&name=smoke-art.png",
+        png((96, 96), "#386e9e"),
     ))
     project = action(f"assets/{artwork}/approve")
     expect_conflict(url, f"{route}/assets/{artwork}/publish", {"revision": project["revision"]})
@@ -97,6 +183,12 @@ def run_export(url, project):
     project = action(f"assets/{artwork}/publish")
     if project["assetChecks"][0]["status"] != "passed":
         raise RuntimeError("Publishing discarded a passed artwork use.")
+    warm = json.loads(request(url, "/api/library?styleId=warm-editorial"))
+    custom = json.loads(request(url, f"/api/library?styleId={custom_style_id}"))
+    published, = project["assets"]
+    published_ids = {entry["id"] for entry in warm["assets"]}
+    if published_ids != {published["libraryId"]} or custom["assets"]:
+        raise RuntimeError("The published demo artwork did not stay in its Warm Editorial library.")
     project = action("animation/prepare")
     if not request(url, f"{route}/preview?time=0.5").startswith(b"\x89PNG"):
         raise RuntimeError("The prepared example lacked a renderer preview.")
@@ -123,6 +215,9 @@ def run_export(url, project):
                 raise RuntimeError("The default export did not identify its actual encoder and any fallback.")
             if receipt["candidate"]["mix"]["rendered"]["sha256"] != prepared["sha256"]:
                 raise RuntimeError("The exported receipt did not bind the approved WAV.")
+            style = receipt["candidate"].get("styleGuide", {})
+            if (style.get("id"), style.get("revision")) != ("warm-editorial", project["styleSnapshot"]["revision"]):
+                raise RuntimeError("The exported receipt did not retain the selected style revision.")
             for scope, key in (("assets", "assetChecks"), ("animation", "animationChecks")):
                 checks = receipt["review"][scope]
                 if set(checks) != {check["id"] for check in project[key]} or any(
@@ -155,12 +250,14 @@ def check_provider_defaults(url):
     # Exercise readiness only. No test key is ever sent to a provider.
     request(url, "/api/settings", {"openAIKey": "test-local-openai-key"})
     config = json.loads(request(url, "/api/config"))
-    if config["plannerAvailable"] or config["transcriberAvailable"] or config["imageAvailable"]:
+    if config["plannerAvailable"] or config["transcriberAvailable"] or config["imageAvailable"] or config["styleDraftAvailable"]:
         raise RuntimeError("An OpenAI key alone enabled an AI stage.")
     request(url, "/api/settings", {"anthropicKey": "test-local-anthropic-key"})
     config = json.loads(request(url, "/api/config"))
     if config["plannerProvider"] != "anthropic" or not config["plannerAvailable"]:
         raise RuntimeError("A Claude key alone must enable the default planner.")
+    if not config["styleDraftAvailable"]:
+        raise RuntimeError("A Claude key did not make guide drafting available.")
     if config["transcriberAvailable"] or config["imageAvailable"]:
         raise RuntimeError("OpenAI media features must remain opt-in.")
     request(url, "/api/settings", {"clearAnthropicKey": True, "clearOpenAIKey": True})
@@ -202,11 +299,13 @@ def main():
                     raise RuntimeError(f"Missing embedded asset {asset}.")
             check_provider_defaults(url)
             check_audit_directory(url, root)
+            custom = check_styles(url)
             project = json.loads(request(url, "/api/demo", {}))
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")
             if args.render:
-                print(f"Verified default export encoder: {run_export(url, project)}")
+                check_style_mix(url, custom)
+                print(f"Verified default export encoder: {run_export(url, project, custom['styleSnapshot']['id'])}")
             request(url, "/api/quit", {})
             if process.wait(15) != 0:
                 raise RuntimeError("Bacchus returned a failure status after quitting.")
@@ -214,7 +313,7 @@ def main():
             if process.poll() is None:
                 process.kill()
                 process.wait(10)
-    print("Verified packaged startup, Claude-first setup, offline example, and clean shutdown"
+    print("Verified packaged startup, Claude-first setup, style guides and libraries, offline example, and clean shutdown"
           + (", including evidence gates and MP4 export." if args.render else "."))
 
 

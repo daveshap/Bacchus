@@ -83,7 +83,7 @@ def main():
     parser.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--data", type=Path, default=default_data_directory(),
                         help="Choose where Bacchus stores videos, settings, and its default library.")
-    parser.add_argument("--library", type=Path, help="Set a separate directory for shared versioned artwork.")
+    parser.add_argument("--library", type=Path, help="Copy an existing Bacchus library into its internal style libraries.")
     parser.add_argument("--version", action="version", version=APP_VERSION)
     options = parser.parse_args()
     data = options.data.expanduser().resolve()

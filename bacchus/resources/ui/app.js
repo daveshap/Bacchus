@@ -10,6 +10,7 @@ const stages = [
 ];
 
 const audioFormats = ".mp3,.flac,.wav,audio/mpeg,audio/flac,audio/wav,audio/x-flac,audio/x-wav";
+const newStyleOption = "__new_style__";
 
 const state = {
   config: null,
@@ -17,6 +18,7 @@ const state = {
   view: "project",
   settings: null,
   library: null,
+  libraryStyle: "",
   libraryQuery: "",
   libraryId: "",
   libraryVersion: null,
@@ -28,6 +30,12 @@ const state = {
   stage: "intake",
   pending: false,
   newTitle: "",
+  newStyleId: "",
+  newRecording: null,
+  styles: [],
+  styleEditor: null,
+  styleProposal: "",
+  returnToKickoff: false,
   inputDraft: null,
   planDraft: null,
   mixDraft: null,
@@ -62,8 +70,8 @@ function localMedia(value) {
   return path.startsWith("/api/") ? escapeHtml(path) : "";
 }
 
-function projectPath(suffix = "") {
-  return `/api/projects/${encodeURIComponent(state.project.id)}${suffix}`;
+function projectPath(suffix = "", project = state.project) {
+  return `/api/projects/${encodeURIComponent(project.id)}${suffix}`;
 }
 
 async function api(path, options) {
@@ -90,9 +98,9 @@ function mutate(suffix, value = {}) {
   return post(projectPath(suffix), { revision: state.project.revision, ...value });
 }
 
-function upload(suffix, file) {
-  const query = new URLSearchParams({ revision: state.project.revision, name: file.name });
-  return api(`${projectPath(suffix)}?${query}`, {
+function upload(suffix, file, project = state.project) {
+  const query = new URLSearchParams({ revision: project.revision, name: file.name });
+  return api(`${projectPath(suffix, project)}?${query}`, {
     method: "POST",
     headers: { "Content-Type": file.type || "application/octet-stream" },
     body: file,
@@ -126,6 +134,7 @@ async function openStudioView(view, alias = "") {
   state.view = view;
   setMessage();
   if (view === "library") {
+    setLibraryStyle(projectStyleId(state.project) || state.libraryStyle || state.styles[0]?.id || "");
     state.libraryAliasPreferred = alias;
     state.libraryAlias = alias || libraryAlias(state.library?.find(asset => asset.id === state.libraryId));
     state.libraryProject = state.project?.id ?? "";
@@ -134,6 +143,7 @@ async function openStudioView(view, alias = "") {
   content.focus({ preventScroll: true });
   window.scrollTo(0, 0);
   if (view === "library") await refreshLibrary();
+  if (view === "styles") await refreshStyles();
   if (view === "settings" && !state.settings) await refreshSettings();
 }
 
@@ -193,7 +203,7 @@ function readDrafts(project) {
 }
 
 function upsertProject(project) {
-  const summary = { id: project.id, title: project.title, updatedAt: project.updatedAt };
+  const summary = { id: project.id, title: project.title, updatedAt: project.updatedAt, styleId: projectStyleId(project) };
   state.projects = [summary, ...state.projects.filter(item => item.id !== project.id)];
 }
 
@@ -208,12 +218,12 @@ function render() {
     `<option value="${escapeHtml(item.id)}">${escapeHtml(item.title)}</option>`
   ).join("");
   picker.value = project?.id ?? "";
-  const toolName = state.view === "library" ? "Art library" : state.view === "settings" ?
+  const toolName = state.view === "library" ? "Art library" : state.view === "styles" ? "Styles" : state.view === "settings" ?
     (state.settings?.completed ? "Settings" : "Setup") : null;
   workspaceName.textContent = toolName ? "Studio" : "Projects";
   projectName.textContent = toolName ?? project?.title ?? "New project";
-  const style = state.config?.styles?.find(option => option.id === project?.style);
-  packName.textContent = state.config?.pack ? `${style?.name ?? state.config.pack.name} · v${state.config.pack.version}` : "";
+  const style = project?.styleSnapshot;
+  packName.textContent = style ? `${style.name} · v${style.revision}` : "";
   packName.hidden = Boolean(toolName) || !packName.textContent;
   quitButton.disabled = !state.config;
   studioNavigation.querySelectorAll("[data-view]").forEach(control => {
@@ -241,6 +251,7 @@ function render() {
   };
   if (state.view === "settings") content.innerHTML = settingsView();
   else if (state.view === "library") content.innerHTML = libraryView();
+  else if (state.view === "styles") content.innerHTML = stylesView();
   else content.innerHTML = project ? views[state.stage](project) : startView();
   if (content.querySelector("#preview-image")) state.stopPreview = attachPreview(project);
   schedulePoll();
@@ -473,6 +484,15 @@ function libraryDate(value) {
     new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(date) : "";
 }
 
+function setLibraryStyle(id) {
+  if (state.libraryStyle === id) return;
+  state.libraryStyle = id;
+  state.library = null;
+  state.libraryId = "";
+  state.libraryVersion = null;
+  state.libraryQuery = "";
+}
+
 function libraryInspector() {
   const asset = state.library?.find(item => item.id === state.libraryId);
   if (!asset) return "";
@@ -482,7 +502,10 @@ function libraryInspector() {
   const name = version.name || asset.name || asset.id;
   const usable = version.qualified === true && !version.issue;
   const created = libraryDate(version.createdAt);
-  const target = state.libraryProject || state.project?.id || state.projects[0]?.id;
+  const eligibleProjects = state.project && projectStyleId(state.project) === state.libraryStyle
+    ? state.projects.filter(project => project.styleId === state.libraryStyle || project.id === state.project.id) : [];
+  const target = eligibleProjects.some(project => project.id === state.libraryProject)
+    ? state.libraryProject : state.project?.id;
   return `<section class="panel stack">
     <div class="panel-header"><h2>${escapeHtml(name)}</h2>
       ${version.issue ? badge("Flagged", "error") : usable ? badge("Qualified", "good") : badge("Awaiting qualification", "warm")}
@@ -497,15 +520,15 @@ function libraryInspector() {
     ${version.brief ? `<p class="hint">${escapeHtml(version.brief)}</p>` : ""}
     ${version.issue?.reason ? `<p class="notice error inline">${escapeHtml(version.issue.reason)}</p>` : ""}
     <dl class="receipt">
-      ${version.style ? `<dt>Style</dt><dd>${escapeHtml(version.style)}</dd>` : ""}
+      ${version.style ? `<dt>Style</dt><dd>${escapeHtml(styleById(version.style)?.name ?? version.style)}</dd>` : ""}
       ${version.source ? `<dt>Source</dt><dd>${escapeHtml(version.source)}</dd>` : ""}
       ${created ? `<dt>Saved</dt><dd>${escapeHtml(created)}</dd>` : ""}
       <dt>Fingerprint</dt><dd>${shortHash(version.hash)}</dd>
     </dl>
-    ${state.projects.length ? `<form class="stack" data-form="library-pin">
+    ${eligibleProjects.length ? `<form class="stack" data-form="library-pin">
       <div class="field"><label for="library-project">Project</label>
         <select id="library-project" name="project">
-          ${state.projects.map(project => `<option value="${escapeHtml(project.id)}"${target === project.id ? " selected" : ""}>${escapeHtml(project.title)}</option>`).join("")}
+          ${eligibleProjects.map(project => `<option value="${escapeHtml(project.id)}"${target === project.id ? " selected" : ""}>${escapeHtml(project.title)}</option>`).join("")}
         </select>
       </div>
       <div class="field">
@@ -516,17 +539,24 @@ function libraryInspector() {
       <div class="cluster"><button class="button primary"${usable ? "" : " disabled"}>Use in project</button>
         ${state.project ? '<button class="button quiet" type="button" data-view="project">Back to project</button>' : ""}</div>
       <p id="library-pin-status" class="notice inline" role="status" aria-live="polite" hidden></p>
-    </form>` : '<div><button class="button primary" type="button" data-action="new-project">Create a project to use this image</button></div>'}
+    </form>` : '<p class="hint">Open a project in this style to pin this artwork.</p>'}
   </section>`;
 }
 
 function libraryView() {
   const matches = libraryMatches();
+  const scope = styleById(state.libraryStyle);
   if (!matches.some(item => item.id === state.libraryId)) selectLibraryAsset(matches[0]);
   return `
     ${heading("Art library", "Find approved artwork and pin a specific version to a project.")}
     <div class="columns library-columns">
-      <section class="panel">
+      <section class="panel stack">
+        <div class="field"><label for="library-style">Style library</label>
+          <select id="library-style">
+            ${state.styles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.libraryStyle ? " selected" : ""}>${escapeHtml(style.libraryName)} · ${escapeHtml(style.name)}</option>`).join("")}
+          </select>
+          ${scope ? `<p class="hint">${styleAssetCount(scope)}</p>` : ""}
+        </div>
         <div class="field"><label for="library-search">Search artwork</label>
           <input id="library-search" type="search" value="${escapeHtml(state.libraryQuery)}" placeholder="Search by name, brief, or style">
         </div>
@@ -545,9 +575,170 @@ function updateLibrarySearch() {
   content.querySelector("#library-results").innerHTML = libraryRows(matches);
 }
 
+function projectStyleId(project) {
+  return project?.styleSnapshot?.id ?? project?.style;
+}
+
+function styleById(id) {
+  return state.styles.find(style => style.id === id);
+}
+
+function styleAssetCount(style) {
+  const count = style.assetCount ?? 0;
+  return `${count} ${count === 1 ? "asset" : "assets"}`;
+}
+
+function kickoffStyleSummary(style) {
+  if (!style) return "";
+  return `<div class="style-summary">
+    <p><strong>Version ${escapeHtml(style.revision)}</strong> · ${escapeHtml(style.libraryName)} · ${styleAssetCount(style)}</p>
+    ${style.description ? `<p class="hint">${escapeHtml(style.description)}</p>` : ""}
+  </div>`;
+}
+
+const visualBases = { "warm-editorial": "Warm editorial", "studio-ink": "Studio ink", "night-signal": "Night signal" };
+const paletteFields = {
+  paper: ["Background", "#f8efe0"], ink: ["Text", "#26372d"], muted: ["Secondary text", "#505c50"],
+  rule: ["Rules and borders", "#d8c6ac"], accent: ["Accent", "#a65235"],
+};
+
+function emptyStyle() {
+  return {
+    name: "", libraryName: "", description: "", visualPreset: "warm-editorial", palette: {}, guide: "", referenceImages: [],
+    answers: {
+      visualNotes: "", colorNotes: "", sceneNotes: "", music: null, musicNotes: "",
+      musicPreset: "ambient", soundEffects: null, effectsNotes: "",
+    },
+  };
+}
+
+function styleTextarea(name, label, value, rows = 3) {
+  return `<div class="field"><label for="style-${name}">${label}</label>
+    <textarea id="style-${name}" name="${name}" rows="${rows}">
+${escapeHtml(value)}</textarea></div>`;
+}
+
+function styleYesNo(name, question, value) {
+  return `<fieldset class="setup-fieldset">
+    <legend>${question}</legend>
+    <div class="cluster">
+      <label class="music-option"><input name="${name}" type="radio" value="yes"${value === true ? " checked" : ""} required> Yes</label>
+      <label class="music-option"><input name="${name}" type="radio" value="no"${value === false ? " checked" : ""} required> No</label>
+    </div>
+  </fieldset>`;
+}
+
+function paletteEditor(palette) {
+  return `<details class="timing-panel">
+    <summary>Color overrides</summary>
+    <div class="style-palette settings-note">
+      ${Object.entries(paletteFields).map(([key, [label, fallback]]) => `<div class="style-color">
+        <label class="music-option"><input type="checkbox" name="override-${key}" data-palette-override="${key}"${palette[key] ? " checked" : ""}> ${label}</label>
+        <input type="color" id="palette-${key}" name="palette-${key}" value="${escapeHtml(palette[key] || fallback)}"
+          aria-label="${label} color"${palette[key] ? "" : " disabled"}>
+      </div>`).join("")}
+    </div>
+  </details>`;
+}
+
+function styleReferences(references) {
+  return `<section class="stack">
+    <h2>Reference images</h2>
+    ${references.length ? `<ul class="style-references">${references.map(image => `
+      <li>${proofImage(image.url ?? `/api/style-references/${encodeURIComponent(image.sha256)}`, image.name)}
+        ${button("Remove reference", "remove-style-reference", { name: image.sha256, style: "quiet small" })}
+      </li>`).join("")}</ul>` : ""}
+    <div class="field">
+      <label for="style-reference-file">PNG or JPEG reference images</label>
+      <input id="style-reference-file" type="file" accept="image/png,image/jpeg,.png,.jpg,.jpeg" multiple>
+    </div>
+    <div>${button("Add reference images", "upload-style-references", { style: "quiet" })}</div>
+  </section>`;
+}
+
+function styleForm(style) {
+  const answers = style.answers;
+  const existing = Boolean(style.id);
+  return `<form class="panel stack" data-form="style">
+    <div class="panel-header">
+      <h2>${existing ? escapeHtml(style.name) : "Create a style"}</h2>
+      ${existing ? badge(`Active version ${style.revision}`, "good") : ""}
+    </div>
+    ${existing ? '<p class="hint">Saving a new version makes it available to future projects. Existing projects keep their pinned versions.</p>' : ""}
+    <div class="field"><label for="style-name">Style name</label>
+      <input id="style-name" name="name" value="${escapeHtml(style.name)}" maxlength="120" required>
+    </div>
+    <div class="field"><label for="style-library-name">Art library name</label>
+      <input id="style-library-name" name="libraryName" value="${escapeHtml(style.libraryName)}" maxlength="120" placeholder="Use the style name">
+    </div>
+    ${styleTextarea("description", "Short description", style.description, 2)}
+    <div class="field"><label for="style-visual-preset">Visual base</label>
+      <select id="style-visual-preset" name="visualPreset">
+        ${Object.entries(visualBases).map(([id, label]) => `<option value="${id}"${style.visualPreset === id ? " selected" : ""}>${label}</option>`).join("")}
+      </select>
+    </div>
+    ${styleTextarea("visualNotes", "What’s the visual palette like?", answers.visualNotes)}
+    ${styleTextarea("colorNotes", "What’s the color palette like?", answers.colorNotes)}
+    ${paletteEditor(style.palette)}
+    ${styleTextarea("sceneNotes", "Any other considerations about how the scenes are constructed?", answers.sceneNotes)}
+    ${styleYesNo("music", "Do you want music?", answers.music)}
+    ${styleTextarea("musicNotes", "Music guidance", answers.musicNotes, 2)}
+    <div class="field"><label for="style-music-preset">Music preset</label>
+      <select id="style-music-preset" name="musicPreset">
+        <option value="ambient"${answers.musicPreset === "ambient" ? " selected" : ""}>Ambient</option>
+        <option value="pulse"${answers.musicPreset === "pulse" ? " selected" : ""}>Pulse</option>
+      </select>
+    </div>
+    ${styleYesNo("soundEffects", "Do you want sound effects?", answers.soundEffects)}
+    ${styleTextarea("effectsNotes", "Sound effects guidance", answers.effectsNotes, 2)}
+    ${styleReferences(style.referenceImages)}
+    ${styleTextarea("guide", "Style guide (Markdown)", style.guide, 10)}
+    <div class="field">
+      <label for="style-guide-file">Markdown guide file</label>
+      <input id="style-guide-file" type="file" accept=".md,.markdown,text/markdown">
+      <div>${button("Import Markdown", "import-style-guide", { style: "quiet" })}</div>
+    </div>
+    ${state.config.styleDraftAvailable ? `<div class="cluster">
+      ${button("Draft guide with Claude", "draft-style-guide", { style: "quiet" })}
+      <span class="hint">Sends this questionnaire and its reference images to Claude.</span>
+    </div>` : ""}
+    ${state.styleProposal ? `<section class="stack style-proposal">
+      <h2>Claude’s suggested guide</h2>
+      <div class="field"><label for="proposed-style-guide">Review the draft</label>
+        <textarea id="proposed-style-guide" rows="10" readonly>${escapeHtml(state.styleProposal)}</textarea>
+      </div>
+      <div class="cluster">
+        ${button("Use this draft", "adopt-style-draft")}
+        ${button("Discard draft", "discard-style-draft", { style: "quiet" })}
+      </div>
+    </section>` : ""}
+    <div class="cluster">
+      <button class="button primary">${existing ? "Save as new version" : "Create style"}</button>
+      ${state.returnToKickoff ? button("Back to new project", "return-to-kickoff", { style: "quiet" }) : ""}
+    </div>
+  </form>`;
+}
+
+function stylesView() {
+  return `${heading("Styles", "Set the guide, scene preferences, and approved artwork library for future projects.")}
+    <div class="columns library-columns">
+      <section class="panel stack">
+        <div class="panel-header"><h2>Available styles</h2>${button("New style", "new-style", { style: "quiet small" })}</div>
+        ${state.styles.length ? `<ul class="proof-list" aria-label="Available styles">
+          ${state.styles.map(style => `<li><button type="button" class="proof-choice" data-action="select-style"
+            data-name="${escapeHtml(style.id)}" aria-pressed="${state.styleEditor?.id === style.id}">
+            <span><strong>${escapeHtml(style.name)}</strong><small>${escapeHtml(style.libraryName)} · ${styleAssetCount(style)}</small></span>
+            ${badge(`v${style.revision}`)}
+          </button></li>`).join("")}
+        </ul>` : '<p class="hint">Create a style to make it available at project kickoff.</p>'}
+      </section>
+      ${state.styleEditor ? styleForm(state.styleEditor) : '<section class="panel"><p class="hint">Select a style to view its guide and preferences.</p></section>'}
+    </div>`;
+}
+
 function startView() {
   return `
-    ${heading("New project", "Turn recorded narration into a finished animation.")}
+    ${heading("New project", "Choose a style and add the narration recording here or in Intake.")}
     <div class="columns">
       <form class="panel" data-form="new-project">
         <div class="stack">
@@ -555,6 +746,20 @@ function startView() {
             <label for="new-title">Project name</label>
             <input id="new-title" name="title" maxlength="120" placeholder="e.g. The shape of a good question" value="${escapeHtml(state.newTitle)}" required>
           </div>
+          <div class="field">
+            <label for="new-style-id">Project style</label>
+            <select id="new-style-id" name="styleId" required>
+              <option value="">Choose a style</option>
+              ${state.styles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.newStyleId ? " selected" : ""}>${escapeHtml(style.name)}</option>`).join("")}
+              <option value="${newStyleOption}">New style…</option>
+            </select>
+            <div id="kickoff-style-details" aria-live="polite">${kickoffStyleSummary(styleById(state.newStyleId))}</div>
+          </div>
+          ${state.config.audioAvailable ? `<div class="field">
+            <label for="new-recording">Narration recording (optional)</label>
+            <input id="new-recording" type="file" accept="audio/wav,audio/mpeg,audio/flac,.mp3,.flac,.wav">
+            <div id="kickoff-recording-details" class="cluster" aria-live="polite">${kickoffRecordingSummary()}</div>
+          </div>` : ""}
         </div>
         <div class="actions"><button class="button primary">Create project</button></div>
       </form>
@@ -564,6 +769,12 @@ function startView() {
         ${button("Create example", "demo", { style: "quiet" })}
       </section>
     </div>`;
+}
+
+function kickoffRecordingSummary() {
+  if (!state.newRecording) return '<span class="hint">MP3, FLAC, or WAV</span>';
+  return `<strong>${escapeHtml(state.newRecording.name)}</strong>
+    ${button("Clear recording", "clear-new-recording", { style: "quiet small" })}`;
 }
 
 function timecode(seconds) {
@@ -727,8 +938,7 @@ function intakeView(project) {
   const draft = state.inputDraft;
   const busy = Boolean(project.busy);
   const hasSource = Boolean(audio || input || project.requiresAudio === false);
-  const styles = state.config.styles ?? [{ id: "warm-editorial", name: "Warm editorial" }];
-  const style = input?.style ?? draft?.style ?? project.style ?? styles[0].id;
+  const style = project.styleSnapshot ?? styleById(projectStyleId(project));
   const sourceTimings = project.transcript?.timing === "source-cues" && Boolean(project.transcript.words?.length);
   return `
     ${heading("Intake", "Import the narration recording, verify its word timings, and add creative direction.")}
@@ -772,12 +982,12 @@ function intakeView(project) {
             <label for="script">Narration transcript</label>
             <textarea id="script" name="script" rows="8" readonly>${escapeHtml(input?.script ?? project.transcript?.script)}</textarea>
           </div>` : ""}
-          <div class="field">
-            <label for="style">Visual style</label>
-            <select id="style" name="style"${input ? " disabled" : ""}>
-              ${styles.map(option => `<option value="${escapeHtml(option.id)}"${option.id === style ? " selected" : ""}>${escapeHtml(option.name)}</option>`).join("")}
-            </select>
-          </div>
+          ${style ? `<div class="field"><span>Project style</span><span>${escapeHtml(style.name)} · v${escapeHtml(style.revision)}</span>
+            ${style.guide ? `<details class="timing-panel">
+              <summary>Pinned style guide</summary>
+              <pre class="style-guide-text">${escapeHtml(style.guide)}</pre>
+            </details>` : ""}
+          </div>` : ""}
           <div class="field">
             <label for="intention">Creative brief <span class="muted">(optional)</span></label>
             <textarea id="intention" name="intention" rows="3" maxlength="2000" ${input ? "readonly" : ""}
@@ -1239,6 +1449,19 @@ function mixEvidence(rendered) {
   </div>`;
 }
 
+function styleSoundGuidance(project) {
+  const style = project.styleSnapshot;
+  if (!style?.answers) return "";
+  const { music, musicNotes, soundEffects, effectsNotes } = style.answers;
+  return `<section class="panel stack">
+    <h2>${escapeHtml(style.name)} sound guidance</h2>
+    <dl class="receipt">
+      <dt>Music</dt><dd>${music ? "Yes" : "No"}${musicNotes ? `<div class="style-guide-text">${escapeHtml(musicNotes)}</div>` : ""}</dd>
+      <dt>Sound effects</dt><dd>${soundEffects ? "Yes" : "No"}${effectsNotes ? `<div class="style-guide-text">${escapeHtml(effectsNotes)}</div>` : ""}</dd>
+    </dl>
+  </section>`;
+}
+
 function compositionView(project) {
   if (!project.input) return prerequisite("Composition", "Lock the narration recording and transcript before composing the soundtrack.", "intake", "Open intake");
   if (!project.plan?.approved) return prerequisite("Composition", "Approve the scene plan before composing the soundtrack.", "plan", "Open scene plan");
@@ -1320,6 +1543,7 @@ function compositionView(project) {
         </section>
       </form>
       <div class="stack">
+        ${styleSoundGuidance(project)}
         <form class="panel stack" data-form="mix-preset">
           <h2>Create soundtrack</h2>
           <p class="hint">Create original background music and place effects at scene changes. This replaces the current soundtrack.</p>
@@ -1865,13 +2089,164 @@ function settingsPayload(data) {
   return payload;
 }
 
-async function refreshLibrary() {
+async function refreshStyles() {
   try {
-    const listing = await api("/api/library");
+    const result = await api("/api/styles");
+    state.styles = result.styles;
+    if (state.view === "styles" && !state.styleEditor && state.styles.length) {
+      state.styleEditor = structuredClone(state.styles[0]);
+    }
+    if (!state.pending && (state.view === "styles" || state.view === "library" || (state.view === "project" && !state.project))) render();
+  } catch (error) {
+    setMessage(error.message, "error");
+  }
+}
+
+function captureStyleForm(form) {
+  const data = new FormData(form);
+  const value = name => String(data.get(name) ?? "");
+  const choice = name => data.has(name) ? value(name) === "yes" : null;
+  state.styleEditor = {
+    ...state.styleEditor,
+    name: value("name"),
+    libraryName: value("libraryName"),
+    description: value("description"),
+    visualPreset: value("visualPreset"),
+    palette: Object.fromEntries(Object.keys(paletteFields).filter(key => data.has(`override-${key}`))
+      .map(key => [key, value(`palette-${key}`)])),
+    answers: {
+      visualNotes: value("visualNotes"), colorNotes: value("colorNotes"), sceneNotes: value("sceneNotes"),
+      music: choice("music"), musicNotes: value("musicNotes"), musicPreset: value("musicPreset"),
+      soundEffects: choice("soundEffects"), effectsNotes: value("effectsNotes"),
+    },
+    guide: value("guide"),
+  };
+  return state.styleEditor;
+}
+
+function stylePayload(style) {
+  return {
+    name: style.name, libraryName: style.libraryName || style.name, description: style.description,
+    visualPreset: style.visualPreset, palette: style.palette, answers: style.answers, guide: style.guide,
+    referenceImages: style.referenceImages.map(({ sha256, name, width, height }) => ({ sha256, name, width, height })),
+  };
+}
+
+function returnToNewProject(styleId) {
+  state.returnToKickoff = false;
+  if (styleId) state.newStyleId = styleId;
+  state.project = null;
+  openStage("intake", false);
+  content.querySelector("#new-style-id")?.focus();
+}
+
+async function saveStyle(form) {
+  const style = captureStyleForm(form);
+  const payload = stylePayload(style);
+  const endpoint = style.id ? `/api/styles/${encodeURIComponent(style.id)}` : "/api/styles";
+  if (style.id) payload.revision = style.revision;
+  const finish = beginRequest("Saving the style…");
+  let saved = null;
+  try {
+    saved = await post(endpoint, payload);
+    const listed = state.styles.some(entry => entry.id === saved.id);
+    state.styles = listed ? state.styles.map(entry => entry.id === saved.id ? saved : entry) : [...state.styles, saved];
+    state.styleEditor = structuredClone(saved);
+    state.styleProposal = "";
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    finish();
+  }
+  if (!saved) return;
+  if (state.returnToKickoff) returnToNewProject(saved.id);
+  else render();
+  setMessage(`Saved ${saved.name} version ${saved.revision}.`, "good");
+}
+
+async function importStyleGuide() {
+  const file = content.querySelector("#style-guide-file").files[0];
+  if (!file) {
+    setMessage("Choose a Markdown file to import.", "error");
+    return;
+  }
+  const style = captureStyleForm(content.querySelector('[data-form="style"]'));
+  if (style.guide && !window.confirm("Replace the current guide in this draft?")) return;
+  try {
+    const guide = await file.text();
+    if (Array.from(guide).length > 24_000) throw new Error("Choose a guide with at most 24,000 characters.");
+    style.guide = guide;
+    state.styleProposal = "";
+    render();
+    setMessage("Markdown imported into this style draft.", "good");
+    content.querySelector("#style-guide").focus();
+  } catch (error) {
+    setMessage(error.message, "error");
+  }
+}
+
+async function addStyleReferences() {
+  const form = content.querySelector('[data-form="style"]');
+  const files = Array.from(content.querySelector("#style-reference-file").files);
+  if (!files.length) {
+    setMessage("Choose reference images to add.", "error");
+    return;
+  }
+  const style = captureStyleForm(form);
+  const finish = beginRequest("Importing reference images…");
+  try {
+    for (const file of files) {
+      const query = new URLSearchParams({ name: file.name });
+      const reference = await api(`/api/style-references?${query}`, {
+        method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file,
+      });
+      if (!style.referenceImages.some(image => image.sha256 === reference.sha256)) style.referenceImages.push(reference);
+    }
+    setMessage("Reference images added to this draft.", "good");
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    finish();
+    render();
+  }
+}
+
+async function draftStyleGuide() {
+  const form = content.querySelector('[data-form="style"]');
+  if (!form.reportValidity()) return;
+  const style = captureStyleForm(form);
+  const finish = beginRequest("Claude is drafting the style guide…");
+  try {
+    const result = await post("/api/styles/draft", stylePayload(style));
+    if (!result.guide) throw new Error("Claude returned an empty style guide.");
+    state.styleProposal = result.guide;
+    setMessage("Style guide draft ready to review.", "good");
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    finish();
+  }
+  if (state.styleProposal) {
+    render();
+    content.querySelector("#proposed-style-guide")?.focus();
+  }
+}
+
+async function refreshLibrary() {
+  const styleId = state.libraryStyle;
+  if (!styleId) {
+    state.library = [];
+    if (state.view === "library") render();
+    return;
+  }
+  try {
+    const query = new URLSearchParams({ styleId });
+    const listing = await api(`/api/library?${query}`);
+    if (state.libraryStyle !== styleId) return;
     state.library = listing.assets;
     if (state.view === "library" && !state.pending) render();
   } catch (error) {
-    if (state.view === "library") {
+    if (state.view === "library" && state.libraryStyle === styleId) {
       state.library ??= [];
       if (!state.pending) render();
       setMessage(error.message, "error");
@@ -1890,6 +2265,9 @@ async function pinArtwork(data) {
   const previousProject = state.project?.id;
   await perform(async () => {
     const project = await api(path);
+    if (projectStyleId(project) !== state.libraryStyle) {
+      throw new Error("Choose a project that uses this style library.");
+    }
     const existing = project.assets.find(item => item.id === alias);
     if (existing && !(existing.issue && existing.hash !== selected?.hash)
         && (existing.libraryId !== libraryId || existing.libraryVersion !== version)) {
@@ -2089,7 +2467,26 @@ picker.addEventListener("change", () => selectProject(picker.value));
 
 document.addEventListener("change", event => {
   const control = event.target;
-  if (control.id === "library-version") {
+  if (control.id === "new-style-id") {
+    if (control.value === newStyleOption) {
+      state.returnToKickoff = true;
+      state.styleEditor = emptyStyle();
+      state.styleProposal = "";
+      openStudioView("styles");
+    } else {
+      state.newStyleId = control.value;
+      content.querySelector("#kickoff-style-details").innerHTML = kickoffStyleSummary(styleById(state.newStyleId));
+    }
+  } else if (control.id === "new-recording") {
+    state.newRecording = control.files[0] ?? null;
+    content.querySelector("#kickoff-recording-details").innerHTML = kickoffRecordingSummary();
+  } else if (control.id === "library-style") {
+    setLibraryStyle(control.value);
+    state.libraryAliasPreferred = "";
+    state.libraryProject = projectStyleId(state.project) === state.libraryStyle ? state.project.id : "";
+    render();
+    refreshLibrary();
+  } else if (control.id === "library-version") {
     state.libraryVersion = Number(control.value);
     content.querySelector("#library-inspector").innerHTML = libraryInspector();
     content.querySelector("#library-version").focus();
@@ -2123,17 +2520,21 @@ document.addEventListener("play", event => {
 document.addEventListener("input", event => {
   const control = event.target;
   if (control.id === "new-title") state.newTitle = control.value;
+  if (control.form?.dataset.form === "style") {
+    const color = control.dataset.paletteOverride;
+    if (color) control.form.querySelector(`#palette-${color}`).disabled = !control.checked;
+    captureStyleForm(control.form);
+  }
   if (control.id === "library-search") {
     state.libraryQuery = control.value;
     updateLibrarySearch();
   } else if (control.id === "library-alias") {
     state.libraryAlias = control.value;
   }
-  if (["intention", "style"].includes(control.id)) {
+  if (control.id === "intention") {
     state.inputDraft = {
       id: state.project.id,
       intention: content.querySelector("#intention").value,
-      style: content.querySelector("#style").value,
     };
   }
   if (control.dataset.field || control.dataset.layerField) updatePlanDraft();
@@ -2178,6 +2579,41 @@ function importFile(name, data) {
   perform(() => upload(path, file), { busy: "Importing file…", success: "File imported." });
 }
 
+async function createProject(title, style) {
+  const recording = state.newRecording;
+  const limit = state.config.maxAudioBytes;
+  if (recording && !recording.size) {
+    setMessage("Choose a narration recording with audio.", "error");
+    return;
+  }
+  if (recording?.size > limit) {
+    setMessage(`Choose a recording smaller than ${Math.floor(limit / 1024 / 1024)} MB.`, "error");
+    return;
+  }
+  let importError = "";
+  let styleChanged = false;
+  await perform(async () => {
+    let project;
+    try {
+      project = await post("/api/projects", { title, styleId: style.id, styleRevision: style.revision });
+    } catch (error) {
+      styleChanged = error.status === 409;
+      throw error;
+    }
+    state.newRecording = null;
+    if (recording) {
+      try {
+        return await upload("/audio", recording, project);
+      } catch (error) {
+        importError = error.message;
+      }
+    }
+    return project;
+  }, { stage: "intake", busy: recording ? "Creating project and importing narration…" : "Creating project…" });
+  if (styleChanged) await refreshStyles();
+  if (importError) setMessage(`Project created. Try importing the recording again in Intake. ${importError}`, "error");
+}
+
 document.addEventListener("submit", event => {
   const form = event.target;
   const name = form.dataset.form;
@@ -2185,7 +2621,9 @@ document.addEventListener("submit", event => {
   event.preventDefault();
   if (state.pending) return;
   const data = new FormData(form);
-  if (name === "settings") {
+  if (name === "style") {
+    saveStyle(form);
+  } else if (name === "settings") {
     const payload = settingsPayload(data);
     if ((payload.openAIKey && payload.clearOpenAIKey) || (payload.anthropicKey && payload.clearAnthropicKey)) {
       setMessage("Choose either a replacement key or the clear option for each provider.", "error");
@@ -2202,7 +2640,7 @@ document.addEventListener("submit", event => {
       return;
     }
     perform(() => mutate(`/assets/${encodeURIComponent(form.dataset.assetId)}/issue`, { kind: data.get("kind"), reason }),
-      { success: "Artwork issue recorded." });
+      { success: "Artwork issue recorded." }).then(refreshStyles);
   } else if (name === "proof-result") {
     const { proofGroup, proofId } = form.dataset;
     const passed = form.dataset.passed === "true";
@@ -2219,7 +2657,12 @@ document.addEventListener("submit", event => {
       setMessage("Enter a project name.", "error");
       return;
     }
-    perform(() => post("/api/projects", { title }), { stage: "intake" });
+    const style = styleById(data.get("styleId"));
+    if (!style) {
+      setMessage("Choose a style for this project.", "error");
+      return;
+    }
+    createProject(title, style);
   } else if (name === "derive-timings") {
     const modelDirectory = data.get("modelDirectory").trim();
     state.timingModelDirectory = modelDirectory;
@@ -2243,7 +2686,6 @@ document.addEventListener("submit", event => {
     perform(() => mutate("/input", {
       script: data.get("script"),
       intention: data.get("intention"),
-      style: data.get("style"),
       confirmTiming: data.has("confirmTiming"),
     }), {
       success: "Recording and transcript locked.",
@@ -2332,8 +2774,48 @@ document.addEventListener("click", event => {
   } else if (action === "new-project") {
     state.project = null;
     state.newTitle = "";
+    state.newStyleId = "";
+    state.newRecording = null;
+    state.returnToKickoff = false;
     openStage("intake", false);
     content.querySelector("#new-title")?.focus();
+  } else if (action === "clear-new-recording") {
+    state.newRecording = null;
+    const input = content.querySelector("#new-recording");
+    input.value = "";
+    content.querySelector("#kickoff-recording-details").innerHTML = kickoffRecordingSummary();
+    input.focus();
+  } else if (action === "new-style") {
+    state.styleEditor = emptyStyle();
+    state.styleProposal = "";
+    render();
+    content.querySelector("#style-name")?.focus();
+  } else if (action === "select-style") {
+    const selected = styleById(name);
+    if (!selected) return;
+    state.styleEditor = structuredClone(selected);
+    state.styleProposal = "";
+    setMessage();
+    render();
+  } else if (action === "return-to-kickoff") {
+    returnToNewProject();
+  } else if (action === "import-style-guide") {
+    importStyleGuide();
+  } else if (action === "upload-style-references") {
+    addStyleReferences();
+  } else if (action === "remove-style-reference") {
+    const editor = captureStyleForm(content.querySelector('[data-form="style"]'));
+    editor.referenceImages = editor.referenceImages.filter(image => image.sha256 !== name);
+    render();
+  } else if (action === "draft-style-guide") {
+    draftStyleGuide();
+  } else if (action === "adopt-style-draft" || action === "discard-style-draft") {
+    const editor = captureStyleForm(content.querySelector('[data-form="style"]'));
+    if (action === "adopt-style-draft") editor.guide = state.styleProposal;
+    state.styleProposal = "";
+    setMessage();
+    render();
+    content.querySelector("#style-guide")?.focus();
   } else if (action === "demo") {
     perform(() => post("/api/demo", {}), { busy: "Creating example…", stage: nextStage });
   } else if (action === "refresh-settings") {
@@ -2352,8 +2834,8 @@ document.addEventListener("click", event => {
     });
   } else if (action === "unlock-input") {
     if (window.confirm("Unlocking clears the current plan, quality checks, and export from this project. Unlock the intake?")) {
-      const { id, input, style } = state.project;
-      state.inputDraft = { id, intention: input.intention, style: input.style ?? style };
+      const { id, input } = state.project;
+      state.inputDraft = { id, intention: input.intention };
       perform(() => mutate("/input/unlock"), { success: "Intake unlocked.", resetPlan: true });
     }
   } else if (action === "seek-timing") {
@@ -2394,7 +2876,8 @@ document.addEventListener("click", event => {
       success: "Source approved for planned-use review.",
     });
   } else if (action === "publish-art") {
-    perform(() => mutate(`/assets/${encodeURIComponent(name)}/publish`), { success: "Artwork published to the library." });
+    perform(() => mutate(`/assets/${encodeURIComponent(name)}/publish`), { success: "Artwork published to the library." })
+      .then(refreshStyles);
   } else if (action === "generate-art") {
     perform(() => mutate(`/assets/${encodeURIComponent(name)}/generate`), {
       busy: `Generating ${name} with OpenAI…`,
@@ -2437,10 +2920,13 @@ async function initialize() {
   newProject.disabled = true;
   render();
   try {
-    const [config, listing, settings] = await Promise.all([api("/api/config"), api("/api/projects"), api("/api/settings")]);
+    const [config, listing, settings, styleList] = await Promise.all([
+      api("/api/config"), api("/api/projects"), api("/api/settings"), api("/api/styles"),
+    ]);
     state.config = config;
     state.projects = listing.projects;
     state.settings = settings;
+    state.styles = styleList.styles;
     if (!settings.completed) state.view = "settings";
     setConnection("online");
     let last = "";

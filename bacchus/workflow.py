@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from . import ENGINE_VERSION, api_log, audio, gates, local_timing, planning, providers, render, score, timing, visual_review
+from . import ENGINE_VERSION, api_log, audio, gates, local_timing, planning, providers, render, score, styles, timing, visual_review
 from .library import Library, LibraryError
 from .settings import video_encoder_mode
 
@@ -227,7 +227,7 @@ def missing_art(project):
     return list(missing.values())
 
 
-def art_prompt(missing, style):
+def art_prompt(missing, project):
     if not missing:
         return ""
     items = []
@@ -236,11 +236,15 @@ def art_prompt(missing, style):
         if item.get("issue"):
             line += f"\nRequired correction: {item['issue']['reason']}"
         items.append(line)
+    style = project.get("styleSnapshot") or {}
+    name = style.get("name", STYLES[project["style"]])
+    guide = "\n\nStyle guide:\n" + style["guide"] if style.get("guide") else ""
+    references = "\nReference images: " + ", ".join(ref["name"] for ref in style["referenceImages"]) if style.get("referenceImages") else ""
     return (
-        f"Create one separate image for each item below for the same animation. Visual style: {STYLES[style]}. "
+        f"Create one separate image for each item below for the same animation. Visual style: {name}. "
         "Use a coherent visual style across the set. Keep requested isolated subjects on transparent "
         "backgrounds. Keep the artwork free of lettering. Return each image with its corresponding ID.\n\n"
-        + "\n\n".join(items)
+        + "\n\n".join(items) + guide + references
     )
 
 
@@ -329,7 +333,7 @@ def candidate(project, folder, verify=True, require_mix=True):
         if verify and file_digest(folder / "assets" / f"{asset['hash']}.png") != asset["hash"]:
             raise WorkflowError(f"The approved artwork for {asset_id} is missing or no longer matches.", 409)
         used[asset_id] = asset["hash"]
-    return {
+    record = {
         "engine": ENGINE_VERSION,
         "pack": project["pack"],
         "inputHash": source["hash"],
@@ -340,6 +344,9 @@ def candidate(project, folder, verify=True, require_mix=True):
         "style": project["style"],
         "mix": mix_record(project, folder, require_approval=True, verify=verify) if require_mix else None,
     }
+    if style := project.get("styleSnapshot"):
+        record["styleGuide"] = {"id": style["id"], "revision": style["revision"], "hash": digest(encoded(style))}
+    return record
 
 
 def reset_candidate(project):
@@ -394,11 +401,64 @@ class Studio:
     def __init__(self, root, library_root=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.library = Library(Path(library_root).resolve() if library_root is not None else self.root / "library")
         self.lock = threading.RLock()
+        self.styles = styles.StyleCatalog(self.root)
+        self.library_root = self.root / "style-libraries"
+        if not self.library_root.resolve().is_relative_to(self.root):
+            raise WorkflowError("Style libraries must stay inside Bacchus data.", 409)
+        self.libraries = {}
+        legacy_roots = [self.root / "library"]
+        if library_root is not None:
+            legacy_roots.append(Path(library_root).resolve())
+        self.library_migration_error = None
+        for existing in dict.fromkeys(legacy_roots):
+            try:
+                self._migrate_library(existing)
+            except (LibraryError, OSError) as error:
+                self.library_migration_error = str(error)
+        self.library = self.library_for("warm-editorial")
         self.mix_lock = threading.Lock()
+        self.active_style_drafts = 0
         self.jobs = set()
         self._recover_jobs()
+
+    def library_for(self, style_id):
+        if not isinstance(style_id, str) or len(style_id) > 80 or not ART_ID.fullmatch(style_id):
+            raise WorkflowError("Style library was not found.", 404)
+        with self.lock:
+            if style_id not in self.libraries:
+                directory = self.library_root / style_id
+                if not directory.resolve().is_relative_to(self.library_root.resolve()):
+                    raise WorkflowError("The style library must stay inside Bacchus data.", 409)
+                self.libraries[style_id] = Library(directory)
+            return self.libraries[style_id]
+
+    @staticmethod
+    def project_style_id(project):
+        return (project.get("styleSnapshot") or {}).get("id", project["style"])
+
+    def _migrate_library(self, source):
+        if not (source / "entries").is_dir():
+            return
+        marker = self.library_root / f".legacy-{digest(str(source).encode('utf-8'))}.json"
+        if marker.is_file() or source.is_relative_to(self.library_root):
+            return
+        Library(source).copy_by_style({style_id: self.library_for(style_id) for style_id in STYLES})
+        write_json(marker, {"source": str(source), "copiedAt": now()})
+
+    def style_view(self, style, *, include_count=True):
+        view = {**style, "referenceImages": [{**ref, "url": f"/api/style-references/{ref['sha256']}"}
+                                             for ref in style["referenceImages"]]}
+        if include_count:
+            library = self.library_for(style["id"])
+            view["assetCount"] = sum(any(version["qualified"] and not version["issue"] for version in entry["versions"])
+                                     for entry in library.list_assets())
+        return view
+
+    def _style_reference_bytes(self, project):
+        style = project.get("styleSnapshot") or {}
+        return tuple(self.styles.reference(reference["sha256"]).read_bytes()
+                     for reference in style.get("referenceImages", []))
 
     def _recover_jobs(self):
         for path in self.root.glob("*/project.json"):
@@ -497,7 +557,7 @@ class Studio:
         for track in ([mix["music"]] if mix["music"] else []) + mix["effects"]:
             track["url"] = f"{base}/media/audio/{track['hash']}"
         view["missing"] = missing_art(view)
-        view["artPrompt"] = art_prompt(view["missing"], project["style"])
+        view["artPrompt"] = art_prompt(view["missing"], project)
         view["accepted"] = bool(project["accepted"])
         view["needsExactTiming"] = bool(project["input"] and not project["demo"]
                                        and (project["input"].get("timing") != "source-cues" or not project["input"].get("words")))
@@ -519,6 +579,8 @@ class Studio:
             and bool(view["animationChecks"])
             and all(check["status"] == "passed" for check in view["animationChecks"])
         )
+        chosen_style = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+        view["styleSnapshot"] = self.style_view(chosen_style, include_count=False)
         planner_runs = view.pop("plannerRuns")
         view["plannerCalls"] = len(planner_runs)
         view["plannerLastRun"] = planner_runs[-1] if planner_runs else None
@@ -546,11 +608,15 @@ class Studio:
                         project = self._read(path.parent.name)
                     except WorkflowError:
                         continue
-                    projects.append({key: project[key] for key in ("id", "title", "updatedAt")})
+                    chosen = project.get("styleSnapshot") or self.styles.get(project["style"], 1)
+                    projects.append({**{key: project[key] for key in ("id", "title", "updatedAt")},
+                                     "styleId": chosen["id"], "styleName": chosen["name"]})
             return {"projects": sorted(projects, key=lambda item: item["updatedAt"], reverse=True)}
 
     def providers_in_use(self):
         with self.lock:
+            if self.active_style_drafts:
+                return True
             for path in self.root.glob("*/project.json"):
                 if not PROJECT_ID.fullmatch(path.parent.name):
                     continue
@@ -564,13 +630,14 @@ class Studio:
                     continue
             return False
 
-    def create(self, title, demo=False):
+    def create(self, title, demo=False, *, style_id="warm-editorial", style_revision=None):
+        chosen = self.styles.get(style_id, style_revision)
         project = {
             "id": uuid.uuid4().hex, "title": text_value(title, "Project title", 120, True),
             "revision": 0, "createdAt": now(), "pack": PACK_PIN, "input": None, "audio": None,
             "plan": None, "assets": [], "qc": None, "accepted": None, "export": None, "busy": None,
             "plannerRuns": [], "approvals": [],
-            "style": "warm-editorial", "mix": new_mix("none") if demo else new_mix(),
+            "style": chosen["visualPreset"], "styleSnapshot": chosen, "mix": new_mix("none") if demo else new_mix(),
             "demo": demo, "transcript": None, "transcriptionRuns": [], "artRuns": [],
             "review": gates.new_review(),
         }
@@ -614,11 +681,24 @@ class Studio:
         return project
 
     def _apply_library_issues(self, project):
+        library = self.library_for(self.project_style_id(project))
         for asset in project["assets"]:
             if asset.get("libraryId") and not asset.get("issue"):
-                issue = self.library.issue(asset["libraryId"], asset["libraryVersion"])
+                issue = library.issue(asset["libraryId"], asset["libraryVersion"])
                 if issue:
                     asset["issue"] = issue
+
+    @staticmethod
+    def _library_contains_pin(library, asset):
+        if not asset.get("libraryId"):
+            return False
+        try:
+            version = library.get(asset["libraryId"], asset["libraryVersion"])
+        except LibraryError as error:
+            if error.status == 404:
+                return False
+            raise
+        return version["hash"] == asset["hash"]
 
     def _approve_plan(self, project):
         require_source_cues(project)
@@ -628,6 +708,17 @@ class Studio:
         if not plan["approved"]:
             plan["approved"] = True
             project["approvals"].append({"kind": "plan", "hash": plan["hash"], "at": now()})
+            style = project.get("styleSnapshot")
+            if style and project["mix"]["musicMode"] is None and not project["mix"]["effects"]:
+                folder = self._folder(project["id"])
+                answers = style["answers"]
+                if answers["music"]:
+                    self._preset_mix(project, folder, answers["musicPreset"])
+                else:
+                    mix = new_mix("none")
+                    if answers["soundEffects"]:
+                        mix["effects"] = self._transition_accents(project, folder)
+                    self._update_mix(project, mix)
 
     def change(self, project_id, action, data):
         params = {"input": ("script", "intention"), "plan": ("scenes",)}.get(action, ())
@@ -672,6 +763,8 @@ class Studio:
                 style = data.get("style", project["style"])
                 if not isinstance(style, str) or style not in STYLES:
                     raise WorkflowError("Choose a supported visual style.")
+                if style != project["style"] and (project.get("styleSnapshot") or project["assets"]):
+                    raise WorkflowError("Choose the style when creating a new project.", 409)
                 project["style"] = style
                 project["input"] = make_input(project, data["script"], data["intention"])
                 if project["audio"]:
@@ -814,6 +907,12 @@ class Studio:
             raise WorkflowError("Approve the scene plan before creating a soundtrack.", 409)
         raw_music, music_duration = score.soundtrack(preset)
         music = self._store_track(folder, score.PRESETS[preset], raw_music, music_duration, -16)
+        style = project.get("styleSnapshot")
+        effects = self._transition_accents(project, folder) if not style or style["answers"]["soundEffects"] else []
+        self._update_mix(project, {"musicMode": "track", "music": music, "effects": effects,
+                                   "musicRegions": [], "approved": False})
+
+    def _transition_accents(self, project, folder):
         effects = []
         accents = project["plan"]["scenes"][1:MAX_EFFECTS + 1]
         if accents:
@@ -822,8 +921,7 @@ class Studio:
             for scene in accents:
                 start = project["input"]["lines"][scene["startLine"] - 1]["start"]
                 effects.append({**track, "id": uuid.uuid4().hex, "start": start})
-        self._update_mix(project, {"musicMode": "track", "music": music, "effects": effects,
-                                   "musicRegions": [], "approved": False})
+        return effects
 
     def upload_mix(self, project_id, revision, kind, name, raw):
         name = file_name(name)
@@ -1058,7 +1156,15 @@ class Studio:
                 raise WorkflowError("Enable OpenAI image generation and add an OpenAI key in Settings to generate here.", 409)
             if len(project["artRuns"]) >= MAX_ART_GENERATIONS:
                 raise WorkflowError("This project reached its artwork generation limit.", 409)
-            payload = providers.image_request(STYLES[project["style"]], asset_id, brief)
+            style = project.get("styleSnapshot") or {}
+            answers = style.get("answers", {})
+            options = {}
+            if style:
+                options = {
+                    "guide": style["guide"], "visual_notes": answers["visualNotes"] + "\n" + answers["colorNotes"],
+                    "palette": style["palette"], "references": self._style_reference_bytes(project),
+                }
+            payload = providers.image_request(style.get("name", STYLES[project["style"]]), asset_id, brief, **options)
             run = {"model": payload["model"], "id": asset_id, "status": "running", "startedAt": now(),
                    "requestHash": digest(encoded(payload)), "planHash": project["plan"]["hash"]}
             project["artRuns"].append(run)
@@ -1134,6 +1240,7 @@ class Studio:
         with self.lock:
             project = self._edit(project_id, data["revision"])
             folder = self._folder(project_id)
+            library = self.library_for(self.project_style_id(project))
             candidate(project, folder, require_mix=False)
             asset = assets_by_id(project).get(asset_id)
             checks = [check for check in gates.checks(project, "assets") if check["assetId"] == asset_id]
@@ -1145,13 +1252,13 @@ class Studio:
                 if record.get("status") != "passed" or not gates.has_proof(folder, "assets", check, record):
                     raise WorkflowError("Pass every current planned use of this artwork before publishing.", 409)
                 proof_hashes[check["id"]] = record["proofHash"]
-            if asset.get("libraryId"):
-                self.library.qualify(asset["libraryId"], asset["libraryVersion"], project_id, proof_hashes)
+            if self._library_contains_pin(library, asset):
+                library.qualify(asset["libraryId"], asset["libraryVersion"], project_id, proof_hashes)
             else:
                 uses = (use for scene in project["plan"]["scenes"] for use in planning.scene_art(scene))
                 brief = next((use["artBrief"] for use in uses if use["artId"] == asset_id and use["artBrief"]), "")
-                version = self.library.publish(
-                    project_id=project_id, alias=asset_id, name=asset["name"], brief=brief, style=project["style"],
+                version = library.publish(
+                    project_id=project_id, alias=asset_id, name=asset["name"], brief=brief, style=self.project_style_id(project),
                     source=asset.get("source", "project"), content_hash=asset["hash"],
                     path=folder / "assets" / f"{asset['hash']}.png", proofs=proof_hashes,
                 )
@@ -1175,8 +1282,9 @@ class Studio:
             if asset.get("issue"):
                 raise WorkflowError("This version already has an open issue. Replace it with corrected artwork.", 409)
             issue = {"kind": data["kind"], "reason": reason, "at": now()}
-            if asset.get("libraryId"):
-                self.library.flag(asset["libraryId"], asset["libraryVersion"], issue)
+            library = self.library_for(self.project_style_id(project))
+            if self._library_contains_pin(library, asset):
+                library.flag(asset["libraryId"], asset["libraryVersion"], issue)
             asset.update(issue=issue, approved=False)
             project.setdefault("assetIssues", []).append({**issue, "id": asset_id, "hash": asset["hash"]})
             reset_candidate(project)
@@ -1199,10 +1307,9 @@ class Studio:
         narration = project["input"]
         wanted = asset_terms(f"{project['title']} {narration['intention']} {narration['script']}")
         ranked = []
-        for entry in self.library.list_assets():
+        library = self.library_for(self.project_style_id(project))
+        for entry in library.list_assets():
             if entry["id"] in excludes or entry["id"] in pinned_entries:
-                continue
-            if entry["style"] != project["style"]:
                 continue
             terms = asset_terms(f"{entry['alias']} {Path(entry['name']).stem} {entry['brief']}")
             matches = len(terms & wanted)
@@ -1232,7 +1339,7 @@ class Studio:
 
     def _copy_library_art(self, project, version):
         try:
-            raw = self.library.blob(version["hash"]).read_bytes()
+            raw = self.library_for(self.project_style_id(project)).blob(version["hash"]).read_bytes()
         except OSError as error:
             raise WorkflowError("The stored artwork version could not be read.", 409) from error
         if digest(raw) != version["hash"]:
@@ -1252,9 +1359,9 @@ class Studio:
     def pin_library(self, project_id, data):
         fields(data, ("revision", "libraryId", "version", "alias"))
         alias = art_id(data["alias"])
-        version = self.library.get(data["libraryId"], data["version"])
         with self.lock:
             project = self._edit(project_id, data["revision"])
+            version = self.library_for(self.project_style_id(project)).get(data["libraryId"], data["version"])
             existing = assets_by_id(project).get(alias)
             asset = self._pinned_art(alias, version)
             if existing:
@@ -1280,6 +1387,9 @@ class Studio:
         selected = [asset for asset in reusable if asset["id"] in ids]
         if not selected:
             return
+        library = self.library_for(self.project_style_id(project))
+        for version in selected:
+            library.get(version["id"], version["version"])
         additions = [self._pinned_art(version["id"], version) for version in selected]
         validate_scenes({**project, "assets": project["assets"] + additions}, scenes)
         for version in selected:
@@ -1297,7 +1407,7 @@ class Studio:
             if len(project["plannerRuns"]) >= planning.MAX_PLANNER_CALLS:
                 raise WorkflowError("This project reached its AI planning request limit.", 409)
             reusable = self._reusable_art(project)
-            payload = planning.plan_request(project, reusable)
+            payload = planning.plan_request(project, reusable, self._style_reference_bytes(project))
             provider = "openai" if "text" in payload else "anthropic"
             run = {
                 "model": payload["model"], "requestHash": digest(encoded(payload)),
@@ -1441,11 +1551,14 @@ class Studio:
             if not visual_review.available():
                 raise WorkflowError("Add an Anthropic API key in Settings to ask Claude to review a proof.", 409)
             scene = project["plan"]["scenes"][check["scene"] - 1]
+            style = project.get("styleSnapshot") or {}
             context = {
-                "style": STYLES[project["style"]], "scene": scene,
+                "style": style.get("name", STYLES[project["style"]]), "scene": scene,
                 "narration": [line["text"] for line in project["input"]["lines"][scene["startLine"] - 1:scene["endLine"]]],
                 "intention": project["input"]["intention"], "samples": check.get("samples"),
             }
+            if style.get("guide"):
+                context["styleGuide"] = style["guide"][:3000]
             brief = json.dumps(context, ensure_ascii=False)
             if len(brief) > visual_review.MAX_BRIEF_CHARS:
                 context["narration"] = " ".join(context["narration"])[:4000]

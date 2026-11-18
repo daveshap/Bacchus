@@ -1,7 +1,7 @@
 """Render the same constrained scene plan to a still or an H.264 video."""
 
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import hashlib
 from io import BytesIO
@@ -14,7 +14,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 from threading import Timer
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
 
 from . import layer_spec, media_tools, mixing, video_encoding
 
@@ -41,6 +41,8 @@ PALETTES = {
     "studio-ink": Palette("#f8f7f3", "#202120", "#494b48", "#634f89", "#b9b7b3", "#e8e6e1"),
     "night-signal": Palette("#141d2c", "#f1f6ff", "#b1c2d9", "#6ce9c1", "#405371", "#20324a", "signal"),
 }
+PALETTE_ROLES = frozenset(("paper", "ink", "muted", "rule", "accent"))
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 
 FONT_ROOTS = (
     Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts",
@@ -62,6 +64,43 @@ FONT_FILES = {
 
 class RenderError(ValueError):
     """A scene cannot be drawn or its delivery could not be verified."""
+
+
+def validate_style_palette(value):
+    """Normalize explicit colors without changing the creator's palette choices."""
+    if not isinstance(value, dict) or value.keys() - PALETTE_ROLES:
+        raise RenderError("Style palette colors must use paper, ink, muted, rule or accent.")
+    normalized = {}
+    for role, color in value.items():
+        if not isinstance(color, str) or not HEX_COLOR.fullmatch(color):
+            raise RenderError(f"Style palette {role} must be a six-digit hex color such as #26372d.")
+        normalized[role] = color.lower()
+    return normalized
+
+
+def project_visual_preset(project):
+    stored = project.get("style", "warm-editorial")
+    snapshot = project.get("styleSnapshot")
+    preset = snapshot.get("visualPreset", stored) if snapshot else stored
+    if not isinstance(preset, str) or preset not in PALETTES:
+        raise RenderError(f"Unsupported project style {preset!r}.")
+    return preset
+
+
+def project_palette(project):
+    """Resolve the colors actually rendered by the project's pinned style guide."""
+    base = PALETTES[project_visual_preset(project)]
+    snapshot = project.get("styleSnapshot") or {}
+    overrides = validate_style_palette(snapshot.get("palette", {}))
+    overrides = {role: color for role, color in overrides.items() if color != getattr(base, role)}
+    if not overrides:
+        return base
+    if "paper" in overrides:
+        paper = ImageColor.getrgb(overrides["paper"])
+        ink = ImageColor.getrgb(overrides.get("ink", base.ink))
+        channels = (round(.92 * background + .08 * foreground) for background, foreground in zip(paper, ink, strict=True))
+        overrides["matte"] = "#" + "".join(f"{channel:02x}" for channel in channels)
+    return replace(base, **overrides)
 
 
 @lru_cache(maxsize=64)
@@ -202,13 +241,13 @@ def _draw_block(image, text, box, color, role="body", maximum=33, minimum=18, *,
         y += step
 
 
-def _layered_background(scene, palette):
+def _layered_background(scene, palette, preset):
     frame = Image.new("RGB", (WIDTH, HEIGHT), palette.paper)
     draw = ImageDraw.Draw(frame)
     draw.rectangle((47, 43, WIDTH - 47, HEIGHT - 43), outline=palette.rule, width=2)
     draw.line((91, 140, WIDTH - 91, 140), fill=palette.rule, width=2)
     draw.rounded_rectangle((92, 74, 128, 79), radius=2, fill=palette.accent)
-    heading = "warm-heading" if palette is PALETTES["warm-editorial"] else palette.title_font
+    heading = "warm-heading" if preset == "warm-editorial" else palette.title_font
     _draw_block(frame, scene["title"], (149, 65, 1039, 67), palette.ink, heading, 44, 23)
     caption = scene.get("caption", "")
     if caption:
@@ -217,7 +256,7 @@ def _layered_background(scene, palette):
     return frame
 
 
-def _draw_chart(tile, layer, palette):
+def _draw_chart(tile, layer, palette, preset):
     draw = ImageDraw.Draw(tile)
     width, height = tile.size
     items = layer["items"]
@@ -239,10 +278,10 @@ def _draw_chart(tile, layer, palette):
 
     baseline = position(0)
     draw.line((baseline, header, baseline, height - 18), fill=palette.muted, width=1)
-    colors = (
-        ("#5f8377", "#a95d44", "#658095", "#a88039")
-        if palette is PALETTES["warm-editorial"] else (palette.accent, palette.muted)
-    )
+    colors = (palette.accent, palette.muted)
+    warm = PALETTES["warm-editorial"]
+    if preset == "warm-editorial" and colors == (warm.accent, warm.muted):
+        colors = ("#5f8377", "#a95d44", "#658095", "#a88039")
     for index, item in enumerate(items):
         top = header + row_height * index
         _draw_block(tile, item["label"], (12, top, label_width, row_height), palette.ink, maximum=20, minimum=13)
@@ -356,10 +395,8 @@ class _Composition:
         self.duration = self.source["duration"]
         self.folder = folder
         self.scenes = project["plan"]["scenes"]
-        style = project.get("style", "warm-editorial")
-        if style not in PALETTES:
-            raise RenderError(f"Unsupported project style {style!r}.")
-        self.palette = PALETTES[style]
+        self.preset = project_visual_preset(project)
+        self.palette = project_palette(project)
         # Include the recording's lead-in in the opening scene.
         self.positions = [0.0] + [
             self.source["lines"][scene["startLine"] - 1]["start"]
@@ -404,7 +441,7 @@ class _Composition:
                     fitted = ImageOps.contain(image, tile.size, Image.Resampling.LANCZOS)
                     tile.alpha_composite(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
                 elif kind == "bar-chart":
-                    _draw_chart(tile, layer, self.palette)
+                    _draw_chart(tile, layer, self.palette, self.preset)
                 elif kind == "flow":
                     _draw_flow(tile, layer, self.palette)
             except RenderError as error:
@@ -413,7 +450,7 @@ class _Composition:
                 layer["id"], tile, (x, y), start - scene_start, settled - scene_start, end - scene_start,
                 layer["enter"]["effect"],
             ))
-        return _PreparedScene(_layered_background(scene, self.palette), tuple(layers))
+        return _PreparedScene(_layered_background(scene, self.palette, self.preset), tuple(layers))
 
     def visual_state(self, index, elapsed, prepared):
         if prepared.layers:

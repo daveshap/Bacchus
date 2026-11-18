@@ -32,10 +32,15 @@ def _scenes(project):
 
 
 def _style(project):
-    style = project.get("style", "warm-editorial")
-    if style not in render.PALETTES:
-        raise RenderError(f"Unsupported project style {style!r}.")
-    return {"id": style, "palette": asdict(render.PALETTES[style]), "size": [render.WIDTH, render.HEIGHT]}
+    style = {
+        "id": render.project_visual_preset(project),
+        "palette": asdict(render.project_palette(project)),
+        "size": [render.WIDTH, render.HEIGHT],
+    }
+    snapshot = project.get("styleSnapshot")
+    if snapshot:
+        style["guide"] = {"id": snapshot["id"], "revision": snapshot["revision"]}
+    return style
 
 
 def _visual(scene, assets):

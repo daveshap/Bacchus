@@ -10,7 +10,7 @@ import wave
 
 from PIL import Image
 
-from bacchus import audio, planning, render, visual_review
+from bacchus import audio, planning, render, styles, visual_review
 from bacchus.library import LibraryError
 from bacchus.workflow import Studio, WorkflowError
 
@@ -401,6 +401,37 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertFalse(self.project["accepted"])
         self.assertFalse(self.project["plan"]["approved"])
         self.assertIsNone(self.project["qc"])
+
+    def test_style_pins_the_guide_applies_audio_preferences_and_keeps_its_library_separate(self):
+        guide = self.studio.styles.create({
+            "name": "Receipt illustrations", "libraryName": "Receipt artwork",
+            "guide": "# Use a paper backdrop", "visualPreset": "studio-ink",
+            "answers": {**styles.ANSWER_DEFAULTS, "music": False, "soundEffects": True,
+                        "effectsNotes": "  Keep each transition subtle.\n"},
+        })
+        self.project = self.studio.create("A patch of light", style_id=guide["id"], style_revision=1)
+        self.project_id = self.project["id"]
+        self.project = self.studio.upload_audio(self.project_id, self.project["revision"], "recording.wav", wav_recording())
+        self.plan_with_art()
+        self.assertEqual(self.project["mix"]["musicMode"], "none")
+        self.assertEqual(len(self.project["mix"]["effects"]), 1)
+        self.change("assets/checks")
+        self.review_checks("assets")
+        self.publish_art()
+        self.assertEqual(self.studio.style_view(guide)["assetCount"], 1)
+        asset = self.project["assets"][0]
+        self.assertEqual(self.studio.library_for("professional-corporate").list_assets(), [])
+        other = self.studio.create("Corporate video", style_id="professional-corporate")
+        with self.assertRaises(LibraryError):
+            self.studio.pin_library(other["id"], {
+                "revision": other["revision"], "libraryId": asset["libraryId"], "version": asset["libraryVersion"], "alias": "cup",
+            })
+        self.studio.styles.update(guide["id"], 1, {"guide": "A new guide"})
+        pinned = self.studio.get(self.project_id)["styleSnapshot"]
+        self.assertEqual((pinned["revision"], pinned["guide"]), (1, "# Use a paper backdrop"))
+        self.assertEqual(pinned["answers"]["effectsNotes"], "  Keep each transition subtle.\n")
+        later = self.studio.create("Another lesson", style_id=guide["id"])
+        self.assertEqual(later["styleSnapshot"]["revision"], 2)
 
     def test_library_pin_keeps_the_selected_version_across_projects(self):
         self.plan_with_art()

@@ -103,13 +103,18 @@ class Library:
             or not isinstance(asset.get("name"), str) or type(asset.get("latestVersion")) is not int
         ):
             raise LibraryError("Library artwork metadata needs repair.", 409)
-        for offset, version in enumerate(versions):
+        previous = asset["latestVersion"] + 1
+        for version in versions:
             if (
                 not isinstance(version, dict) or set(version) != VERSION_FIELDS or version["id"] != asset_id
-                or type(version["version"]) is not int or version["version"] != asset["latestVersion"] - offset
+                or type(version["version"]) is not int or not 0 < version["version"] < previous
                 or not isinstance(version["hash"], str) or not CONTENT_HASH.fullmatch(version["hash"])
+                or not isinstance(version["style"], str)
             ):
                 raise LibraryError("Library artwork version metadata needs repair.", 409)
+            previous = version["version"]
+        if versions[0]["version"] != asset["latestVersion"]:
+            raise LibraryError("Library artwork version metadata needs repair.", 409)
         return record
 
     def _blob_path(self, content_hash):
@@ -195,6 +200,47 @@ class Library:
     def _write_record(self, asset_id, record):
         raw = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         _atomic_write(self._entry_path(asset_id), raw)
+
+    def copy_by_style(self, libraries):
+        """Copy a legacy shared collection without changing its source files."""
+        for path in self._safe_path("entries").glob("*.json"):
+            if not ASSET_ID.fullmatch(path.stem):
+                continue
+            record = self._read(path.stem)
+            grouped = {}
+            for version in record["asset"]["versions"]:
+                style = version["style"] if version["style"] in libraries else "warm-editorial"
+                grouped.setdefault(style, []).append(version)
+            for style, versions in grouped.items():
+                libraries[style]._copy_versions(self, record, versions)
+
+    def _copy_versions(self, source, record, versions):
+        asset_id = record["asset"]["id"]
+        with self._exclusive():
+            current = self._read(asset_id, optional=True)
+            if current and current["origin"] != record["origin"]:
+                raise LibraryError("An existing style library entry conflicts with the old library.", 409)
+            existing = {item["version"]: item for item in current["asset"]["versions"]} if current else {}
+            for version in versions:
+                number = version["version"]
+                if number in existing and existing[number] != version:
+                    raise LibraryError("An existing style library version conflicts with the old library.", 409)
+                target = self._blob_path(version["hash"])
+                if not target.exists():
+                    _atomic_write(target, source.blob(version["hash"]).read_bytes())
+                else:
+                    self.blob(version["hash"])
+                existing[number] = version
+            merged = sorted(existing.values(), key=lambda item: item["version"], reverse=True)
+            latest = merged[0]
+            asset = {**record["asset"], "name": latest["name"], "brief": latest["brief"], "style": latest["style"],
+                     "latestVersion": latest["version"], "versions": merged}
+            metadata = {}
+            for key in ("qualifications", "issues"):
+                retained = {str(item["version"]): record.get(key, {}).get(str(item["version"])) for item in versions}
+                metadata[key] = {version: value for version, value in retained.items() if value is not None}
+                metadata[key].update((current or {}).get(key, {}))
+            self._write_record(asset_id, {"schema": 1, "origin": record["origin"], "asset": asset, **metadata})
 
     def qualify(self, asset_id, version, project_id, proofs):
         with self._exclusive():

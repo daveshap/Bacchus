@@ -10,7 +10,7 @@ import webbrowser
 
 
 LOOPBACK = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})")
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0"
 
 
 def _absolute_override(name, fallback):

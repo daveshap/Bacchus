@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageColor
 
 from bacchus import planning, render, review
 
@@ -101,6 +101,34 @@ class LayeredScenesTests(unittest.TestCase):
             changed["plan"]["scenes"][0]["layers"][0]["items"][0]["value"] = 5.25
             original = render.preview(project, folder, 1.7)
             self.assertNotEqual(original, render.preview(changed, folder, 1.7))
+
+    def test_pinned_palette_changes_canvas_accents_and_chart_without_changing_timing(self):
+        with TemporaryDirectory(prefix="bacchus-layered-style-") as directory:
+            folder = Path(directory)
+            project = scene_project()
+            self.create_asset(folder, project)
+            legacy = render.preview(project, folder, 1.7)
+            project["styleSnapshot"] = {
+                "id": "bold-green", "revision": 1, "visualPreset": "warm-editorial", "palette": {},
+            }
+            self.assertEqual(legacy, render.preview(project, folder, 1.7))
+
+            project["styleSnapshot"]["palette"] = {"paper": "#E2F3E1", "accent": "#00662E", "muted": "#355045"}
+            composition = render._Composition(project, folder)
+            chart = composition.prepare(0).layers[0]
+            self.assertEqual(chart.start, 1)
+            self.assertIn((*ImageColor.getrgb("#00662E"), 255), chart.image.get_flattened_data())
+            self.assertNotEqual(composition.palette.matte, render.PALETTES["warm-editorial"].matte)
+            with Image.open(BytesIO(render.preview(project, folder, 1.7))) as styled:
+                self.assertEqual(styled.getpixel((0, 0)), ImageColor.getrgb("#E2F3E1"))
+                self.assertEqual(styled.getpixel((106, 76)), ImageColor.getrgb("#00662E"))
+            self.assertEqual(render.layout_findings(project, folder), [])
+
+    def test_palette_rejects_malformed_colors_and_unknown_roles(self):
+        for palette in ({"accent": "#abc"}, {"accent": "green"}, {"paper": None}, {"matte": "#000000"}):
+            with self.subTest(palette=palette), self.assertRaises(render.RenderError):
+                render.validate_style_palette(palette)
+        self.assertEqual(render.validate_style_palette({"accent": "#ABCDEF"}), {"accent": "#abcdef"})
 
     def test_per_use_proof_shows_isolated_action_and_library_publication_keeps_identity(self):
         with TemporaryDirectory(prefix="bacchus-layered-proof-") as directory:

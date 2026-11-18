@@ -8,7 +8,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, visual_review
+from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, styles, visual_review
 from .library import LibraryError
 from .runtime import APP_VERSION
 from .settings import SettingsError
@@ -56,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._post(target.path, parse_qs(target.query))
             else:
                 self._get(target.path, parse_qs(target.query))
-        except (WorkflowError, LibraryError, SettingsError) as error:
+        except (WorkflowError, LibraryError, SettingsError, styles.StyleError) as error:
             self._json({"error": str(error)}, error.status)
         except render.RenderError as error:
             self._json({"error": str(error)}, 422)
@@ -93,6 +93,9 @@ class Handler(BaseHTTPRequestHandler):
                 "audioAvailable": audio.audio_available(), "transcriberAvailable": audio.transcriber_available(),
                 "imageAvailable": providers.image_available(), "plannerProvider": planning.planner_provider(),
                 "visualReviewerAvailable": visual_review.available(),
+                "styleDraftAvailable": studio.styles.available(),
+                "maxStyleReferenceBytes": styles.MAX_REFERENCE_BYTES,
+                "maxStyleReferenceImages": styles.MAX_REFERENCE_IMAGES,
                 "localTimingAvailable": local_timing.available(),
                 "styles": [{"id": style, "name": label} for style, label in STYLES.items()],
                 "maxEffects": MAX_EFFECTS, "maxFxDuration": MAX_FX_DURATION,
@@ -109,15 +112,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             self._json(self._settings_view(self.server.settings.get()))
             return
+        if path == "/api/styles":
+            self._json({"styles": [studio.style_view(style) for style in studio.styles.list_styles()]})
+            return
+        if re.fullmatch(r"/api/styles/[^/]+", path):
+            style_id = path.rsplit("/", 1)[-1]
+            self._json(studio.style_view(studio.styles.get(style_id)))
+            return
+        if re.fullmatch(r"/api/style-references/[^/]+", path):
+            image = studio.styles.reference(path.rsplit("/", 1)[-1])
+            self._file(image, "image/png", "art")
+            return
         if path == "/api/library":
-            assets = studio.library.list_assets()
+            style_id = query.get("styleId", ["warm-editorial"])[0]
+            style = studio.styles.get(style_id)
+            assets = studio.library_for(style_id).list_assets()
             for entry in assets:
                 for version in entry["versions"]:
-                    version["url"] = f"/api/library/media/{version['hash']}"
-            self._json({"assets": assets})
+                    version["url"] = f"/api/library/media/{version['hash']}?styleId={style_id}"
+            self._json({"assets": assets, "styleId": style_id, "libraryName": style["libraryName"]})
             return
         if path.startswith("/api/library/media/"):
-            image = studio.library.blob(path.rsplit("/", 1)[-1])
+            style_id = query.get("styleId", ["warm-editorial"])[0]
+            studio.styles.get(style_id)
+            image = studio.library_for(style_id).blob(path.rsplit("/", 1)[-1])
             self._file(image, "image/png", "art")
             return
         project_id, tail = self._project_route(path)
@@ -164,10 +182,45 @@ class Handler(BaseHTTPRequestHandler):
                     raise WorkflowError("Wait for the active AI request before changing provider settings.", 409)
                 self._json(self._settings_view(self.server.settings.save(data)))
             return
+        if path == "/api/style-references":
+            reference = studio.styles.store_reference(query.get("name", ["reference.png"])[0],
+                                                      self._raw(styles.MAX_REFERENCE_BYTES))
+            self._json({**reference, "url": f"/api/style-references/{reference['sha256']}"}, 201)
+            return
+        if path == "/api/styles":
+            self._json(studio.style_view(studio.styles.create(self._body())), 201)
+            return
+        if path == "/api/styles/draft":
+            spec = self._body()
+            with studio.lock:
+                if self.server.closing:
+                    raise WorkflowError("Bacchus is closing.", 409)
+                studio.active_style_drafts += 1
+            try:
+                self._json(studio.styles.draft_guide(spec))
+            finally:
+                with studio.lock:
+                    studio.active_style_drafts -= 1
+            return
+        if re.fullmatch(r"/api/styles/[^/]+", path):
+            style_id = path.rsplit("/", 1)[-1]
+            data = self._body()
+            if not isinstance(data, dict) or "revision" not in data:
+                raise WorkflowError("Supply the revision of the style you are editing.")
+            revision = data.pop("revision")
+            self._json(studio.style_view(studio.styles.update(style_id, revision, data)))
+            return
         if path == "/api/projects":
             data = self._body()
-            fields(data, ("title",))
-            self._json(studio.create(data["title"]), 201)
+            if isinstance(data, dict) and "styleId" in data:
+                fields(data, ("title", "styleId", "styleRevision"))
+                if type(data["styleRevision"]) is not int or data["styleRevision"] < 1:
+                    raise WorkflowError("Choose a saved style revision.")
+                self._json(studio.create(data["title"], style_id=data["styleId"],
+                                         style_revision=data["styleRevision"]), 201)
+            else:
+                fields(data, ("title",))
+                self._json(studio.create(data["title"]), 201)
             return
         if path == "/api/demo":
             fields(self._body(), ())
@@ -221,7 +274,8 @@ class Handler(BaseHTTPRequestHandler):
         return {
             **settings,
             "dataPath": str(self.server.studio.root),
-            "libraryPath": str(self.server.studio.library.root),
+            "libraryPath": str(self.server.studio.library_root),
+            "libraryMigrationError": self.server.studio.library_migration_error,
             "audioAvailable": audio.audio_available(),
             "renderAvailable": render_available,
             "mediaInstallAvailable": media_tools.can_install() and not render_available,

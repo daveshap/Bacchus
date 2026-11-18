@@ -16,12 +16,12 @@ class LibraryTests(unittest.TestCase):
         self.source = Path(work.name) / "project-art.png"
         self.library = Library(self.root)
 
-    def publish(self, color, *, project_id="first-project", alias="ceramic-cup", name="Cup"):
+    def publish(self, color, *, project_id="first-project", alias="ceramic-cup", name="Cup", style="warm-editorial"):
         Image.new("RGBA", (32, 32), color).save(self.source)
         digest = hashlib.sha256(self.source.read_bytes()).hexdigest()
         return self.library.publish(
             project_id=project_id, alias=alias, name=name, brief="Ceramic cup from the side",
-            style="warm-editorial", source="upload", content_hash=digest, path=self.source, proofs={"a" * 64: "b" * 64},
+            style=style, source="upload", content_hash=digest, path=self.source, proofs={"a" * 64: "b" * 64},
         )
 
     def test_projects_share_catalog_but_same_alias_has_separate_identity(self):
@@ -64,6 +64,24 @@ class LibraryTests(unittest.TestCase):
             self.library.get(version["id"], 2)
         self.assertEqual(error.exception.status, 404)
         self.assertEqual(self.library.list_assets()[0]["latestVersion"], 1)
+
+    def test_migration_separates_historical_versions_and_preserves_issue_records(self):
+        first = self.publish("tan")
+        second = self.publish("brown", style="studio-ink")
+        latest = self.publish("red")
+        issue = {"kind": "defective", "reason": "Missing edge", "at": "recorded"}
+        self.library.flag(first["id"], first["version"], issue)
+        libraries = {name: Library(self.root.parent / name) for name in ("warm-editorial", "studio-ink")}
+        self.library.copy_by_style(libraries)
+        self.library.copy_by_style(libraries)
+        warm, ink = (libraries[name].list_assets()[0]["versions"] for name in ("warm-editorial", "studio-ink"))
+        self.assertEqual([item["version"] for item in warm], [latest["version"], first["version"]])
+        self.assertEqual(ink, [second])
+        self.assertEqual(warm[1]["issue"], issue)
+        self.assertTrue(warm[0]["qualified"])
+        with self.assertRaises(LibraryError):
+            libraries["warm-editorial"].get(second["id"], second["version"])
+        self.assertEqual(len(self.library.list_assets()[0]["versions"]), 3)
 
 
 if __name__ == "__main__":

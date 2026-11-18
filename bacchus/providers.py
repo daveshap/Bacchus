@@ -119,8 +119,8 @@ def image_available():
     return openai_images_enabled() and bool(provider_value("OPENAI_API_KEY", "").strip())
 
 
-def image_request(project_style, asset_id, brief):
-    return {
+def image_request(project_style, asset_id, brief, *, guide="", visual_notes="", palette=None, references=()):
+    payload = {
         "model": provider_value("BACCHUS_IMAGE_MODEL", "").strip() or DEFAULT_IMAGE_MODEL,
         "size": "1024x1024", "quality": "medium", "n": 1, "output_format": "png",
         "prompt": (
@@ -130,12 +130,25 @@ def image_request(project_style, asset_id, brief):
             f"Artwork ID: {asset_id}. Visual brief: {brief}"
         ),
     }
+    if guide or visual_notes or palette:
+        payload["prompt"] += (
+            f"\n\nStyle information for this illustration. Apply it to the requested artwork.\n"
+            f"{visual_notes[:5000]}\nPalette: {json.dumps(palette or {})}\n{guide}"
+        )
+    if references:
+        payload["prompt"] += " Create the requested subject using the input images as visual style examples."
+        payload["images"] = [
+            {"image_url": "data:image/png;base64," + base64.b64encode(reference).decode("ascii")}
+            for reference in references
+        ]
+    return payload
 
 
 def request_image(payload):
     if not openai_images_enabled():
         raise ProviderError("Enable OpenAI artwork generation in Settings to generate images.")
-    result, request_id = openai_json("images/generations", payload, timeout=160, limit=16 * 1024 * 1024)
+    endpoint = "images/edits" if payload.get("images") else "images/generations"
+    result, request_id = openai_json(endpoint, payload, timeout=160, limit=16 * 1024 * 1024)
     try:
         image = base64.b64decode(result["data"][0]["b64_json"], validate=True)
     except (TypeError, KeyError, IndexError, binascii.Error, ValueError) as error:
