@@ -4,7 +4,7 @@ Bacchus turns recorded narration and a creative brief into a reviewed MP4. AI ca
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.3.2 Windows installer](releases/0.3.2/Bacchus-0.3.2-windows-x64.msi) and its [SHA-256 checksum](releases/0.3.2/Bacchus-0.3.2-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.3.2` tag records the source and installer for this release.
+Download the [Bacchus 0.3.3 Windows installer](releases/0.3.3/Bacchus-0.3.3-windows-x64.msi) and its [SHA-256 checksum](releases/0.3.3/Bacchus-0.3.3-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.3.3` tag records the source and installer for this release.
 
 1. Run the MSI, then open **Bacchus** from the Start menu. Bacchus opens its local workspace in your default browser.
 2. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data.
@@ -28,19 +28,26 @@ To use an optional OpenAI feature, add an OpenAI API key in **Settings** or set 
 - **Image generation.** Enable OpenAI image generation in **Settings** or set `BACCHUS_USE_OPENAI_IMAGES=1`. When requested, Bacchus sends the selected artwork brief and style to generate an image. [Image generation API](https://developers.openai.com/api/reference/resources/images/methods/generate)
 - **Scene planning.** Choose OpenAI as your planning provider in **Settings** or set `BACCHUS_PLANNER_PROVIDER=openai`. [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 
-Each provider call starts at your request. Planning sends the transcript, brief, cue timings, and relevant approved artwork names and descriptions to the selected provider. Bacchus records attempts and usage where available, limits requests per project, and leaves retries to you. Keys entered in **Settings** last until Bacchus exits. Nonsecret preferences persist in the data folder.
+Each provider call starts at your request. Planning sends the transcript, brief, cue timings, and relevant approved artwork names and descriptions to the selected provider. In both review stages, **Ask Claude** sends one proof image with the relevant approved scene context for a second opinion. Bacchus uses high effort for that review with the default Claude model. A person records the decision for every proof. Keys entered in **Settings** last until Bacchus exits. Nonsecret preferences persist in the data folder.
+
+### API logs
+
+**Settings** shows the active API log folder. Choose an absolute path there or set `BACCHUS_API_LOG_DIR` before launch. Otherwise Bacchus writes to a per-user folder under the system's temporary directory. Each outbound provider call gets its own folder with metadata, a request body, and the response body when one is available. Metadata includes the project, stage, HTTP status, provider request ID when supplied, and whether the response hit the transport size limit. Interrupted calls can leave a pending record.
+
+Logs can contain prompts, transcripts, artwork, and audio. Bacchus omits authentication headers and redacts configured keys from logged payloads. Keep the folder private. The system may clear temporary files, so choose a persistent folder for logs you want to keep.
 
 ## Make a cut
 
 1. Import an MP3, FLAC, or WAV. Paste an existing transcript, import recording-matched word timings, or transcribe it with the optional OpenAI feature. Pick a visual style, set the creative brief, and lock intake.
 2. Generate a plan or start from the local editable draft. Review the scenes, motion, and artwork requirements, then approve the saved plan.
-3. Use artwork from the library, upload prepared images, or use the combined request with your image tool. If you enabled OpenAI image generation, you can also make illustrations in Bacchus. Review and approve the images for this cut.
-4. Choose a built-in score with transition accents, import music and place effects, or select no music. Listen to the same mix used in the final video, then approve it.
-5. Review the cut, run checks, and accept the candidate. Press **Render video** to download the H.264 MP4, SRT captions, and a render receipt.
+3. Pin library artwork, upload prepared images, or make illustrations with optional OpenAI image generation. Approve the image versions. Run **Artwork checks** and pass every planned use against the source image and its static placement in the actual scene.
+4. Choose a built-in score, import music and place effects, or select no music. Listen to the export mix and approve it. Once the artwork and sound mix are approved, prepare the animation.
+5. Run **Animation checks** to produce contact sheets from the prepared cut with frame samples around entrances, motion, cues, exits, and joins. Scrub the cut and listen to the mix for sync. Resolve any failed checks, pass each scene, and accept the candidate.
+6. Press **Render video** to export an H.264 MP4, SRT captions, and a receipt with both review stages.
 
 The offline example starts with an approved visual plan. For your own recording, manual transcript entry, the local starter plan, image import and built-in soundtracks also work offline. The app supports recordings up to 30 minutes and three visual treatments over the same title, editorial, and illustration layouts. Export is 720p at 24 fps. OpenAI file transcription and manually entered transcript text use estimated timing. Import a `timing.json` with matching `audio.sha256`, `duration`, and `words` to use source-linked cues. Editing the imported transcript text switches it to estimated timing.
 
-Bacchus keeps the original uploaded recording, normalized media, plans, approvals, request metadata, and exports in its data folder. Editing a plan, referenced asset, or sound mix requires fresh approval of the resulting candidate. Earlier completed MP4s and receipts remain on disk.
+Bacchus keeps original recordings, normalized media, plans, review proofs, decisions, and exports in its data folder. Proofs bind to the artwork version and the scene inputs they show. Changes to the cut invalidate its acceptance. Checks that still show the current inputs can carry forward. The built-in motions apply to the whole scene. The artwork checks use still images.
 
 ## Reuse artwork
 

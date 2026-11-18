@@ -6,12 +6,12 @@ import re
 import subprocess
 from tempfile import TemporaryDirectory
 import textwrap
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import Request
 import uuid
 import wave
 
 from . import media_tools
+from .providers import ProviderError, send_request
 from .settings import DEFAULT_TRANSCRIBE_MODEL, openai_transcription_enabled, provider_value
 
 
@@ -25,11 +25,6 @@ MAX_TRANSCRIPT_LENGTH = 100_000
 
 class AudioError(ValueError):
     pass
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 def audio_available():
@@ -151,15 +146,9 @@ def transcribe(wav_path):
             raise AudioError("The narration is empty or too long for one transcription request.")
         request = _transcription_request(encoded_path.read_bytes(), key, model)
     try:
-        with build_opener(NoRedirect()).open(request, timeout=105) as response:
-            request_id = response.headers.get("x-request-id")
-            raw = response.read(TRANSCRIPTION_RESPONSE_LIMIT + 1)
-    except HTTPError as error:
-        raise AudioError(f"OpenAI transcription returned HTTP {error.code}. Check API access and limits.") from error
-    except (URLError, TimeoutError, OSError) as error:
-        raise AudioError("The transcription request failed before a response arrived. Provider status is unknown.") from error
-    if len(raw) > TRANSCRIPTION_RESPONSE_LIMIT:
-        raise AudioError("The transcription response exceeded its size limit.")
+        raw, request_id = send_request(request, "OpenAI", timeout=105, limit=TRANSCRIPTION_RESPONSE_LIMIT)
+    except ProviderError as error:
+        raise AudioError(str(error)) from error
     try:
         result = json.loads(raw)
         script = _transcript_script(result.get("text"))

@@ -15,6 +15,7 @@ class ProviderTests(TestCase):
             self.assertEqual(planning.planner_provider(), "anthropic")
             payload = planning.plan_request(project)
             self.assertEqual(payload["model"], DEFAULT_CLAUDE_MODEL)
+            self.assertEqual(payload["output_config"]["effort"], "high")
             self.assertEqual(payload["output_config"]["format"]["type"], "json_schema")
             response = {"stop_reason": "end_turn", "id": "response", "model": payload["model"],
                         "content": [{"type": "text", "text": '{"scenes":[]}'}]}

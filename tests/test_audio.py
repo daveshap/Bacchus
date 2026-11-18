@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 import wave
 
-from bacchus import audio
+from bacchus import audio, providers, settings
 
 
 def stereo_wav():
@@ -53,19 +53,22 @@ class AudioTests(unittest.TestCase):
     def test_transcription_uploads_a_compact_copy_and_checks_response(self):
         response = MagicMock()
         response.headers = {"x-request-id": "test-transcription"}
+        response.getcode.return_value = 200
         response.read.return_value = json.dumps({
             "text": "A voice was recorded. The recording was transcribed.",
             "usage": {"type": "duration", "seconds": 2},
         }).encode("utf-8")
         opener = MagicMock()
-        opener.open.return_value.__enter__.return_value = response
+        opener.open.return_value = response
         with TemporaryDirectory(prefix="bacchus-transcribe-test-") as work, patch.dict(
             "os.environ", {
                 "OPENAI_API_KEY": "test-only",
                 "BACCHUS_TRANSCRIBE_MODEL": "gpt-transcribe-fixed",
                 "BACCHUS_USE_OPENAI_TRANSCRIPTION": "1",
             },
-        ), patch.object(audio, "build_opener", return_value=opener):
+        ), patch.object(providers, "build_opener", return_value=opener), patch.object(
+            settings, "api_log_directory", return_value=Path(work) / "audit",
+        ):
             original = Path(work) / "private name.wav"
             original.write_bytes(stereo_wav())
             transcript = audio.transcribe(original)
@@ -79,6 +82,8 @@ class AudioTests(unittest.TestCase):
             self.assertIn(b'filename="narration.m4a"', request.data)
             self.assertIn(b"ftypM4A", request.data)
             self.assertNotIn(b"private name", request.data)
+            [logged_request] = (Path(work) / "audit").glob("*/request.body")
+            self.assertEqual(logged_request.read_bytes(), request.data)
             response.read.return_value = b'{"text":" "}'
             with self.assertRaisesRegex(audio.AudioError, "no narration"):
                 audio.transcribe(original)
@@ -87,12 +92,12 @@ class AudioTests(unittest.TestCase):
         with (
             patch.dict("os.environ", {"OPENAI_API_KEY": "test-only", "BACCHUS_USE_OPENAI_TRANSCRIPTION": "0"}),
             patch.object(audio, "_convert") as convert,
-            patch.object(audio, "build_opener") as opener,
+            patch.object(audio, "send_request") as send,
         ):
             with self.assertRaisesRegex(audio.AudioError, "Enable OpenAI transcription"):
                 audio.transcribe(Path("recording.wav"))
             convert.assert_not_called()
-            opener.assert_not_called()
+            send.assert_not_called()
 
 
 if __name__ == "__main__":

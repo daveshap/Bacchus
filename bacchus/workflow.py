@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from . import ENGINE_VERSION, audio, planning, providers, render, score, timing
+from . import ENGINE_VERSION, api_log, audio, gates, planning, providers, render, score, timing, visual_review
 from .library import Library, LibraryError
 
 
@@ -305,6 +305,8 @@ def candidate(project, folder, verify=True, require_mix=True):
 
 def reset_candidate(project):
     project.update(qc=None, accepted=None, export=None)
+    if "review" in project:
+        project["review"]["prepared"] = None
 
 
 def set_plan(project, scenes, source):
@@ -396,6 +398,10 @@ class Studio:
                 if not project["busy"]:
                     reset_candidate(project)
             project.pop("legacy", None)
+            if "review" not in project:
+                if not project["busy"] and (project["export"] or {}).get("status") != "complete":
+                    reset_candidate(project)
+                project["review"] = gates.new_review()
             return project
         except FileNotFoundError as error:
             raise WorkflowError("Project not found.", 404) from error
@@ -432,6 +438,19 @@ class Studio:
         view["missing"] = missing_art(project)
         view["artPrompt"] = art_prompt(view["missing"], project["style"])
         view["accepted"] = bool(project["accepted"])
+        folder = self._folder(project_id)
+        view.pop("review")
+        view["assetChecks"] = gates.view(project, folder, "assets")
+        view["assetReviewReady"] = bool(project["plan"] and project["plan"]["approved"]) and all(
+            check["status"] == "passed" for check in view["assetChecks"]
+        )
+        view["animationPrepared"] = bool(project["review"]["prepared"]) and view["assetReviewReady"]
+        view["animationChecks"] = gates.view(project, folder, "animation") if view["animationPrepared"] else []
+        view["animationReviewReady"] = (
+            (project["qc"] or {}).get("status") == "passed"
+            and bool(view["animationChecks"])
+            and all(check["status"] == "passed" for check in view["animationChecks"])
+        )
         planner_runs = view.pop("plannerRuns")
         view["plannerCalls"] = len(planner_runs)
         view["plannerLastRun"] = planner_runs[-1] if planner_runs else None
@@ -468,7 +487,7 @@ class Studio:
                 if not PROJECT_ID.fullmatch(path.parent.name):
                     continue
                 try:
-                    if self._read(path.parent.name)["busy"] in ("planning", "transcribing", "generating artwork"):
+                    if self._read(path.parent.name)["busy"] in ("planning", "transcribing", "generating artwork", "reviewing proof"):
                         return True
                 except WorkflowError:
                     continue
@@ -482,6 +501,7 @@ class Studio:
             "plannerRuns": [], "approvals": [],
             "style": "warm-editorial", "mix": new_mix("none") if demo else new_mix(),
             "demo": demo, "transcript": None, "transcriptionRuns": [], "artRuns": [],
+            "review": gates.new_review(),
         }
         if demo:
             script = (
@@ -578,14 +598,23 @@ class Studio:
                     project["approvals"].append({"kind": "mix", "hash": digest(encoded(record)), "at": now()})
             elif action == "mix/preset":
                 self._preset_mix(project, folder, data["preset"])
+            elif action == "assets/checks":
+                candidate(project, folder, require_mix=False)
+                gates.run(project, folder, "assets", write_file)
+                if project["review"]["prepared"]:
+                    try:
+                        self._require_review(project, folder, "assets")
+                    except WorkflowError:
+                        reset_candidate(project)
+            elif action == "animation/prepare":
+                record = candidate(project, folder)
+                self._require_review(project, folder, "assets")
+                project["review"]["prepared"] = digest(encoded(record))
             elif action == "qc":
                 self._run_qc(project, folder)
             elif action == "candidate/accept":
-                record = candidate(project, folder)
-                candidate_hash = digest(encoded(record))
-                qc = project["qc"]
-                if not qc or qc["status"] != "passed" or qc["candidateHash"] != candidate_hash:
-                    raise WorkflowError("Run and pass QC on this version before accepting it.", 409)
+                record = self._require_prepared(project, folder)
+                candidate_hash = self._require_animation_review(project, folder, record)
                 project["accepted"] = {"hash": candidate_hash, "at": now()}
                 project["approvals"].append({"kind": "candidate", **project["accepted"]})
             else:
@@ -761,7 +790,8 @@ class Studio:
             self._save(project)
         error = None
         try:
-            result = audio.transcribe(path)
+            with api_log.scope(project_id, "transcription"):
+                result = audio.transcribe(path)
             script = text_value(result["script"], "Transcript", 100_000, True)
             make_input(project, script, "")
             project["transcript"] = {"script": script, "model": result["model"],
@@ -827,7 +857,8 @@ class Studio:
             self._save(project)
         error = None
         try:
-            raw, receipt = providers.request_image(payload)
+            with api_log.scope(project_id, "artwork generation"):
+                raw, receipt = providers.request_image(payload)
             normalized = normalized_art(raw)
             self._add_art(project, asset_id, f"{asset_id}.png", normalized, "generated")
             run.update(receipt, status="complete", artHash=digest(normalized))
@@ -1010,7 +1041,8 @@ class Studio:
             self._save(project)
         error = None
         try:
-            scenes, receipt = planning.request_plan(payload)
+            with api_log.scope(project_id, "scene planning"):
+                scenes, receipt = planning.request_plan(payload)
             run.update(receipt)
             self._apply_planned_art(project, scenes, reusable)
             set_plan(project, scenes, "claude" if provider == "anthropic" else "openai")
@@ -1026,14 +1058,38 @@ class Studio:
             raise WorkflowError(error, 422)
         return self._view(project)
 
+    @staticmethod
+    def _require_review(project, folder, scope, *, verify=True):
+        try:
+            gates.require_approved(project, folder, scope, verify=verify)
+        except gates.GateError as error:
+            raise WorkflowError(str(error), error.status) from error
+
+    def _require_prepared(self, project, folder, *, verify=True):
+        record = candidate(project, folder, verify=verify)
+        self._require_review(project, folder, "assets", verify=verify)
+        if project["review"]["prepared"] != digest(encoded(record)):
+            raise WorkflowError("Prepare the animation before reviewing or previewing it.", 409)
+        return record
+
+    def _require_animation_review(self, project, folder, record):
+        key = digest(encoded(record))
+        qc = project["qc"]
+        if not qc or qc["status"] != "passed" or qc["candidateHash"] != key:
+            raise WorkflowError("Run and pass the technical animation checks on this version.", 409)
+        self._require_review(project, folder, "animation")
+        return key
+
     def _run_qc(self, project, folder):
-        record = candidate(project, folder)
+        record = self._require_prepared(project, folder)
         candidate_hash = digest(encoded(record))
         findings = [{"level": "info", "message": "Narration coverage, scene vocabulary, and file fingerprints passed."}]
         try:
             findings.extend({"level": "error", "message": message} for message in render.layout_findings(project, folder))
         except render.RenderError as error:
             findings.append({"level": "error", "message": str(error)})
+        findings.extend({"level": "error", "message": message}
+                        for message in gates.run(project, folder, "animation", write_file))
         if project["input"].get("timing") == "source-cues":
             findings.append({"level": "info", "message": "Scene cues and captions use recording-matched word timings."})
         elif project["audio"]:
@@ -1041,17 +1097,110 @@ class Studio:
         elif not mix_audio(project["mix"]):
             findings.append({"level": "warning", "message": "This project has no recording. The video will be silent."})
         if candidate_hash != (project["qc"] or {}).get("candidateHash") or any(item["level"] == "error" for item in findings):
-            reset_candidate(project)
+            project.update(accepted=None, export=None)
+        elif project["accepted"]:
+            try:
+                self._require_review(project, folder, "animation")
+            except WorkflowError:
+                project.update(accepted=None, export=None)
         project["qc"] = {
             "status": "failed" if any(item["level"] == "error" for item in findings) else "passed",
             "findings": findings, "candidateHash": candidate_hash, "checkedAt": now(),
         }
 
+    def _review_item(self, project, folder, scope, check_id):
+        if scope == "assets":
+            candidate(project, folder, require_mix=False)
+        elif scope == "animation":
+            self._require_prepared(project, folder)
+            if not project["qc"]:
+                raise WorkflowError("Run the animation checks first.", 409)
+        else:
+            raise WorkflowError("Review item not found.", 404)
+        try:
+            return gates.selected(project, folder, scope, check_id)
+        except gates.GateError as error:
+            raise WorkflowError(str(error), error.status) from error
+
+    def record_review(self, project_id, scope, check_id, data):
+        fields(data, ("revision", "passed", "reason"))
+        if type(data["passed"]) is not bool:
+            raise WorkflowError("Choose Pass or Fail for this check.")
+        reason = text_value(data["reason"], "Review note", 1000)
+        with self.lock:
+            project = self._edit(project_id, data["revision"])
+            folder = self._folder(project_id)
+            _, review_record = self._review_item(project, folder, scope, check_id)
+            try:
+                gates.decide(review_record, data["passed"], reason, now())
+            except gates.GateError as error:
+                raise WorkflowError(str(error), error.status) from error
+            if not data["passed"]:
+                if scope == "assets":
+                    reset_candidate(project)
+                else:
+                    project.update(accepted=None, export=None)
+            self._save(project)
+            return self._view(project)
+
+    def review_proof(self, project_id, scope, check_id):
+        with self.lock:
+            project = self._read(project_id)
+            folder = self._folder(project_id)
+            if scope not in ("assets", "animation"):
+                raise WorkflowError("Review item not found.", 404)
+            if scope == "animation" and (not project["review"]["prepared"] or not project["qc"]):
+                raise WorkflowError("Run the animation checks first.", 409)
+            try:
+                gates.selected(project, folder, scope, check_id)
+            except gates.GateError as error:
+                raise WorkflowError(str(error), error.status) from error
+            return gates.proof_path(folder, scope, check_id)
+
+    def advise_review(self, project_id, scope, check_id, data):
+        fields(data, ("revision",))
+        with self.lock:
+            project = self._edit(project_id, data["revision"])
+            folder = self._folder(project_id)
+            check, review_record = self._review_item(project, folder, scope, check_id)
+            if review_record.get("advice"):
+                return self._view(project)
+            if review_record["status"] == "passed":
+                raise WorkflowError("Ask Claude for advice before passing this proof.", 409)
+            if not visual_review.available():
+                raise WorkflowError("Add an Anthropic API key in Settings to ask Claude to review a proof.", 409)
+            scene = project["plan"]["scenes"][check["scene"] - 1]
+            context = {
+                "style": STYLES[project["style"]], "scene": scene,
+                "narration": [line["text"] for line in project["input"]["lines"][scene["startLine"] - 1:scene["endLine"]]],
+                "intention": project["input"]["intention"], "samples": check.get("samples"),
+            }
+            brief = json.dumps(context, ensure_ascii=False)
+            if len(brief) > visual_review.MAX_BRIEF_CHARS:
+                context["narration"] = " ".join(context["narration"])[:4000]
+                brief = json.dumps(context, ensure_ascii=False)
+            proof = gates.proof_path(folder, scope, check_id).read_bytes()
+            if digest(proof) != review_record["proofHash"]:
+                raise WorkflowError("The proof changed. Run the checks again.", 409)
+            project["busy"] = "reviewing proof"
+            self._save(project)
+        try:
+            label = "asset" if scope == "assets" else "animation"
+            with api_log.scope(project_id, f"{label} review"):
+                review_record["advice"] = visual_review.review(label, brief, proof)
+        except visual_review.VisualReviewError as error:
+            raise WorkflowError(str(error), 422) from error
+        finally:
+            with self.lock:
+                project["busy"] = None
+                self._save(project)
+        return self._view(project)
+
     def preview(self, project_id, time):
         with self.lock:
             project = self._read(project_id)
             folder = self._folder(project_id)
-            candidate(project, folder, verify=False, require_mix=False)
+            self._require_prepared(project, folder, verify=False)
         return render.preview(project, folder, time)
 
     def _queue_export(self, project_id, revision):
@@ -1070,6 +1219,8 @@ class Studio:
                     return self._view(project)
                 except WorkflowError:
                     pass
+            self._require_prepared(project, folder)
+            self._require_animation_review(project, folder, record)
             if not render.render_available():
                 raise WorkflowError("FFmpeg and ffprobe must be installed and on PATH.", 409)
             snapshot = deepcopy(project)
@@ -1093,10 +1244,17 @@ class Studio:
             details = render.export_video(snapshot, folder, temporary)
             if candidate(snapshot, folder) != record:
                 raise WorkflowError("An input changed while the candidate was rendering.", 409)
+            self._require_review(snapshot, folder, "assets")
+            self._require_animation_review(snapshot, folder, record)
             receipt = {
                 "candidateHash": key, "candidate": record, "accepted": snapshot["accepted"],
                 "qc": snapshot["qc"], "media": details, "videoHash": file_digest(temporary),
                 "captionsTiming": snapshot["input"].get("timing", "estimated"), "createdAt": now(),
+                "review": {
+                    scope: {check["id"]: {**check, **snapshot["review"][scope][check["id"]]}
+                            for check in gates.checks(snapshot, scope)}
+                    for scope in ("assets", "animation")
+                },
             }
             receipt["libraryArtwork"] = {
                 asset["id"]: {"id": asset["libraryId"], "version": asset["libraryVersion"]}

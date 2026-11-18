@@ -170,6 +170,34 @@ code { overflow-wrap: anywhere; }
 .player-feedback { margin: 8px 0 0; color: var(--danger); }
 .finding-error { color: var(--danger); }
 .finding-warning { color: var(--accent); }
+.tag.error { color: var(--danger); border-color: #68433c; }
+.proof-section { margin-top: 18px; }
+.proof-list { display: grid; gap: 6px; max-height: 55vh; overflow: auto; margin: 0; padding: 2px; list-style: none; }
+.proof-choice { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; text-align: left; color: var(--ink); background: var(--rail); }
+.proof-choice[aria-pressed="true"] { border-color: #80604b; background: #2e251f; }
+.proof-choice:hover { border-color: var(--line-strong); }
+.proof-choice strong, .proof-choice small { display: block; overflow-wrap: anywhere; }
+.proof-choice small { margin-top: 2px; color: var(--muted); }
+.proof-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; }
+.proof-comparison figure, .proof-stills figure { min-width: 0; margin: 0; }
+.proof-comparison img, .proof-stills img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: var(--rail); border: 1px solid var(--line); border-radius: 6px; }
+.proof-comparison figcaption, .proof-stills figcaption { margin-top: 5px; color: var(--muted); font-size: .82rem; }
+.proof-stills { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 135px), 1fr)); gap: 9px; }
+.proof-review summary { width: fit-content; cursor: pointer; color: var(--danger); }
+.proof-review .field { margin-top: 8px; }
+.proof-review .button { margin-top: 8px; }
+.proof-review textarea { max-width: 100%; resize: vertical; }
+.proof-decisions form .field { margin-bottom: 8px; }
+.proof-advisory summary { color: var(--accent); }
+.proof-advisory .read-list { margin-top: 8px; }
+.proof-rejection { overflow-wrap: anywhere; }
+.proof-preview-title { margin-bottom: 8px; }
+.proof-preview-title h2 { margin-bottom: 2px; }
+.proof-range { color: var(--muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 590px) {
+  .proof-comparison { grid-template-columns: minmax(0, 1fr); }
+  .proof-list { max-height: 36vh; }
+}
 .timecode { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; font-size: .83rem; }
 .shot-list { display: flex; flex-wrap: wrap; gap: 7px; padding: 0; margin: 12px 0 0; list-style: none; }
 .shot-list button[aria-current="true"] { color: var(--accent); border-color: #80604b; }

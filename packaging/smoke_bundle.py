@@ -1,6 +1,7 @@
 """Start and verify a frozen Bacchus executable over localhost."""
 
 import argparse
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -8,8 +9,11 @@ from runpy import run_path
 import subprocess
 from tempfile import TemporaryDirectory
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+from PIL import Image
 
 
 APP_VERSION = run_path(str(Path(__file__).resolve().parents[1] / "bacchus" / "runtime.py"))["APP_VERSION"]
@@ -21,7 +25,9 @@ PROVIDER_SETTINGS = (
 
 def request(url, path, data=None):
     options = {}
-    if data is not None:
+    if isinstance(data, bytes):
+        options = {"data": data, "headers": {"Content-Type": "image/png"}}
+    elif data is not None:
         options = {"data": json.dumps(data).encode(), "headers": {"Content-Type": "application/json"}}
     with urlopen(Request(url + path, **options), timeout=25) as response:
         return response.read()
@@ -44,10 +50,52 @@ def endpoint(root, process):
     raise RuntimeError("Bacchus did not announce its local endpoint.")
 
 
+def expect_conflict(url, path, data=None):
+    try:
+        request(url, path, data)
+    except HTTPError as error:
+        if error.code == 409:
+            return
+        raise
+    raise RuntimeError(f"The app accepted {path} before the required review.")
+
+
 def run_export(url, project):
     route = f"/api/projects/{project['id']}"
-    for action in ("qc", "candidate/accept", "export"):
-        project = json.loads(request(url, f"{route}/{action}", {"revision": project["revision"]}))
+
+    def action(name, **data):
+        return json.loads(request(url, f"{route}/{name}", {"revision": project["revision"], **data}))
+
+    scenes = project["plan"]["scenes"]
+    artwork = "smoke-art"
+    scenes[0].update(layout="illustration", artId=artwork, artBrief="A sample blue square.")
+    project = action("plan", scenes=scenes)
+    project = action("plan/approve")
+    with BytesIO() as buffer:
+        Image.new("RGBA", (96, 96), "#386e9e").save(buffer, format="PNG")
+        raw = buffer.getvalue()
+    project = json.loads(request(
+        url, f"{route}/assets/{artwork}?revision={project['revision']}&name=smoke-art.png", raw,
+    ))
+    project = action(f"assets/{artwork}/approve")
+
+    project = action("assets/checks")
+    if len(project["assetChecks"]) != 1:
+        raise RuntimeError("The illustrated example lacked its planned artwork use check.")
+    expect_conflict(url, f"{route}/animation/prepare", {"revision": project["revision"]})
+    expect_conflict(url, f"{route}/preview?time=0.5")
+    project = verify_checks(url, route, project, "assets", "assetChecks")
+    project = action("animation/prepare")
+    if not request(url, f"{route}/preview?time=0.5").startswith(b"\x89PNG"):
+        raise RuntimeError("The prepared example lacked a renderer preview.")
+    project = action("qc")
+    if not project["animationChecks"]:
+        raise RuntimeError("The prepared example lacked per-scene review checks.")
+    expect_conflict(url, f"{route}/candidate/accept", {"revision": project["revision"]})
+    expect_conflict(url, f"{route}/export", {"revision": project["revision"]})
+    project = verify_checks(url, route, project, "animation", "animationChecks")
+    for name in ("candidate/accept", "export"):
+        project = action(name)
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         project = json.loads(request(url, route))
@@ -55,11 +103,29 @@ def run_export(url, project):
         if export["status"] == "complete":
             if request(url, export["url"])[4:8] != b"ftyp":
                 raise RuntimeError("Export downloaded but lacked an MP4 file header.")
+            receipt = json.loads(request(url, export["receiptUrl"]))
+            for scope, key in (("assets", "assetChecks"), ("animation", "animationChecks")):
+                checks = receipt["review"][scope]
+                if set(checks) != {check["id"] for check in project[key]} or any(
+                    check["status"] != "passed" or not check["proofHash"] for check in checks.values()
+                ):
+                    raise RuntimeError(f"The exported receipt did not bind the passed {scope} proofs.")
             return
         if export["status"] == "failed":
             raise RuntimeError(export["error"])
         time.sleep(0.25)
     raise RuntimeError("The example export exceeded its time limit.")
+
+
+def verify_checks(url, route, project, scope, key):
+    for check in project[key]:
+        if not request(url, check["proofUrl"]).startswith(b"\x89PNG"):
+            raise RuntimeError(f"Scene {check['scene']} did not produce a valid {scope} proof.")
+        path = f"{route}/{scope}/checks/{check['id']}/result"
+        project = json.loads(request(url, path, {
+            "revision": project["revision"], "passed": True, "reason": "Packaged smoke-test fixture.",
+        }))
+    return project
 
 
 def check_provider_defaults(url):
@@ -79,6 +145,17 @@ def check_provider_defaults(url):
     if config["transcriberAvailable"] or config["imageAvailable"]:
         raise RuntimeError("OpenAI media features must remain opt-in.")
     request(url, "/api/settings", {"clearAnthropicKey": True, "clearOpenAIKey": True})
+
+
+def check_audit_directory(url, root):
+    directory = root / "provider-audit"
+    request(url, "/api/settings", {"apiLogDirectory": str(directory)})
+    settings = json.loads(request(url, "/api/settings"))
+    on_disk = json.loads((root / "settings.json").read_bytes())
+    if any(Path(value) != directory for value in (
+        settings["apiLogDirectory"], settings["apiLogPath"], on_disk["apiLogDirectory"],
+    )):
+        raise RuntimeError("The custom API audit folder did not persist.")
 
 
 def main():
@@ -104,6 +181,7 @@ def main():
                 if not request(url, asset):
                     raise RuntimeError(f"Missing embedded asset {asset}.")
             check_provider_defaults(url)
+            check_audit_directory(url, root)
             project = json.loads(request(url, "/api/demo", {}))
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")
@@ -117,7 +195,7 @@ def main():
                 process.kill()
                 process.wait(10)
     print("Verified packaged startup, Claude-first setup, offline example, and clean shutdown"
-          + (", including MP4 export." if args.render else "."))
+          + (", including evidence gates and MP4 export." if args.render else "."))
 
 
 if __name__ == "__main__":

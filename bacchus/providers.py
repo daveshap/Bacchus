@@ -1,11 +1,13 @@
-"""Small JSON-only HTTP transport for optional production providers."""
+"""Bounded, audited HTTP transport for optional production providers."""
 
 import base64
 import binascii
+from http.client import HTTPException, IncompleteRead
 import json
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from . import api_log, settings
 from .settings import DEFAULT_IMAGE_MODEL, openai_images_enabled, provider_value
 
 
@@ -18,21 +20,84 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _start_log(request, provider):
+    bearer = request.get_header("Authorization", "").removeprefix("Bearer ")
+    anthropic = request.get_header("X-api-key", "")
+    try:
+        return api_log.start(
+            settings.api_log_directory(), provider, request.full_url, request.data,
+            request.get_header("Content-type", "application/octet-stream"),
+            (*settings.provider_secrets(), bearer, anthropic),
+        )
+    except api_log.ApiLogError as error:
+        raise ProviderError("Choose a writable API log folder in Settings before sending a provider request.") from error
+
+
+def _finish_log(call, status, body=None, **details):
+    try:
+        call.finish(status, body, **details)
+    except api_log.ApiLogError as error:
+        raise ProviderError("The provider may have received the request. Fix the API log folder in Settings before retrying.") from error
+
+
+def send_request(request, provider, *, timeout, limit):
+    """Send one request and capture up to the adapter's response-byte limit."""
+    call = _start_log(request, provider)
+    http_error = None
+    try:
+        response = build_opener(NoRedirect()).open(request, timeout=timeout)
+    except HTTPError as error:
+        http_error = response = error
+    except (HTTPException, OSError, ValueError) as error:
+        _finish_log(call, None, error="network_error")
+        raise ProviderError(f"The {provider} request did not return. Provider status is unknown.") from error
+    with response:
+        status = response.getcode()
+        headers = response.headers or {}
+        request_id = headers.get("request-id") or headers.get("x-request-id")
+        content_type = headers.get("content-type") or headers.get("Content-Type")
+        content_length = headers.get("content-length") or headers.get("Content-Length") or ""
+        read_error = None
+        truncated = False
+        try:
+            raw = response.read(limit + 1)
+        except IncompleteRead as error:
+            raw, read_error, truncated = error.partial, error, True
+        except (HTTPException, OSError, ValueError) as error:
+            raw, read_error = None, error
+        oversized = raw is not None and len(raw) > limit
+        if raw is not None and not oversized and content_length.isdecimal() and len(content_length) <= 19:
+            expected = int(content_length)
+            if len(raw) < expected and read_error is None:
+                read_error = IncompleteRead(raw, expected - len(raw))
+                truncated = True
+        error_code = None
+        if http_error is not None:
+            error_code = "http_error"
+        elif read_error is not None:
+            error_code = "response_read_error"
+        elif oversized:
+            error_code = "response_too_large"
+        _finish_log(
+            call, status, raw[:limit] if raw is not None else None,
+            content_type=content_type, request_id=request_id, error=error_code,
+            truncated=truncated or oversized,
+        )
+    if http_error is not None:
+        raise ProviderError(f"{provider} returned HTTP {status}. Check the API key, model access, and limits.") from http_error
+    if read_error is not None:
+        raise ProviderError(f"The {provider} response ended before Bacchus could read it.") from read_error
+    if oversized:
+        raise ProviderError(f"{provider} returned more data than the configured size limit.")
+    return raw, request_id
+
+
 def post_json(url, payload, headers, provider, timeout=125, limit=512 * 1024):
     request = Request(
         url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={**headers, "content-type": "application/json"}, method="POST",
     )
-    try:
-        with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
-            raw = response.read(limit + 1)
-            request_id = response.headers.get("request-id") or response.headers.get("x-request-id")
-    except HTTPError as error:
-        raise ProviderError(f"{provider} returned HTTP {error.code}. Check the API key, model access, and limits.") from error
-    except (URLError, TimeoutError, OSError) as error:
-        raise ProviderError(f"The {provider} request did not return. No automatic retry was sent.") from error
-    if len(raw) > limit:
-        raise ProviderError(f"{provider} returned more data than the configured size limit.")
+    raw, request_id = send_request(request, provider, timeout=timeout, limit=limit)
     try:
         result = json.loads(raw)
     except (ValueError, RecursionError) as error:

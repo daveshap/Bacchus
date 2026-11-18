@@ -91,6 +91,22 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse((self.root / "settings.json").exists())
         self.assertFalse(setup.get()["completed"])
 
+    def test_api_log_directory_defaults_and_persists_without_keys(self):
+        directory = self.root / "audit"
+        setup = settings.Settings(self.root)
+        self.assertEqual(setup.get()["apiLogPath"], str(settings.api_log.default_directory()))
+        with patch.dict(os.environ, {"BACCHUS_API_LOG_DIR": str(directory)}):
+            self.assertEqual(setup.get()["apiLogDirectory"], str(directory))
+            setup.save({"apiLogDirectory": ""})
+            self.assertEqual(settings.api_log_directory(), settings.api_log.default_directory())
+        with self.assertRaises(settings.SettingsError):
+            setup.save({"apiLogDirectory": "relative", "openAIKey": "submitted-key"})
+        with self.assertRaises(settings.SettingsError):
+            setup.save({"apiLogDirectory": str(self.root / "submitted-key"), "openAIKey": "submitted-key"})
+        setup.save({"apiLogDirectory": str(directory)})
+        self.assertEqual(settings.Settings(self.root).get()["apiLogPath"], str(directory))
+        self.assertEqual(settings.provider_secrets(), ("inherited-key",))
+
 
 if __name__ == "__main__":
     unittest.main()

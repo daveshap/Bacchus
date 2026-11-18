@@ -8,6 +8,8 @@ import re
 from tempfile import NamedTemporaryFile
 from threading import RLock
 
+from . import api_log
+
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"
@@ -21,6 +23,7 @@ _MODELS = {
     "imageModel": ("BACCHUS_IMAGE_MODEL", DEFAULT_IMAGE_MODEL),
 }
 _PROVIDER_KEY = "BACCHUS_PLANNER_PROVIDER"
+_API_LOG_DIR = "BACCHUS_API_LOG_DIR"
 _PROVIDERS = ("anthropic", "openai")
 _FEATURES = {
     "useOpenAITranscription": "BACCHUS_USE_OPENAI_TRANSCRIPTION",
@@ -35,7 +38,7 @@ _KEYS = {
     "OPENAI_API_KEY": ("openAIKey", "clearOpenAIKey", "OpenAI"),
     "ANTHROPIC_API_KEY": ("anthropicKey", "clearAnthropicKey", "Anthropic"),
 }
-_PREFERENCES = {"plannerProvider", *_BOOLEANS, *_MODELS}
+_PREFERENCES = {"plannerProvider", "apiLogDirectory", *_BOOLEANS, *_MODELS}
 _INPUT_FIELDS = _PREFERENCES | {field for key, clear, _ in _KEYS.values() for field in (key, clear)}
 _MODEL_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _LOCK = RLock()
@@ -55,6 +58,33 @@ def provider_value(name, default=None):
             value = _OVERRIDES[name]
             return default if value is None else value
         return os.environ.get(name, default)
+
+
+def provider_secrets():
+    with _LOCK:
+        return tuple(value for name in _KEYS if (value := provider_value(name, "").strip()))
+
+
+def _log_directory(value, secrets):
+    if not isinstance(value, str):
+        raise SettingsError("Enter an absolute folder path for API logs.")
+    value = value.strip()
+    if not value:
+        return ""
+    if (
+        len(value) > 2048 or any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in value)
+        or any(secret and secret in value for secret in secrets) or not Path(value).is_absolute()
+    ):
+        raise SettingsError("Enter an absolute folder path for API logs, or leave it empty to use the default.")
+    return str(Path(value))
+
+
+def api_log_directory():
+    try:
+        selected = _log_directory(provider_value(_API_LOG_DIR, ""), provider_secrets())
+    except SettingsError:
+        selected = ""
+    return Path(selected) if selected else api_log.default_directory()
 
 
 def _normalize_planner(value):
@@ -123,6 +153,9 @@ class Settings:
         if isinstance(selected, str) and selected.strip().lower() in (*_PROVIDERS, "", "auto"):
             preferences["plannerProvider"] = _normalize_planner(selected)
         secrets = {provider_value(name) for name in _KEYS}
+        if "apiLogDirectory" in stored:
+            with suppress(SettingsError):
+                preferences["apiLogDirectory"] = _log_directory(stored["apiLogDirectory"], secrets)
         for field, (_, default) in _MODELS.items():
             if field in stored:
                 try:
@@ -135,6 +168,8 @@ class Settings:
     def _apply_preferences(preferences):
         if "plannerProvider" in preferences:
             _OVERRIDES[_PROVIDER_KEY] = preferences["plannerProvider"]
+        if "apiLogDirectory" in preferences:
+            _OVERRIDES[_API_LOG_DIR] = preferences["apiLogDirectory"]
         for field, name in _FEATURES.items():
             if field in preferences:
                 _OVERRIDES[name] = "1" if preferences[field] else "0"
@@ -153,6 +188,10 @@ class Settings:
                 "hasAnthropicKey": bool(provider_value("ANTHROPIC_API_KEY", "").strip()),
             }
             secrets = {provider_value(name) for name in _KEYS}
+            with suppress(SettingsError):
+                view["apiLogDirectory"] = _log_directory(provider_value(_API_LOG_DIR, ""), secrets)
+            view.setdefault("apiLogDirectory", "")
+            view["apiLogPath"] = str(api_log_directory())
             for field, (name, default) in _MODELS.items():
                 try:
                     view[field] = _model(provider_value(name, default), default, secrets)
@@ -176,6 +215,9 @@ class Settings:
                     raise SettingsError("Choose Anthropic or OpenAI for the planner.")
                 preferences["plannerProvider"] = data["plannerProvider"]
             secrets = {provider_value(name) for name in _KEYS} | set(credentials.values())
+            if "apiLogDirectory" in data or "apiLogDirectory" in preferences:
+                value = data.get("apiLogDirectory", preferences.get("apiLogDirectory"))
+                preferences["apiLogDirectory"] = _log_directory(value, secrets)
             for field, (_, default) in _MODELS.items():
                 if field in data:
                     preferences[field] = _model(data[field], default, secrets)

@@ -112,12 +112,16 @@ def plan_request(project, reusable=()):
             "instructions": system, "input": content,
             "text": {"format": {"type": "json_schema", "name": "scene_plan", "strict": True, "schema": OUTPUT_SCHEMA}},
         }
+    model = provider_value("BACCHUS_CLAUDE_MODEL", "").strip() or DEFAULT_CLAUDE_MODEL
+    output = {"format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}}
+    if model == DEFAULT_CLAUDE_MODEL:
+        output["effort"] = "high"
     return {
-        "model": provider_value("BACCHUS_CLAUDE_MODEL", "").strip() or DEFAULT_CLAUDE_MODEL,
+        "model": model,
         "max_tokens": OUTPUT_TOKENS,
         "system": system,
         "messages": [{"role": "user", "content": content}],
-        "output_config": {"format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
+        "output_config": output,
     }
 
 

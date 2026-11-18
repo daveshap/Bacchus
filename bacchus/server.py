@@ -8,7 +8,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import RESOURCES, audio, media_tools, planning, providers, render
+from . import RESOURCES, audio, media_tools, planning, providers, render, visual_review
 from .library import LibraryError
 from .runtime import APP_VERSION
 from .settings import SettingsError
@@ -92,6 +92,7 @@ class Handler(BaseHTTPRequestHandler):
                 "maxPlannerCalls": planning.MAX_PLANNER_CALLS,
                 "audioAvailable": audio.audio_available(), "transcriberAvailable": audio.transcriber_available(),
                 "imageAvailable": providers.image_available(), "plannerProvider": planning.planner_provider(),
+                "visualReviewerAvailable": visual_review.available(),
                 "styles": [{"id": style, "name": label} for style, label in STYLES.items()],
                 "maxEffects": MAX_EFFECTS, "maxFxDuration": MAX_FX_DURATION,
                 "maxArtGenerations": MAX_ART_GENERATIONS, "maxTranscriptionCalls": MAX_TRANSCRIPTIONS,
@@ -131,6 +132,8 @@ class Handler(BaseHTTPRequestHandler):
             self._bytes(studio.preview(project_id, time), "image/png")
         elif tail == ["mix", "preview"]:
             self._file(studio.mix_preview(project_id), "audio/wav", "audio")
+        elif len(tail) == 4 and tail[1] == "checks" and tail[3] == "proof":
+            self._file(studio.review_proof(project_id, tail[0], tail[2]), "image/png", "art")
         elif len(tail) == 3 and tail[0] == "media":
             file, mime = studio.media(project_id, tail[1], tail[2])
             self._file(file, mime, tail[1])
@@ -188,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
             ))
         elif len(tail) == 4 and tail[:2] == ["mix", "effects"] and tail[3] == "remove":
             self._json(studio.remove_effect(project_id, tail[2], self._body()))
-        elif len(tail) == 2 and tail[0] == "assets":
+        elif len(tail) == 2 and tail[0] == "assets" and (tail[1] != "checks" or "revision" in query):
             self._json(studio.upload_art(
                 project_id, self._revision(query), tail[1], query.get("name", ["artwork.png"])[0],
                 self._raw(MAX_ART_BYTES),
@@ -197,6 +200,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(studio.approve_art(project_id, tail[1], self._body()))
         elif len(tail) == 3 and tail[0] == "assets" and tail[2] == "generate":
             self._json(studio.generate_art(project_id, tail[1], self._body()))
+        elif len(tail) == 4 and tail[1] == "checks" and tail[3] == "result":
+            self._json(studio.record_review(project_id, tail[0], tail[2], self._body()))
+        elif len(tail) == 4 and tail[1] == "checks" and tail[3] == "advise":
+            self._json(studio.advise_review(project_id, tail[0], tail[2], self._body()))
         else:
             self._json(studio.change(project_id, "/".join(tail), self._body()))
 

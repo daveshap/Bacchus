@@ -31,6 +31,8 @@ const state = {
   inputDraft: null,
   planDraft: null,
   mixDraft: null,
+  assetProofId: "",
+  animationReviewId: "",
   previewPosition: null,
   poll: null,
   stopPreview: null,
@@ -139,6 +141,11 @@ function pendingArt(project) {
   return [...required].filter(id => !approved.has(id));
 }
 
+function artworkComplete(project) {
+  if (!project?.plan?.approved || pendingArt(project).length) return false;
+  return project.assetReviewReady ?? !project.plan.scenes.some(scene => scene.artId);
+}
+
 function afterArtwork(project) {
   return project.mix?.approved ? "review" : "composition";
 }
@@ -152,7 +159,7 @@ function stageStates(project) {
   return {
     intake: Boolean(project?.input),
     plan: Boolean(project?.plan?.approved),
-    art: Boolean(project?.plan?.approved && !pendingArt(project).length),
+    art: artworkComplete(project),
     composition: Boolean(project?.mix?.approved),
     review: Boolean(project?.accepted),
     export: project?.export?.status === "complete",
@@ -160,6 +167,7 @@ function stageStates(project) {
 }
 
 function nextStage(project) {
+  if (project.accepted && project.export?.status === "complete") return "export";
   const complete = stageStates(project);
   return stages.find(([id]) => !complete[id])?.[0] || "export";
 }
@@ -362,6 +370,15 @@ function settingsView() {
             </div>
           </details>
         </fieldset>
+        <details class="timing-panel">
+          <summary>API logs</summary>
+          <div class="field settings-note">
+            <label for="apiLogDirectory">API log folder</label>
+            <input id="apiLogDirectory" name="apiLogDirectory" value="${escapeHtml(settings.apiLogDirectory)}" spellcheck="false" placeholder="Use the temporary-folder default">
+            <p class="hint">Logs contain provider request and response bodies, including media. Bacchus omits API credentials.</p>
+            ${settings.apiLogPath ? `<p class="hint">Current location <code>${escapeHtml(settings.apiLogPath)}</code></p>` : ""}
+          </div>
+        </details>
         <p class="hint settings-key-note">API keys apply to the current Bacchus session.</p>
         <div class="cluster">
           <button class="button primary">${setup ? "Finish setup" : "Save settings"}</button>
@@ -542,6 +559,76 @@ function shortHash(hash) {
   return `<code title="${escapeHtml(hash)}">${escapeHtml(String(hash ?? "").slice(0, 12))}</code>`;
 }
 
+function proofStatus(status) {
+  if (status === "passed") return badge("Approved", "good");
+  if (status === "failed") return badge("Rejected", "error");
+  if (status === "error") return badge("Proof error", "error");
+  if (status === "pending") return badge("Awaiting proof", "warm");
+  return badge("Awaiting review", "warm");
+}
+
+function proofChoice(proofId, title, detail, status, active, action) {
+  return `<li><button class="proof-choice" type="button" data-action="${action}" data-name="${escapeHtml(proofId)}"
+    aria-pressed="${active}"><span><strong>${escapeHtml(title)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</span>
+    ${proofStatus(status)}</button></li>`;
+}
+
+function proofImage(url, label) {
+  const src = localMedia(url);
+  return src ? `<figure><img src="${src}" alt="${escapeHtml(label)}"><figcaption>${escapeHtml(label)}</figcaption></figure>` : "";
+}
+
+function proofSeconds(time) {
+  return `${Number(time).toFixed(2)} s`;
+}
+
+function reviewReason(proof) {
+  if (!proof.reason) return "";
+  return proof.status === "passed" ? `<p class="hint proof-rejection">Approval note ${escapeHtml(proof.reason)}</p>` :
+    `<p class="notice error inline proof-rejection">${escapeHtml(proof.reason)}</p>`;
+}
+
+function proofReviewActions(proof, group, approveLabel, rejectLabel, busy) {
+  if (!["ready", "passed"].includes(proof.status)) return "";
+  const requiresDisposition = proof.advice?.findings?.some(finding => ["fail", "unclear"].includes(finding.status));
+  return `<div class="stack proof-decisions">
+    ${proof.status === "ready" ? `<form data-form="proof-result" data-proof-group="${group}" data-proof-id="${escapeHtml(proof.id)}" data-passed="true">
+      ${requiresDisposition ? `<div class="field">
+        <label for="${group}-proof-disposition">Explain your decision on Claude’s findings</label>
+        <textarea id="${group}-proof-disposition" name="reason" rows="2" maxlength="1000" required></textarea>
+      </div>` : ""}
+      <button class="button primary"${busy ? " disabled" : ""}>${approveLabel}</button>
+    </form>` : ""}
+    <details class="proof-review">
+      <summary>${rejectLabel}</summary>
+      <form data-form="proof-result" data-proof-group="${group}" data-proof-id="${escapeHtml(proof.id)}">
+        <div class="field">
+          <label for="${group}-proof-reason">Why are you rejecting this proof?</label>
+          <textarea id="${group}-proof-reason" name="reason" rows="2" maxlength="1000" required></textarea>
+        </div>
+        <button class="button danger"${busy ? " disabled" : ""}>Record rejection</button>
+      </form>
+    </details>
+  </div>`;
+}
+
+function proofAdvisory(proof, group, busy) {
+  const advice = proof.advice;
+  const available = state.config.visualReviewerAvailable && proof.proofUrl && proof.status === "ready";
+  if (!available && !advice) return "";
+  return `<div class="proof-advisory">
+    ${advice ? `<details class="timing-panel" open>
+      <summary>Claude advisory findings${advice.model ? ` · ${escapeHtml(advice.model)}` : ""}</summary>
+      ${advice.findings?.length ? `<ul class="read-list">${advice.findings.map(finding =>
+        `<li><strong>${escapeHtml(finding.id)} · ${escapeHtml(String(finding.status).replaceAll("_", " "))}</strong> ${escapeHtml(finding.evidence)}</li>`).join("")}</ul>` : '<p class="hint">No findings returned.</p>'}
+    </details>` : ""}
+    ${available && !advice ? `<div class="cluster">
+      ${button("Ask Claude to review proof", `advise-${group}`, { name: proof.id, style: "small quiet", disabled: busy })}
+      <span class="hint">Sends this evidence to Claude for advisory feedback.</span>
+    </div>` : ""}
+  </div>`;
+}
+
 function timingImport() {
   return `<details class="timing-import">
     <summary>Import word timings</summary>
@@ -706,7 +793,7 @@ function planView(project) {
     Math.max(0, state.config.maxPlannerCalls - (project.plannerCalls || 0));
   const provider = plannerProvider();
   const planStatus = plan?.approved ? badge("Approved", "good") : plan ? badge("Ready for review", "warm") : "";
-  const next = pendingArt(project).length ? goTo("art", "Open artwork") : afterArtworkButton(project);
+  const next = artworkComplete(project) ? afterArtworkButton(project) : goTo("art", "Open artwork");
   return `
     ${heading("Scene plan", "Review every scene against the narration, then approve the saved plan.")}
     <div class="columns">
@@ -754,6 +841,49 @@ function plannerProvider() {
   return state.config.plannerProvider === "openai" ? "OpenAI" : "Anthropic";
 }
 
+function assetUseReview(project) {
+  const records = project.assetChecks ?? [];
+  if (!records.length) return artworkComplete(project) ? afterArtworkButton(project) : "";
+  const selected = records.find(record => record.id === state.assetProofId)
+    ?? records.find(record => record.status !== "passed") ?? records[0];
+  state.assetProofId = selected.id;
+  const busy = Boolean(project.busy);
+  const pendingImages = pendingArt(project).length;
+  const approved = records.filter(record => record.status === "passed").length;
+  const needsProof = records.some(record => ["pending", "error"].includes(record.status));
+  const original = project.assets.find(asset => asset.id === selected.assetId);
+  return `<section class="proof-section" id="artwork-review">
+    <div class="columns">
+      <section class="panel stack">
+        <div class="panel-header">
+          <h2>Artwork use review</h2>
+          ${badge(`${approved} / ${records.length} approved`, approved === records.length ? "good" : "warm")}
+        </div>
+        <p class="hint">Check each use of approved artwork in its planned scene.</p>
+        ${pendingImages ? '<p class="hint">Import and approve the required images to prepare these proofs.</p>' : ""}
+        ${needsProof && !pendingImages ? `<div>${button("Prepare artwork proofs", "prepare-asset-proofs", { primary: true, disabled: busy })}</div>` : ""}
+        <ul class="proof-list" aria-label="Planned artwork uses">
+          ${records.map(record => proofChoice(record.id, record.title, record.assetId, record.status, record.id === selected.id,
+            "select-asset-proof")).join("")}
+        </ul>
+        ${artworkComplete(project) ? afterArtworkButton(project) : ""}
+      </section>
+      <section class="panel stack" id="asset-proof-detail" tabindex="-1">
+        <div class="panel-header"><h2>${escapeHtml(selected.title)}</h2>${proofStatus(selected.status)}</div>
+        ${selected.proofUrl ? `<div class="proof-comparison">
+          ${proofImage(original?.url, "Original artwork")}
+          ${proofImage(selected.proofUrl, "Rendered scene proof")}
+        </div><p class="hint">Check framing, legibility, and the image’s fit with the approved scene plan.</p>` :
+          selected.status === "error" ? "" : '<p class="hint">Prepare the scene proof to review this use.</p>'}
+        ${reviewReason(selected)}
+        ${selected.status === "failed" ? '<p class="hint">Fix the artwork or update the scene plan, then prepare a new proof.</p>' : ""}
+        ${proofAdvisory(selected, "assets", busy)}
+        ${selected.proofUrl ? proofReviewActions(selected, "assets", "Approve this use", "Reject this use", busy) : ""}
+      </section>
+    </div>
+  </section>`;
+}
+
 function artworkView(project) {
   if (!project.plan?.approved) return prerequisite("Artwork", "Approve a scene plan to see its complete artwork request.", "plan", "Open scene plan");
   const required = new Map(project.plan.scenes.filter(scene => scene.artId).map(scene => [scene.artId, scene.artBrief]));
@@ -762,7 +892,7 @@ function artworkView(project) {
   const pending = pendingArt(project).length;
   const callsRemaining = Math.max(0, (state.config.maxArtGenerations ?? 0) - (project.artGenerations ?? 0));
   return `
-    ${heading("Artwork", "Import the artwork your approved scene plan calls for and approve each image for use.")}
+    ${heading("Artwork", "Approve the source images, then review how each image appears in its planned scene.")}
     <div class="columns">
       <section class="panel">
         <div class="panel-header">
@@ -803,7 +933,6 @@ function artworkView(project) {
           : providerNotice(state.settings?.useOpenAIImages
             ? "Import your images or add an OpenAI key to generate them in Bacchus."
             : "Copy the combined request into your image tool, then import the files here.", "Image settings") : ""}
-        ${!pending ? afterArtworkButton(project) : ""}
       </section>
       <div class="stack">
         ${project.artPrompt ? `<section class="panel">
@@ -827,7 +956,8 @@ function artworkView(project) {
           <div><button class="button"${project.busy ? " disabled" : ""}>Import artwork</button></div>
         </form>
       </div>
-    </div>`;
+    </div>
+    ${assetUseReview(project)}`;
 }
 
 function mixSettings(mix) {
@@ -885,7 +1015,7 @@ function sceneTiming(project) {
 function compositionView(project) {
   if (!project.input) return prerequisite("Composition", "Lock the narration recording and transcript before composing the soundtrack.", "intake", "Open intake");
   if (!project.plan?.approved) return prerequisite("Composition", "Approve the scene plan before composing the soundtrack.", "plan", "Open scene plan");
-  if (pendingArt(project).length) return prerequisite("Composition", "Approve the required artwork before composing the soundtrack.", "art", "Open artwork");
+  if (!artworkComplete(project)) return prerequisite("Composition", "Approve the planned artwork uses before composing the soundtrack.", "art", "Open artwork");
   const mix = project.mix ?? { musicMode: null, music: null, effects: [], approved: false };
   const values = state.mixDraft?.settings ?? mixSettings(mix);
   const dirty = Boolean(state.mixDraft);
@@ -974,7 +1104,7 @@ function compositionView(project) {
 }
 
 function showFindings(qc) {
-  if (!qc) return '<p class="hint">Run the checks against the approved plan and its assets to create a review candidate.</p>';
+  if (!qc) return '<p class="hint">Run the animation checks to generate scene evidence and inspect the technical findings.</p>';
   if (!qc.findings.length) return '<p class="hint">No findings from the automated checks.</p>';
   return `<ul class="read-list">${qc.findings.map(finding =>
     `<li><strong class="finding-${escapeHtml(finding.level)}">${escapeHtml(finding.level)}</strong> ${escapeHtml(finding.message)}</li>`
@@ -985,58 +1115,124 @@ function sceneStart(project, scene) {
   return project.input.lines[scene.startLine - 1].start;
 }
 
-function reviewView(project) {
-  if (!project.plan?.approved) return prerequisite("Preview & QC", "Approve a scene plan to open the preview.", "plan", "Open scene plan");
-  if (pendingArt(project).length) return prerequisite("Preview & QC", "Import and approve the required artwork to open the preview.", "art", "Open artwork");
-  const duration = project.input.duration;
-  const qc = project.qc;
-  const mixApproved = Boolean(project.mix?.approved);
-  const hasSound = hasAudibleTracks(project);
-  return `
-    ${heading("Preview & QC", "Scrub through the animation and review the checks before accepting a candidate.")}
-    <div class="columns">
-      <section class="panel">
+function reviewRange(proof, duration) {
+  if (!proof) return { start: 0, end: duration };
+  const times = proof.samples.map(sample => Number(sample.time));
+  return {
+    start: Math.max(0, Math.min(Number(proof.start), ...times)),
+    end: Math.min(duration, Math.max(Number(proof.end), ...times)),
+  };
+}
+
+function currentAnimationReview(project) {
+  const records = project.animationChecks ?? [];
+  if (state.animationReviewId === "full") return null;
+  const selected = records.find(record => record.id === state.animationReviewId)
+    ?? (project.qc ? records.find(record => record.status !== "passed") : null);
+  state.animationReviewId = selected?.id ?? "";
+  return selected;
+}
+
+function animationPlayer(project, proof) {
+  const range = reviewRange(proof, project.input.duration);
+  return `<section class="panel" id="animation-player" tabindex="-1">
+        ${proof ? `<div class="proof-preview-title"><h2>${escapeHtml(proof.title)}</h2>
+          <span class="proof-range">${proofSeconds(range.start)} to ${proofSeconds(range.end)}</span></div>` : ""}
         <div class="preview-frame">
           <img id="preview-image" alt="Current animation frame">
         </div>
         <div class="player-controls">
-          <button class="button small" type="button" id="play-preview" aria-pressed="false">Play silent preview</button>
-          <input id="preview-time" type="range" min="0" max="${escapeHtml(duration)}" step=".01" value="0" aria-label="Preview position">
-          <span class="timecode"><span id="current-time">0:00</span> / ${timecode(duration)}</span>
+          <button class="button small" type="button" id="play-preview" aria-pressed="false">${proof ? "Play review range" : "Play silent preview"}</button>
+          <input id="preview-time" type="range" min="${escapeHtml(range.start)}" max="${escapeHtml(range.end)}" step=".001" value="${escapeHtml(range.start)}" aria-label="Preview position">
+          <span class="timecode"><span id="current-time">${timecode(range.start)}</span> / ${timecode(range.end)}</span>
         </div>
-        ${mixApproved && hasSound ? `<div class="narration-preview">
+        ${hasAudibleTracks(project) ? `<div class="narration-preview">
           <audio id="preview-narration" preload="none" src="${localMedia(mixPreviewUrl(project))}"></audio>
-          <button class="button small quiet" type="button" id="play-narration" aria-pressed="false">Play with mix</button>
+          <button class="button small quiet" type="button" id="play-narration" aria-pressed="false">${proof ? "Play range with mix" : "Play with mix"}</button>
         </div>` : ""}
         <p id="preview-feedback" class="hint player-feedback" role="status" hidden></p>
-        <ul class="shot-list" aria-label="Jump to scene">
+        ${proof ? `<ul class="shot-list" aria-label="Jump to a proof sample">
+          ${proof.samples.map(sample => `<li><button class="button small" type="button" data-review-sample="${escapeHtml(sample.time)}">
+            ${escapeHtml(sample.label)} · ${proofSeconds(sample.time)}</button></li>`).join("")}
+        </ul>` : `<ul class="shot-list" aria-label="Jump to scene">
           ${project.plan.scenes.map((scene, index) => `<li><button class="button small" type="button"
             data-preview-time="${escapeHtml(sceneStart(project, scene))}"
             title="${escapeHtml(scene.title || `Scene ${index + 1}`)}"
             aria-label="Scene ${index + 1}${scene.title ? `, ${escapeHtml(scene.title)}` : ""}">${index + 1}</button></li>`).join("")}
-        </ul>
-      </section>
-      <section class="panel">
+        </ul>`}
+      </section>`;
+}
+
+function animationProof(proof, busy) {
+  return `<section class="panel stack" id="animation-proof-detail">
+    <div class="panel-header"><h2>Scene and transition proof</h2>${proofStatus(proof.status)}</div>
+    ${proof.proofUrl ? `<div class="proof-stills">${proofImage(proof.proofUrl, "Rendered frame samples")}</div>
+      <p class="hint">Play the review range or jump to exact samples to check motion, timing, readability, and the cuts on either side.</p>` :
+      proof.status === "error" ? "" : '<p class="hint">Run the animation checks to create this proof.</p>'}
+    ${reviewReason(proof)}
+    ${proof.status === "failed" ? '<p class="hint">Fix the scene or its adjoining transition, then prepare and check the revised animation.</p>' : ""}
+    ${proofAdvisory(proof, "animation", busy)}
+    ${proof.proofUrl ? proofReviewActions(proof, "animation", "Approve scene and transitions", "Reject scene or transition", busy) : ""}
+  </section>`;
+}
+
+function animationChecksPanel(project, records, proof) {
+  const qc = project.qc;
+  const busy = Boolean(project.busy);
+  const approved = records.filter(record => record.status === "passed").length;
+  return `<div class="stack"><section class="panel">
         <div class="panel-header">
-          <h2>Quality checks</h2>
+          <h2>Animation checks</h2>
           ${project.accepted ? badge("Candidate accepted", "good") :
-            qc?.status === "passed" ? badge("Passed", "good") : qc ? badge("Needs review", "warm") : ""}
+            qc?.status === "passed" ? badge("Technical checks passed", "good") : qc ? badge("Technical checks failed", "error") : badge("Awaiting checks", "warm")}
         </div>
-        ${mixApproved ? showFindings(qc) : '<p class="hint">Approve the audio composition to run quality checks. The silent preview is available now.</p>'}
+        ${showFindings(qc)}
         ${qc?.candidateHash ? `<dl class="receipt actions"><dt>Candidate</dt><dd>${shortHash(qc.candidateHash)}</dd></dl>` : ""}
+        ${qc?.status === "passed" && !project.animationReviewReady && !project.accepted
+          ? '<p class="hint actions">Approve each scene and its transitions to unlock candidate acceptance.</p>' : ""}
         <div class="actions cluster">
           ${project.accepted ? '<button type="button" class="button primary" data-stage="export">Open export</button>' : ""}
-          ${!project.accepted && qc?.status === "passed" ? button("Accept candidate", "accept-candidate", {
+          ${!project.accepted && qc?.status === "passed" && project.animationReviewReady ? button("Accept candidate", "accept-candidate", {
             primary: true,
-            disabled: Boolean(project.busy),
+            disabled: busy,
           }) : ""}
-          ${mixApproved && !project.accepted ? button(qc ? "Run checks again" : "Run quality checks", "qc", {
+          ${!project.accepted ? button(qc ? "Run animation checks again" : "Run animation checks", "qc", {
             primary: !qc,
-            disabled: Boolean(project.busy),
+            disabled: busy,
           }) : ""}
-          ${!mixApproved ? '<button class="button primary" type="button" data-stage="composition">Open composition</button>' : ""}
         </div>
       </section>
+      ${records.length ? `<section class="panel stack">
+        <div class="panel-header"><h2>Scenes and transitions</h2>${badge(`${approved} / ${records.length} approved`, approved === records.length ? "good" : "warm")}</div>
+        <ul class="proof-list" aria-label="Scene reviews">
+          ${records.map(record => proofChoice(record.id, record.title, `${proofSeconds(record.start)} to ${proofSeconds(record.end)}`,
+            record.status, proof?.id === record.id, "select-animation-proof")).join("")}
+        </ul>
+        ${proof ? `<div>${button("Full animation preview", "full-animation-preview", { style: "quiet small" })}</div>` : ""}
+      </section>` : ""}</div>`;
+}
+
+function reviewView(project) {
+  if (!project.animationPrepared && project.accepted && project.export?.status === "complete") {
+    return prerequisite("Preview & QC", "Your accepted video is ready to download.", "export", "Open export");
+  }
+  if (!project.plan?.approved) return prerequisite("Preview & QC", "Approve a scene plan to prepare animation.", "plan", "Open scene plan");
+  if (!artworkComplete(project)) return prerequisite("Preview & QC", "Approve the planned artwork uses to prepare animation.", "art", "Open artwork");
+  if (!project.mix?.approved) return prerequisite("Preview & QC", "Approve the audio composition to prepare animation.", "composition", "Open composition");
+  if (!project.animationPrepared) return `
+    ${heading("Preview & QC")}
+    <section class="panel slim">
+      <h2>Prepare animation</h2>
+      <p class="hint">Prepare the preview using the approved scene plan, artwork uses, and audio mix.</p>
+      <div class="actions">${button("Prepare animation", "prepare-animation", { primary: true, disabled: Boolean(project.busy) })}</div>
+    </section>`;
+  const records = project.animationChecks ?? [];
+  const proof = currentAnimationReview(project);
+  return `
+    ${heading("Preview & QC", "Run the animation checks, then review each scene and its cuts before accepting a candidate.")}
+    <div class="columns">
+      <div class="stack">${animationPlayer(project, proof)}${proof ? animationProof(proof, Boolean(project.busy)) : ""}</div>
+      ${animationChecksPanel(project, records, proof)}
     </div>`;
 }
 
@@ -1087,9 +1283,12 @@ function attachPreview(project) {
   const playNarration = content.querySelector("#play-narration");
   const feedback = content.querySelector("#preview-feedback");
   const shots = Array.from(content.querySelectorAll("[data-preview-time]"));
+  const samples = Array.from(content.querySelectorAll("[data-review-sample]"));
   const starts = project.plan.scenes.map(scene => Number(sceneStart(project, scene)));
   const duration = Number(project.input.duration);
-  const key = [project.id, project.input.hash, project.plan.hash, ...project.assets.map(asset => asset.hash)].join(".");
+  const proof = currentAnimationReview(project);
+  const range = reviewRange(proof, duration);
+  const key = [project.id, project.input.hash, project.plan.hash, proof?.id, ...project.assets.map(asset => asset.hash)].join(".");
   const savedPosition = state.previewPosition?.key === key ? state.previewPosition : null;
   const path = projectPath("/preview");
   let timer = null;
@@ -1105,7 +1304,7 @@ function attachPreview(project) {
     if (disposed || fetchController || queued == null) return;
     const time = Math.min(queued, Math.max(0, duration - .001));
     queued = null;
-    const query = new URLSearchParams({ time: time.toFixed(3), revision: project.revision });
+    const query = new URLSearchParams({ time, revision: project.revision });
     fetchController = new AbortController();
     try {
       const response = await fetch(`${path}?${query}`, { signal: fetchController.signal });
@@ -1129,10 +1328,11 @@ function attachPreview(project) {
   }
 
   function show(time, throttle = false) {
+    time = Math.max(range.start, Math.min(range.end, time));
     state.previewPosition = { key, time, hasSeeked };
     seek.value = time;
     current.textContent = timecode(time);
-    seek.setAttribute("aria-valuetext", timecode(time));
+    seek.setAttribute("aria-valuetext", proof ? proofSeconds(time) : timecode(time));
     const index = starts.findLastIndex(start => start <= time);
     shots.forEach((shot, shotIndex) => shot.setAttribute("aria-current", String(index === shotIndex)));
     queued = time;
@@ -1146,10 +1346,10 @@ function attachPreview(project) {
     clearInterval(timer);
     timer = null;
     narration?.pause();
-    play.textContent = "Play silent preview";
+    play.textContent = proof ? "Play review range" : "Play silent preview";
     play.setAttribute("aria-pressed", "false");
     if (playNarration) {
-      playNarration.textContent = "Play with mix";
+      playNarration.textContent = proof ? "Play range with mix" : "Play with mix";
       playNarration.setAttribute("aria-pressed", "false");
     }
   }
@@ -1157,7 +1357,7 @@ function attachPreview(project) {
   function start(withNarration = false) {
     pause();
     const playback = playbackId;
-    const offset = !hasSeeked || Number(seek.value) >= duration ? 0 : Number(seek.value);
+    const offset = !hasSeeked || Number(seek.value) >= range.end ? range.start : Number(seek.value);
     hasSeeked = true;
     const clock = performance.now() - offset * 1000;
     const control = withNarration ? playNarration : play;
@@ -1175,10 +1375,10 @@ function attachPreview(project) {
     control.textContent = withNarration && narration.readyState < 2 ? "Loading mix…" : "Pause preview";
     control.setAttribute("aria-pressed", "true");
     timer = setInterval(() => {
-      const time = Math.min(duration, withNarration ? narration.currentTime : (performance.now() - clock) / 1000);
+      const time = Math.min(range.end, withNarration ? narration.currentTime : (performance.now() - clock) / 1000);
       show(time);
-      if (time >= duration || (withNarration && narration.ended)) pause();
-    }, 250);
+      if (time >= range.end || (withNarration && narration.ended)) pause();
+    }, proof ? 125 : 250);
     show(offset);
   }
 
@@ -1206,7 +1406,13 @@ function attachPreview(project) {
     hasSeeked = true;
     show(visibleSceneTime(index));
   }));
-  show(savedPosition?.time ?? visibleSceneTime(0));
+  samples.forEach(sample => sample.addEventListener("click", () => {
+    pause();
+    hasSeeked = true;
+    show(Number(sample.dataset.reviewSample));
+  }));
+  const firstStill = proof ? Number(proof.samples[Math.floor(proof.samples.length / 2)]?.time ?? range.start) : visibleSceneTime(0);
+  show(savedPosition?.time ?? firstStill);
   return () => {
     disposed = true;
     clearTimeout(frameTimer);
@@ -1299,6 +1505,8 @@ async function perform(operation, { busy, success, stage, resetPlan = false, vie
     if (!project?.id) throw new Error("The studio did not return a project.");
     updated = true;
     if (state.project?.id !== project.id) {
+      state.assetProofId = "";
+      state.animationReviewId = "";
       try { localStorage.setItem("bacchus-project", project.id); } catch { /* Browser storage is optional. */ }
     }
     state.project = project;
@@ -1394,6 +1602,7 @@ function settingsPayload(data) {
     plannerProvider: data.get("plannerProvider"),
     useOpenAITranscription: data.has("useOpenAITranscription"),
     useOpenAIImages: data.has("useOpenAIImages"),
+    apiLogDirectory: data.get("apiLogDirectory")?.trim() ?? "",
     clearOpenAIKey: data.has("clearOpenAIKey"),
     clearAnthropicKey: data.has("clearAnthropicKey"),
   };
@@ -1608,6 +1817,16 @@ document.addEventListener("submit", event => {
     saveSettings(payload, !state.settings.completed);
   } else if (name === "library-pin") {
     pinArtwork(data);
+  } else if (name === "proof-result") {
+    const { proofGroup, proofId } = form.dataset;
+    const passed = form.dataset.passed === "true";
+    const reason = String(data.get("reason") ?? "").trim();
+    if (form.querySelector("[name=reason]") && !reason) {
+      setMessage("Enter a reason before recording this decision.", "error");
+      return;
+    }
+    perform(() => mutate(`/${proofGroup}/checks/${encodeURIComponent(proofId)}/result`, { passed, reason }),
+      { success: passed ? "Proof approved." : "Rejection recorded." });
   } else if (name === "new-project") {
     const title = data.get("title").trim();
     if (!title) {
@@ -1646,9 +1865,11 @@ document.addEventListener("submit", event => {
 });
 
 const stageActions = {
-  "approve-plan": ["/plan/approve", "Plan approved.", project => pendingArt(project).length ? "art" : afterArtwork(project)],
+  "approve-plan": ["/plan/approve", "Plan approved.", project => artworkComplete(project) ? afterArtwork(project) : "art"],
+  "prepare-asset-proofs": ["/assets/checks", "Artwork proofs prepared.", undefined, "Preparing artwork proofs…"],
   "approve-mix": ["/mix/approve", "Composition approved.", "review"],
-  qc: ["/qc", "Quality checks finished."],
+  "prepare-animation": ["/animation/prepare", "Animation prepared.", undefined, "Preparing the animation…"],
+  qc: ["/qc", "Animation checks finished.", undefined, "Running animation checks…"],
   "accept-candidate": ["/candidate/accept", "Candidate accepted.", "export"],
   export: ["/export", ""],
 };
@@ -1772,9 +1993,24 @@ document.addEventListener("click", event => {
     }
   } else if (action === "copy-request") {
     copyRequest();
+  } else if (action === "select-asset-proof" || action === "select-animation-proof" || action === "full-animation-preview") {
+    const artwork = action === "select-asset-proof";
+    if (artwork) state.assetProofId = name;
+    else state.animationReviewId = action === "full-animation-preview" ? "full" : name;
+    setMessage();
+    render();
+    const inspector = content.querySelector(artwork ? "#asset-proof-detail" : "#animation-player");
+    inspector?.focus({ preventScroll: true });
+    inspector?.scrollIntoView({ block: "nearest" });
+  } else if (action === "advise-assets" || action === "advise-animation") {
+    const group = action === "advise-assets" ? "assets" : "animation";
+    perform(() => mutate(`/${group}/checks/${encodeURIComponent(name)}/advise`), {
+      busy: "Claude is reviewing this proof…",
+      success: "Claude’s advisory findings are ready.",
+    });
   } else if (stageActions[action]) {
-    const [path, success, stage] = stageActions[action];
-    perform(() => mutate(path), { success, stage, busy: action === "export" ? "Starting render…" : undefined });
+    const [path, success, stage, busy] = stageActions[action];
+    perform(() => mutate(path), { success, stage, busy: action === "export" ? "Starting render…" : busy });
   }
 });
 

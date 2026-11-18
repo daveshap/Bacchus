@@ -10,7 +10,7 @@ import wave
 
 from PIL import Image
 
-from bacchus import audio, planning, render
+from bacchus import audio, planning, render, visual_review
 from bacchus.workflow import Studio, WorkflowError
 
 
@@ -82,6 +82,29 @@ class StudioWorkflowTests(unittest.TestCase):
         self.change("mix", musicMode="none", musicGainDb=-24, effects=[])
         self.change("mix/approve")
 
+    def record_check(self, scope, check, passed=True):
+        self.project = self.studio.record_review(
+            self.project_id, scope, check["id"],
+            {"revision": self.project["revision"], "passed": passed, "reason": "Review regression fixture."},
+        )
+
+    def review_checks(self, scope):
+        key = "assetChecks" if scope == "assets" else "animationChecks"
+        for check in self.project[key]:
+            proof = self.studio.review_proof(self.project_id, scope, check["id"])
+            self.assertTrue(proof.read_bytes().startswith(b"\x89PNG"))
+            self.record_check(scope, check)
+
+    def prepare_animation(self):
+        self.change("assets/checks")
+        self.review_checks("assets")
+        self.change("animation/prepare")
+
+    def pass_animation_review(self):
+        self.change("qc")
+        self.review_checks("animation")
+        self.change("candidate/accept")
+
     def plan_with_art(self):
         self.lock_input()
         self.change("plan", scenes=two_scenes())
@@ -103,6 +126,30 @@ class StudioWorkflowTests(unittest.TestCase):
         self.project = self.studio.upload_mix(
             self.project_id, self.project["revision"], kind, name, raw,
         )
+
+    def test_claude_findings_require_operator_resolution(self):
+        self.plan_with_art()
+        self.change("assets/checks")
+        [proof] = self.project["assetChecks"]
+        call = {"revision": self.project["revision"]}
+        advice = {"findings": [{"id": "behavior-in-use", "status": "unclear", "evidence": "Static panel."}]}
+        with (
+            patch.object(visual_review, "available", return_value=True),
+            patch.object(visual_review, "review", return_value=advice) as reviewer,
+        ):
+            self.project = self.studio.advise_review(self.project_id, "assets", proof["id"], call)
+            self.studio.advise_review(self.project_id, "assets", proof["id"], {"revision": self.project["revision"]})
+        reviewer.assert_called_once()
+        scope, brief, image = reviewer.call_args.args
+        self.assertEqual(scope, "asset")
+        self.assertIn("The cup catches the light.", brief)
+        self.assertTrue(image.startswith(b"\x89PNG"))
+        self.assertEqual(self.project["assetChecks"][0]["status"], "ready")
+        with self.assertRaisesRegex(WorkflowError, "resolved"):
+            self.studio.record_review(self.project_id, "assets", proof["id"],
+                                      {"revision": self.project["revision"], "passed": True, "reason": ""})
+        self.record_check("assets", proof)
+        self.assertTrue(self.project["assetReviewReady"])
 
     def test_transcribing_leaves_editable_draft(self):
         empty = self.studio.create("Missing recording")
@@ -146,8 +193,8 @@ class StudioWorkflowTests(unittest.TestCase):
         self.change("plan/starter")
         self.change("plan/approve")
         self.approve_dry_mix()
-        self.change("qc")
-        self.change("candidate/accept")
+        self.prepare_animation()
+        self.pass_animation_review()
         self.change("input/unlock")
         self.change("input", script="An edited cue.", intention="Use estimated timing.")
         self.assertEqual(self.project["input"]["timing"], "estimated")
@@ -166,6 +213,9 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertEqual(opened["input"], sample["input"])
         self.assertTrue(opened["plan"]["approved"])
         self.assertTrue(opened["requiresAudio"])
+        with self.assertRaisesRegex(WorkflowError, "Prepare the animation"):
+            self.studio.preview(identifier, 1)
+        opened = self.studio.change(identifier, "animation/prepare", {"revision": opened["revision"]})
         self.assertTrue(self.studio.preview(identifier, 1).startswith(b"\x89PNG"))
         unlocked = self.studio.change(identifier, "input/unlock", {"revision": opened["revision"]})
         with self.assertRaisesRegex(WorkflowError, "Import the narration recording"):
@@ -188,20 +238,43 @@ class StudioWorkflowTests(unittest.TestCase):
             self.change("plan", scenes=incomplete)
         self.change("plan", scenes=two_scenes())
         with self.assertRaisesRegex(WorkflowError, "Approve the scene plan"):
-            self.change("qc")
+            self.change("assets/checks")
         self.change("plan/approve")
         with self.assertRaisesRegex(WorkflowError, "Upload and approve"):
-            self.change("qc")
+            self.change("assets/checks")
         self.assertEqual([item["id"] for item in self.project["missing"]], ["cup"])
         self.assertIn("A brown ceramic cup", self.project["artPrompt"])
         self.upload_art("tan")
         self.approve_art()
         self.approve_dry_mix()
-        with self.assertRaisesRegex(WorkflowError, "Run and pass QC"):
+        with self.assertRaisesRegex(WorkflowError, "Review and pass the planned artwork uses"):
+            self.change("animation/prepare")
+        with self.assertRaisesRegex(WorkflowError, "Review and pass the planned artwork uses"):
+            self.studio.preview(self.project_id, 0.5)
+        self.change("assets/checks")
+        self.assertEqual(self.project["assetChecks"][0]["status"], "ready")
+        with self.assertRaisesRegex(WorkflowError, "Review and pass the planned artwork uses"):
+            self.change("animation/prepare")
+        self.review_checks("assets")
+        original_asset_proof = self.project["assetChecks"][0]["id"]
+        with self.assertRaisesRegex(WorkflowError, "Prepare the animation"):
+            self.studio.preview(self.project_id, 0.5)
+        with self.assertRaisesRegex(WorkflowError, "Prepare the animation"):
+            self.change("qc")
+        self.change("animation/prepare")
+        self.assertTrue(self.studio.preview(self.project_id, 0.5).startswith(b"\x89PNG"))
+        with self.assertRaisesRegex(WorkflowError, "technical animation checks"):
             self.change("candidate/accept")
         self.change("qc")
+        with self.assertRaisesRegex(WorkflowError, "Review and pass the scenes and transitions"):
+            self.change("candidate/accept")
         with self.assertRaisesRegex(WorkflowError, "Accept the current candidate"):
             self.change("export")
+        self.record_check("animation", self.project["animationChecks"][0], passed=False)
+        self.assertEqual(self.project["animationChecks"][0]["status"], "failed")
+        with self.assertRaisesRegex(WorkflowError, "Review and pass the scenes and transitions"):
+            self.change("candidate/accept")
+        self.review_checks("animation")
         self.change("candidate/accept")
         self.assertTrue(self.project["accepted"])
         edited = two_scenes()
@@ -211,6 +284,10 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertFalse(self.project["plan"]["approved"])
         self.assertFalse(self.project["accepted"])
         self.assertIsNone(self.project["qc"])
+        self.change("plan/approve")
+        self.assertEqual(self.project["assetChecks"][0]["id"], original_asset_proof)
+        self.assertEqual(self.project["assetChecks"][0]["status"], "passed")
+        self.assertFalse(self.project["animationPrepared"])
         self.change("input/unlock")
         self.assertIsNone(self.project["input"])
         self.assertIsNone(self.project["plan"])
@@ -218,6 +295,7 @@ class StudioWorkflowTests(unittest.TestCase):
     def test_art_normalization_fingerprint_and_revocation(self):
         self.plan_with_art()
         self.approve_dry_mix()
+        self.prepare_animation()
         original = self.project["assets"][0]
         path, content_type = self.studio.media(self.project_id, "art", original["hash"])
         self.assertEqual(content_type, "image/png")
@@ -226,8 +304,7 @@ class StudioWorkflowTests(unittest.TestCase):
             self.assertEqual((art.format, art.mode, art.size), ("PNG", "RGBA", (160, 112)))
         with Image.open(BytesIO(self.studio.preview(self.project_id, 1.5))) as frame:
             self.assertEqual(frame.size, (render.WIDTH, render.HEIGHT))
-        self.change("qc")
-        self.change("candidate/accept")
+        self.pass_animation_review()
         self.upload_art("brown")
         self.assertTrue(self.project["plan"]["approved"])
         self.assertFalse(self.project["assets"][0]["approved"])
@@ -237,11 +314,32 @@ class StudioWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkflowError, "Upload and approve"):
             self.change("qc")
 
+    def test_tampered_proofs_block_acceptance_and_export(self):
+        self.plan_with_art()
+        self.approve_dry_mix()
+        self.prepare_animation()
+        self.change("qc")
+        self.review_checks("animation")
+        check_id = self.project["animationChecks"][0]["id"]
+        self.studio.review_proof(self.project_id, "animation", check_id).write_bytes(b"changed animation evidence")
+        with self.assertRaisesRegex(WorkflowError, "valid proof"):
+            self.studio.review_proof(self.project_id, "animation", check_id)
+        with self.assertRaisesRegex(WorkflowError, "Review and pass the scenes and transitions"):
+            self.change("candidate/accept")
+        self.change("qc")
+        self.assertEqual([item["status"] for item in self.project["animationChecks"]], ["ready", "passed"])
+        self.record_check("animation", self.project["animationChecks"][0])
+        self.change("candidate/accept")
+        check_id = self.project["assetChecks"][0]["id"]
+        self.studio.review_proof(self.project_id, "assets", check_id).write_bytes(b"changed artwork evidence")
+        with self.assertRaisesRegex(WorkflowError, "Review and pass the planned artwork uses"):
+            self.change("export")
+
     def test_planner_cannot_move_the_gates(self):
         self.plan_with_art()
         self.approve_dry_mix()
-        self.change("qc")
-        self.change("candidate/accept")
+        self.prepare_animation()
+        self.pass_animation_review()
         current_plan = self.project["plan"]
         invalid = two_scenes()
         invalid[0]["approved"] = True
@@ -313,8 +411,10 @@ class StudioWorkflowTests(unittest.TestCase):
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_music_and_effects_change_the_export_candidate(self):
         self.plan_with_art()
+        self.change("assets/checks")
+        self.review_checks("assets")
         with self.assertRaisesRegex(WorkflowError, "(?i)mix|music|composition"):
-            self.change("qc")
+            self.change("animation/prepare")
         self.upload_mix("music", "score.wav", wav_tone(220, 0.5))
         self.upload_mix("effects", "chime.wav", wav_tone(660, 0.3))
         effect_id = self.project["mix"]["effects"][0]["id"]
@@ -322,30 +422,34 @@ class StudioWorkflowTests(unittest.TestCase):
                "effects": [{"id": effect_id, "start": 0.25, "gainDb": -9}]}
         self.change("mix", **mix)
         with self.assertRaisesRegex(WorkflowError, "(?i)mix|music|composition"):
-            self.change("qc")
+            self.change("animation/prepare")
         self.change("mix/approve")
         first_preview = self.studio.mix_preview(self.project_id)
         first_mix_bytes = first_preview.read_bytes()
         with wave.open(str(first_preview), "rb") as recording:
             self.assertAlmostEqual(recording.getnframes() / recording.getframerate(), 2, places=2)
-        self.change("qc")
+        self.change("animation/prepare")
+        self.pass_animation_review()
         first_candidate = self.project["qc"]["candidateHash"]
-        self.change("candidate/accept")
+        scene_proof_ids = [check["id"] for check in self.project["animationChecks"]]
         mix["effects"][0]["start"] = 0.75
         self.change("mix", **mix)
         self.assertFalse(self.project["accepted"])
         self.change("mix/approve")
         second_preview = self.studio.mix_preview(self.project_id)
         self.assertNotEqual(first_mix_bytes, second_preview.read_bytes())
+        self.change("animation/prepare")
         self.change("qc")
         self.assertNotEqual(self.project["qc"]["candidateHash"], first_candidate)
+        self.assertEqual([check["id"] for check in self.project["animationChecks"]], scene_proof_ids)
+        self.assertTrue(all(check["status"] == "passed" for check in self.project["animationChecks"]))
 
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_verified_export_with_narration_captions_and_receipt(self):
         self.plan_with_art()
         self.approve_dry_mix()
-        self.change("qc")
-        self.change("candidate/accept")
+        self.prepare_animation()
+        self.pass_animation_review()
         self.change("export")
         self.wait_for_jobs()
         result = self.studio.get(self.project_id)["export"]
@@ -361,6 +465,14 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertEqual(file["media"]["audio"], "aac")
         self.assertEqual(file["media"]["frames"], 48)
         self.assertAlmostEqual(file["media"]["duration"], 2, places=2)
+        self.assertEqual(len(file["review"]["assets"]), 1)
+        self.assertEqual(len(file["review"]["animation"]), 2)
+        for scope, checks in file["review"].items():
+            for check_id, check in checks.items():
+                self.assertEqual(check["status"], "passed")
+                self.assertTrue(check["reviewedAt"])
+                proof = self.studio.review_proof(self.project_id, scope, check_id)
+                self.assertEqual(check["proofHash"], hashlib.sha256(proof.read_bytes()).hexdigest())
         captions_text = captions.read_text(encoding="utf-8")
         self.assertIn("00:00:00,000 --> 00:00:01,091", captions_text)
         self.assertIn("The cup catches the light.", captions_text)
