@@ -122,8 +122,13 @@ def check_styles(url):
     return project
 
 
-def check_style_mix(url, project):
+def check_style_mix_and_captions(url, project):
     route = f"/api/projects/{project['id']}"
+    spoken = "Some captions fit quite a lot of speech into one second."
+
+    def action(name, **data):
+        return json.loads(request(url, f"{route}/{name}", {"revision": project["revision"], **data}))
+
     with BytesIO() as buffer:
         with wave.open(buffer, "wb") as recording:
             recording.setparams((1, 2, 16_000, 0, "NONE", "PCM"))
@@ -134,20 +139,48 @@ def check_style_mix(url, project):
     ))
     cues = {
         "audio": {"sha256": hashlib.sha256(wav).hexdigest()}, "duration": 1,
-        "words": [{"text": "Smoke", "start": 0, "end": 0.43}, {"text": "test.", "start": 0.51, "end": 0.91}],
+        "words": [
+            {"text": word, "start": index * 0.08, "end": index * 0.08 + 0.07}
+            for index, word in enumerate(spoken.split())
+        ],
     }
     project = json.loads(request(
         url, f"{route}/timings?revision={project['revision']}", json.dumps(cues).encode(), content_type="application/json",
     ))
-    for action, body in (
-        ("input", {"script": "Smoke test.", "intention": "", "confirmTiming": True}),
-        ("plan/starter", {}),
-        ("plan/approve", {}),
-    ):
-        project = json.loads(request(url, f"{route}/{action}", {"revision": project["revision"], **body}))
+    project = action("input", script=spoken, intention="", confirmTiming=True)
+    for name in ("plan/starter", "plan/approve"):
+        project = action(name)
     mix = project["mix"]
     if mix["musicMode"] != "none" or mix["effects"] or mix["approved"]:
         raise RuntimeError("Approving a plan did not apply the pinned style's speech-only mix preference.")
+    review = project["captionReview"]
+    if not review or review["method"] != "timed-words-v1" or not review["flaggedCount"] or not review["issues"]:
+        raise RuntimeError("The caption review missed the deliberately fast spoken fixture.")
+    project = action("mix/prepare")
+    project = action("mix/approve", reviewed=True)
+    project = action("animation/prepare")
+    project = action("qc")
+    project = verify_checks(url, route, project, "animation", "animationChecks")
+    project = action("candidate/accept")
+    action("export")
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        output = json.loads(request(url, route))["export"]
+        if output["status"] == "failed":
+            raise RuntimeError(output["error"])
+        if output["status"] == "complete":
+            receipt = json.loads(request(url, output["receiptUrl"]))
+            raw = request(url, output["captionsUrl"])
+            blocks = raw.decode("utf-8").strip().split("\n\n")
+            exported_words = [word for block in blocks for line in block.splitlines()[2:] for word in line.split()]
+            if (output["captionReview"] != review or receipt["captionReview"] != review
+                    or receipt["captionsHash"] != hashlib.sha256(raw).hexdigest()
+                    or len(blocks) != review["cueCount"] or exported_words != spoken.split()):
+                raise RuntimeError("The narrated delivery lost approved words or its caption review evidence.")
+            print("Verified narrated SRT export and caption review.")
+            return
+        time.sleep(0.25)
+    raise RuntimeError("The captioned export exceeded its time limit.")
 
 
 def check_style_archive(url, style_id):
@@ -382,7 +415,7 @@ def main():
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")
             if args.render:
-                check_style_mix(url, custom)
+                check_style_mix_and_captions(url, custom)
                 project = run_export(url, root, project, custom["styleSnapshot"]["id"])
                 print(f"Verified default export encoder: {project['export']['media']['encoder']}")
                 check_export_recovery(url, root, project)

@@ -10,9 +10,9 @@ import wave
 
 from PIL import Image
 
-from bacchus import audio, planning, render, styles, visual_review
+from bacchus import audio, captions as caption_generator, planning, render, styles, visual_review
 from bacchus.library import LibraryError
-from bacchus.workflow import Studio, WorkflowError
+from bacchus.workflow import Studio, WorkflowError, subtitles
 
 
 SCRIPT = (
@@ -238,6 +238,8 @@ class StudioWorkflowTests(unittest.TestCase):
 
     def test_saved_text_first_project_reopens_under_current_intake_rules(self):
         sample = self.studio.create("An early cut", demo=True)
+        self.assertEqual(sample["captionReview"]["method"], "authored-lines-v1")
+        self.assertEqual(self.studio._caption_data(sample)[0], subtitles(sample))
         identifier = sample["id"]
         path = self.studio.root / identifier / "project.json"
         previous = json.loads(path.read_bytes())
@@ -248,6 +250,8 @@ class StudioWorkflowTests(unittest.TestCase):
         path.write_text(json.dumps(previous), encoding="utf-8")
 
         opened = self.studio.get(identifier)
+        self.assertEqual(opened["captionReview"]["method"], "legacy-lines-v1")
+        self.assertEqual(self.studio._caption_data(opened)[0], subtitles(opened))
         self.assertEqual(opened["input"]["script"], sample["input"]["script"])
         self.assertTrue(opened["plan"]["approved"])
         self.assertTrue(opened["requiresAudio"])
@@ -603,9 +607,15 @@ class StudioWorkflowTests(unittest.TestCase):
         self.approve_dry_mix()
         self.prepare_animation()
         self.pass_animation_review()
+        report = self.project["captionReview"]
+        self.assertEqual(report["method"], "timed-words-v1")
+        with patch.object(caption_generator, "generate", wraps=caption_generator.generate) as generate:
+            self.assertEqual(self.studio.get(self.project_id)["captionReview"], report)
+            generate.assert_not_called()
         self.change("export")
         self.wait_for_jobs()
-        result = self.studio.get(self.project_id)["export"]
+        delivered = self.studio.get(self.project_id)
+        result = delivered["export"]
         self.assertEqual(result["status"], "complete", result.get("error"))
         key = result["candidateHash"]
         delivery_id = result["deliveryId"]
@@ -621,6 +631,11 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertEqual(file["captionsHash"], hashlib.sha256(captions.read_bytes()).hexdigest())
         self.assertEqual(file["candidate"]["mix"]["rendered"]["sha256"], self.project["mix"]["rendered"]["sha256"])
         self.assertEqual(file["captionsTiming"], "source-cues")
+        self.assertEqual(file["captionReview"], report)
+        self.assertEqual(result["captionReview"], report)
+        self.assertEqual(delivered["lastDelivery"]["captionReview"], report)
+        self.assertEqual(delivered["input"]["lines"], self.project["input"]["lines"])
+        self.assertEqual(delivered["plan"]["hash"], self.project["plan"]["hash"])
         self.assertEqual(file["media"]["audio"], "aac")
         self.assertEqual(file["media"]["frames"], 48)
         self.assertEqual(file["media"]["decodedFrames"], 48)
@@ -635,8 +650,11 @@ class StudioWorkflowTests(unittest.TestCase):
                 proof = self.studio.review_proof(self.project_id, scope, check_id)
                 self.assertEqual(check["proofHash"], hashlib.sha256(proof.read_bytes()).hexdigest())
         captions_text = captions.read_text(encoding="utf-8")
-        self.assertIn("00:00:00,000 --> 00:00:01,000", captions_text)
-        self.assertIn("The cup catches the light.", captions_text)
+        self.assertNotEqual(captions_text, subtitles(self.project))
+        sections = captions_text.strip().split("\n\n")
+        spoken = [word for cue in sections for line in cue.splitlines()[2:] for word in line.split()]
+        self.assertEqual(spoken, SCRIPT.split())
+        self.assertEqual(len(sections), report["cueCount"])
 
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_delivery_rerender_and_repair_keep_acceptance_and_last_good_files(self):
@@ -651,17 +669,24 @@ class StudioWorkflowTests(unittest.TestCase):
             self.assertEqual(self.project["export"]["status"], "complete", self.project["export"])
             return self.project["export"]
 
+        original_text = subtitles(self.project)
         with patch("bacchus.workflow.video_encoder_mode", return_value="cpu"):
-            self.change("export")
-            previous = current()
+            with patch.object(self.studio, "_caption_data", return_value=(original_text, None)):
+                self.change("export")
+                previous = current()
+            original_receipt = self.studio.media(self.project_id, "receipt", previous["deliveryId"])[0].read_bytes()
+            self.assertIsNone(previous.get("captionReview"))
             self.assertEqual(self.change("export")["export"]["deliveryId"], previous["deliveryId"])
         with patch("bacchus.workflow.video_encoder_mode", return_value="auto"):
-            started = self.change("export")
+            started = self.change("export", rerender=True)
             self.assertEqual(started["lastDelivery"]["deliveryId"], previous["deliveryId"])
             second = current()
             self.assertNotEqual(second["deliveryId"], previous["deliveryId"])
             self.assertEqual(second["encoderMode"], "auto")
             self.assertEqual(second["candidateHash"], previous["candidateHash"])
+            self.assertEqual(second["captionReview"]["method"], "timed-words-v1")
+            new_captions = self.studio.media(self.project_id, "captions", second["deliveryId"])[0]
+            self.assertNotEqual(new_captions.read_bytes(), original_text.encode("utf-8"))
 
             with patch.object(render, "export_video", side_effect=render.RenderError("Test encoder failure.")):
                 self.change("export", rerender=True)
@@ -688,6 +713,9 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertEqual(repaired["candidateHash"], previous["candidateHash"])
         self.assertTrue(self.project["accepted"])
         self.studio.media(self.project_id, "video", previous["deliveryId"])
+        self.assertEqual(self.studio.media(self.project_id, "captions", previous["deliveryId"])[0].read_bytes(),
+                         original_text.encode("utf-8"))
+        self.assertEqual(self.studio.media(self.project_id, "receipt", previous["deliveryId"])[0].read_bytes(), original_receipt)
 
     def test_completed_legacy_delivery_keeps_its_link_and_verifies_against_adopted_hashes(self):
         project = self.studio._read(self.project_id)

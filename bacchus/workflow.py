@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import uuid
+from collections import OrderedDict
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from tempfile import TemporaryDirectory
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from . import ENGINE_VERSION, api_log, audio, delivery, gates, local_timing, planning, providers, render, score, styles, timing, timing_models, visual_review
+from . import ENGINE_VERSION, api_log, audio, captions, delivery, gates, local_timing, planning, providers, render, score, styles, timing, timing_models, visual_review
 from .library import Library, LibraryError
 from .settings import timing_model_directory, video_encoder_mode
 
@@ -27,6 +28,7 @@ MAX_ART_GENERATIONS = 24
 MAX_TRANSCRIPTIONS = 3
 MAX_PROJECT_ASSETS = 128
 MAX_LIBRARY_CHOICES = 20
+MAX_CACHED_CAPTIONS = 8
 LIBRARY_STOP_WORDS = set("about across also and are can for from has have how into its more that the their them then there these this those was were what when where which who will with would you your".split())
 STYLES = {
     "warm-editorial": "Warm editorial",
@@ -403,6 +405,7 @@ class Studio:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self._caption_cache = OrderedDict()
         self.timing_models = timing_models.TimingModels(self.root)
         self.styles = styles.StyleCatalog(self.root)
         self.library_root = self.root / "style-libraries"
@@ -605,6 +608,10 @@ class Studio:
         view["accepted"] = bool(project["accepted"])
         view["needsExactTiming"] = bool(project["input"] and not project["demo"]
                                        and (project["input"].get("timing") != "source-cues" or not project["input"].get("words")))
+        try:
+            view["captionReview"] = deepcopy(self._caption_data(project)[1])
+        except captions.CaptionError as error:
+            view.update(captionReview=None, captionReviewError=str(error))
         folder = self._folder(project_id)
         view["assetChecks"] = gates.view(view, folder, "assets")
         view.pop("review")
@@ -649,6 +656,26 @@ class Studio:
                     view["lastDelivery"] = previous
                     break
         return view
+
+    def _caption_data(self, project):
+        source = project["input"]
+        if not source:
+            return "", None
+        if not source.get("words"):
+            method = "authored-lines-v1" if source.get("timing") == "demo" else "legacy-lines-v1"
+            return subtitles(project), {"method": method, "cueCount": len(source["lines"]),
+                                        "flaggedCount": 0, "issues": []}
+        key = source.get("hash")
+        with self.lock:
+            if isinstance(key, str) and key in self._caption_cache:
+                self._caption_cache.move_to_end(key)
+                return self._caption_cache[key]
+            result = captions.generate(source)
+            if isinstance(key, str):
+                self._caption_cache[key] = result
+                if len(self._caption_cache) > MAX_CACHED_CAPTIONS:
+                    self._caption_cache.popitem(last=False)
+            return result
 
     @staticmethod
     def _delivery_view(folder, base, record):
@@ -1703,6 +1730,10 @@ class Studio:
             self._require_animation_review(project, folder, record)
             if not render.render_available():
                 raise WorkflowError("FFmpeg and ffprobe must be installed and on PATH.", 409)
+            try:
+                caption_data = self._caption_data(project)
+            except captions.CaptionError as error:
+                raise WorkflowError(f"Review the recording's word timings before rendering captions. {error}", 409) from error
             snapshot = deepcopy(project)
             delivery_id = digest(uuid.uuid4().bytes)
             project["busy"] = "rendering"
@@ -1710,16 +1741,17 @@ class Studio:
                                  "encoderMode": encoder_mode, "startedAt": now()}
             self._save(project)
             job = threading.Thread(
-                target=self._export, args=(snapshot, folder, key, record, encoder_mode, delivery_id),
+                target=self._export, args=(snapshot, folder, key, record, encoder_mode, delivery_id, caption_data),
                 name=f"render-{project_id[:8]}",
             )
             self.jobs.add(job)
             job.start()
             return self._view(project)
 
-    def _export(self, snapshot, folder, key, record, encoder_mode, delivery_id):
+    def _export(self, snapshot, folder, key, record, encoder_mode, delivery_id, caption_data):
         output_dir = folder / "exports"
         result = {}
+        caption_text, caption_review = caption_data
         try:
             output_dir.mkdir(exist_ok=True)
             with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=output_dir) as work:
@@ -1733,7 +1765,7 @@ class Studio:
                     raise WorkflowError("An input changed while the candidate was rendering.", 409)
                 self._require_review(snapshot, folder, "assets")
                 self._require_animation_review(snapshot, folder, record)
-                write_file(paths["captions"], subtitles(snapshot).encode("utf-8"))
+                write_file(paths["captions"], caption_text.encode("utf-8"))
                 hashes = {kind: delivery.file_hash(paths[kind]) for kind in ("video", "captions")}
                 receipt = {
                     "candidateHash": key, "deliveryId": delivery_id, "candidate": record,
@@ -1746,6 +1778,8 @@ class Studio:
                         for scope in ("assets", "animation")
                     },
                 }
+                if caption_review is not None:
+                    receipt["captionReview"] = caption_review
                 receipt["libraryArtwork"] = {
                     asset["id"]: {"id": asset["libraryId"], "version": asset["libraryVersion"]}
                     for asset in snapshot["assets"] if "libraryId" in asset and asset["id"] in record["artwork"]
@@ -1754,6 +1788,8 @@ class Studio:
                 hashes["receipt"] = delivery.file_hash(paths["receipt"])
                 bundle.rename(output_dir / delivery_id)
                 result.update(status="complete", media=details, fileHashes=hashes)
+                if caption_review is not None:
+                    result["captionReview"] = caption_review
         except (WorkflowError, render.RenderError) as error:
             result.update(status="failed", error=str(error))
         except Exception:

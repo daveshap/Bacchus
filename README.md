@@ -4,9 +4,9 @@ Bacchus turns an MP3, FLAC, or WAV narration and a creative brief into a reviewe
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.6.1 Windows installer](releases/0.6.1/Bacchus-0.6.1-windows-x64.msi) and its [SHA-256 checksum](releases/0.6.1/Bacchus-0.6.1-windows-x64.sha256). This unsigned preview includes Python and the app's runtime dependencies. The `v0.6.1` tag records the source and installer for this release.
+Download the [Bacchus 0.6.2 Windows installer](releases/0.6.2/Bacchus-0.6.2-windows-x64.msi) and its [SHA-256 checksum](releases/0.6.2/Bacchus-0.6.2-windows-x64.sha256). This unsigned preview includes Python and the app's runtime dependencies. The `v0.6.2` tag records the source and installer for this release.
 
-1. Compare the MSI's SHA-256 with the checksum file using `Get-FileHash -Algorithm SHA256 .\Bacchus-0.6.1-windows-x64.msi` in PowerShell. Run the MSI, then open **Bacchus** from the Start menu. The app opens **Set up Bacchus** in your default browser on first launch.
+1. Compare the MSI's SHA-256 with the checksum file using `Get-FileHash -Algorithm SHA256 .\Bacchus-0.6.2-windows-x64.msi` in PowerShell. Run the MSI, then open **Bacchus** from the Start menu. The app opens **Set up Bacchus** in your default browser on first launch.
 2. Under **Readiness**, choose **Install media tools** if the app reports that its media tools are unavailable. Bacchus downloads and verifies FFmpeg and ffprobe in its own data folder.
 3. For local word cues, choose **Install timing model**. The English Parakeet download is about 460 MiB and needs about 1.1 GiB of free space during installation. To reuse a supported model, expand **Use an existing model folder**, enter its path, and select **Verify and use folder**. You can also import a recording-matched cue sheet in Intake.
 4. Select **Finish setup** to save provider settings, or **Continue offline**. The offline workflow uses the media tools and either a verified local model or a recording-matched cue sheet. In the studio, **Create example** opens a sample with an approved plan so you can try preview, review, and export without a recording or API key.
@@ -67,6 +67,12 @@ Bacchus keeps original recordings, normalized media, plans, review proofs, decis
 **Video encoding** in Settings defaults to **Automatic GPU (CPU fallback)**. Bacchus tests candidates at the delivery format. It tries NVIDIA NVENC, Intel Quick Sync, and AMD AMF on Windows, NVENC and VAAPI on Linux, and VideoToolbox on macOS. Windows can also test a compatible system FFmpeg alongside the managed build. Bacchus falls back to libx264 when hardware encoding is unavailable or fails. Choose **CPU only** to skip hardware tests. The delivery and its receipt identify the actual encoder and any fallback. Scene composition uses the local Pillow renderer.
 
 Bacchus decodes the rendered video and any audio before it marks the delivery complete. It fingerprints the MP4, captions, and receipt and checks the files before reuse or download. **Download MP4** names the downloaded video after the project. In Export, **Check delivery files** refreshes the delivery status. Use **Render a fresh copy** for missing or changed files, **Retry export** after a failed render, or **Rerender video** to make a new verified delivery using the current encoder setting. These actions use the accepted candidate. The most recent intact delivery stays available during a rerender. After an interrupted render, Bacchus clears abandoned render staging folders on startup. For older deliveries, Bacchus checks the MP4 against the original receipt and records initial captions and receipt fingerprints on upgrade.
+
+### Review captions
+
+**Caption review** in **Preview & QC** shows the caption count and any passages that need a closer look. Bacchus builds the UTF-8 SRT directly from approved word timings. Caption breaks are independent of scene and planning cues. The English defaults aim for one or two lines of up to 42 characters, one to six seconds on screen with a seven-second ceiling, and about 17 characters per second. The review calls out cues above 20 characters per second, cues under one second, and other timing or layout exceptions.
+
+Caption review is advisory. Check the flagged passages against the recording, and review speaker changes and meaningful sounds before publishing an accessibility caption track. New narrated deliveries record the caption method and review findings in the receipt. Choose **Rerender video** to generate a new delivery with the updated captions from an already accepted cut.
 
 ## Reuse artwork
 

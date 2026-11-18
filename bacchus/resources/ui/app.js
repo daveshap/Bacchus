@@ -1884,7 +1884,46 @@ function animationProof(proof, busy) {
   </section>`;
 }
 
-function animationChecksPanel(project, records, proof) {
+function captionReviewSummary(review) {
+  const total = `${review.cueCount} ${review.cueCount === 1 ? "cue" : "cues"}`;
+  return review.method === "timed-words-v1" || review.flaggedCount ? `${total} · ${review.flaggedCount} flagged` : total;
+}
+
+function captionTime(value) {
+  const milliseconds = Math.round(value * 1000);
+  const minutes = Math.floor(milliseconds / 60000);
+  const seconds = String(Math.floor(milliseconds / 1000) % 60).padStart(2, "0");
+  return `${minutes}:${seconds}.${String(milliseconds % 1000).padStart(3, "0")}`;
+}
+
+function captionReviewPanel(review, error) {
+  if (!review && !error) return "";
+  const issues = review?.issues ?? [];
+  const hint = review?.method === "timed-words-v1"
+    ? "Review the wording, speaker changes, and meaningful sounds before publishing."
+    : "These captions follow the saved line timings.";
+  return `<section class="panel slim caption-review" aria-labelledby="caption-review-title">
+    <div class="panel-header"><h2 id="caption-review-title">Caption review</h2>
+      ${review ? badge(captionReviewSummary(review), review.flaggedCount ? "warm" : "") : ""}
+    </div>
+    ${error ? `<p class="notice inline">Caption review unavailable. ${escapeHtml(error)}</p>` : `<p class="hint">${hint}</p>`}
+    ${review?.flaggedCount > issues.length ? `<p class="hint">Showing ${escapeHtml(issues.length)} of ${escapeHtml(review.flaggedCount)} flagged cues.</p>` : ""}
+    ${issues.length ? `<details class="timing-panel">
+      <summary>Show flagged cues</summary>
+      <ol class="caption-issues" aria-label="Flagged caption cues">
+        ${issues.map(issue => `<li>
+          <div class="cluster"><strong>Cue ${escapeHtml(issue.cue)}</strong>
+            <span class="proof-range">${captionTime(issue.start)} to ${captionTime(issue.end)}</span>
+          </div>
+          <p class="caption-cue-text">${escapeHtml(issue.text)}</p>
+          <ul class="read-list hint">${issue.messages.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>
+        </li>`).join("")}
+      </ol>
+    </details>` : ""}
+  </section>`;
+}
+
+function animationChecksPanel(project, records, proof, captions) {
   const qc = project.qc;
   const busy = Boolean(project.busy);
   const approved = records.filter(record => record.status === "passed").length;
@@ -1917,30 +1956,31 @@ function animationChecksPanel(project, records, proof) {
             record.status, proof?.id === record.id, "select-animation-proof")).join("")}
         </ul>
         ${proof ? `<div>${button("Full animation preview", "full-animation-preview", { style: "quiet small" })}</div>` : ""}
-      </section>` : ""}</div>`;
+      </section>` : ""}${captions}</div>`;
 }
 
 function reviewView(project) {
+  const captions = captionReviewPanel(project.captionReview, project.captionReviewError);
   if (!project.animationPrepared && project.accepted && project.export?.status === "complete") {
-    return prerequisite("Preview & QC", "Your accepted video is ready to download.", "export", "Open export");
+    return prerequisite("Preview & QC", "Your accepted video is ready to download.", "export", "Open export") + captions;
   }
-  if (!project.plan?.approved) return prerequisite("Preview & QC", "Approve a scene plan to prepare animation.", "plan", "Open scene plan");
-  if (!artworkComplete(project)) return prerequisite("Preview & QC", "Approve the planned artwork uses to prepare animation.", "art", "Open artwork");
-  if (!mixComplete(project)) return prerequisite("Preview & QC", "Review and approve the verified mix to prepare animation.", "composition", "Open composition");
+  if (!project.plan?.approved) return prerequisite("Preview & QC", "Approve a scene plan to prepare animation.", "plan", "Open scene plan") + captions;
+  if (!artworkComplete(project)) return prerequisite("Preview & QC", "Approve the planned artwork uses to prepare animation.", "art", "Open artwork") + captions;
+  if (!mixComplete(project)) return prerequisite("Preview & QC", "Review and approve the verified mix to prepare animation.", "composition", "Open composition") + captions;
   if (!project.animationPrepared) return `
     ${heading("Preview & QC")}
     <section class="panel slim">
       <h2>Prepare animation</h2>
       <p class="hint">Prepare the preview using the approved scene plan, artwork uses, and audio mix.</p>
       <div class="actions">${button("Prepare animation", "prepare-animation", { primary: true, disabled: Boolean(project.busy) })}</div>
-    </section>`;
+    </section>${captions}`;
   const records = project.animationChecks ?? [];
   const proof = currentAnimationReview(project);
   return `
     ${heading("Preview & QC", "Run the animation checks, then review each scene and its cuts before accepting a candidate.")}
     <div class="columns">
       <div class="stack">${animationPlayer(project, proof)}${proof ? animationProof(proof, Boolean(project.busy)) : ""}</div>
-      ${animationChecksPanel(project, records, proof)}
+      ${animationChecksPanel(project, records, proof, captions)}
     </div>`;
 }
 
@@ -1988,6 +2028,10 @@ function deliveryNotices(delivery) {
     ${warnings.length ? `<ul class="notice read-list actions">${warnings.map(warning => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}`;
 }
 
+function deliveryCaptionSummary(delivery) {
+  return delivery?.captionReview ? `<dt>Caption review</dt><dd>${badge(captionReviewSummary(delivery.captionReview), delivery.captionReview.flaggedCount ? "warm" : "")}</dd>` : "";
+}
+
 function previousDelivery(delivery, title) {
   if (delivery?.status !== "complete" || delivery.verification !== "verified") return "";
   return `<section class="panel slim">
@@ -1996,6 +2040,7 @@ function previousDelivery(delivery, title) {
     <dl class="receipt">
       ${delivery.candidateHash ? `<dt>Candidate</dt><dd>${shortHash(delivery.candidateHash)}</dd>` : ""}
       ${delivery.media?.encoder ? `<dt>Video encoder</dt><dd><code>${escapeHtml(delivery.media.encoder)}</code></dd>` : ""}
+      ${deliveryCaptionSummary(delivery)}
     </dl>
     ${deliveryNotices(delivery)}
     ${deliveryDownloads(delivery, title)}
@@ -2033,6 +2078,7 @@ function exportView(project) {
         ${media?.encoder ? `<dt>Video encoder</dt><dd><code>${escapeHtml(media.encoder)}</code></dd>` : ""}
         ${typeof media?.hardwareEncoding === "boolean"
           ? `<dt>Encoding mode</dt><dd>${media.hardwareEncoding ? "Hardware encoding" : "CPU encoding"}</dd>` : ""}
+        ${complete ? deliveryCaptionSummary(output) : ""}
       </dl>
       ${deliveryNotices(output)}
       ${running ? '<p class="hint actions" role="status">Rendering the accepted candidate…</p>' : ""}

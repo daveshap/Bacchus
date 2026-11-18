@@ -199,6 +199,11 @@ code { overflow-wrap: anywhere; }
 .proof-preview-title { margin-bottom: 8px; }
 .proof-preview-title h2 { margin-bottom: 2px; }
 .proof-range { color: var(--muted); font-variant-numeric: tabular-nums; }
+.caption-review .panel-header { margin-bottom: 8px; }
+.caption-review summary { color: var(--accent); }
+.caption-issues { display: grid; gap: 13px; margin: 12px 0 0; padding: 0; list-style: none; }
+.caption-issues > li { min-width: 0; padding: 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--rail); }
+.caption-cue-text { margin: 7px 0; white-space: pre-line; overflow-wrap: anywhere; }
 @media (max-width: 590px) {
   .proof-comparison { grid-template-columns: minmax(0, 1fr); }
   .proof-list { max-height: 36vh; }
