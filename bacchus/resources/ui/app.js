@@ -18,6 +18,8 @@ const state = {
   view: "project",
   settings: null,
   library: null,
+  libraryIssues: [],
+  libraryError: "",
   libraryStyle: "",
   libraryQuery: "",
   libraryId: "",
@@ -33,6 +35,7 @@ const state = {
   newStyleId: "",
   newRecording: null,
   styles: [],
+  stylesError: "",
   styleEditor: null,
   styleProposal: "",
   returnToKickoff: false,
@@ -40,7 +43,12 @@ const state = {
   planDraft: null,
   mixDraft: null,
   timingWord: 1,
+  timingModel: null,
+  timingModelError: "",
+  timingModelPending: false,
+  timingModelQuery: 0,
   timingModelDirectory: "",
+  timingModelPoll: null,
   assetProofId: "",
   animationReviewId: "",
   previewPosition: null,
@@ -130,11 +138,11 @@ function openStage(stage, focus = true) {
   }
 }
 
-async function openStudioView(view, alias = "") {
+async function openStudioView(view, alias = "", styleId = "") {
   state.view = view;
   setMessage();
   if (view === "library") {
-    setLibraryStyle(projectStyleId(state.project) || state.libraryStyle || state.styles[0]?.id || "");
+    setLibraryStyle(styleId || projectStyleId(state.project) || state.libraryStyle || state.styles[0]?.id || "");
     state.libraryAliasPreferred = alias;
     state.libraryAlias = alias || libraryAlias(state.library?.find(asset => asset.id === state.libraryId));
     state.libraryProject = state.project?.id ?? "";
@@ -142,7 +150,11 @@ async function openStudioView(view, alias = "") {
   render();
   content.focus({ preventScroll: true });
   window.scrollTo(0, 0);
-  if (view === "library") await refreshLibrary();
+  if (view === "library") {
+    if (state.stylesError) await refreshStyles();
+    if (!state.libraryStyle && state.styles.length) setLibraryStyle(state.styles[0].id);
+    await refreshLibrary();
+  }
   if (view === "styles") await refreshStyles();
   if (view === "settings" && !state.settings) await refreshSettings();
 }
@@ -182,7 +194,7 @@ function stageStates(project) {
     art: artworkComplete(project),
     composition: mixComplete(project),
     review: Boolean(project?.accepted),
-    export: project?.export?.status === "complete",
+    export: project?.export?.status === "complete" || Boolean(project?.accepted && project?.lastDelivery),
   };
 }
 
@@ -301,6 +313,8 @@ function readinessList(settings) {
   const imagesEnabled = Boolean(settings.useOpenAIImages);
   return [
     readiness("Audio tools", settings.audioAvailable, "Install FFmpeg and ffprobe"),
+    readiness("Local word timings", canDeriveTimings(), state.timingModel?.runtimeAvailable === false ? "Runtime unavailable" :
+      timingModelIsWorking() ? "Installing" : state.timingModel ? "Needs a timing model" : "Awaiting check"),
     readiness("Video export", settings.renderAvailable, "Install FFmpeg and ffprobe"),
     readiness(`Scene planning · ${planner}`, state.config.plannerAvailable, `Needs ${planner} key`, "Configured"),
     readiness("OpenAI image generation", state.config.imageAvailable, imagesEnabled ? "Needs OpenAI key" : "Off",
@@ -324,6 +338,85 @@ function updateReadiness(settings) {
   const actions = content.querySelector("#settings-readiness-actions");
   if (list) list.innerHTML = readinessList(settings);
   if (actions) actions.innerHTML = readinessActions(settings);
+}
+
+function timingModelIsWorking(model = state.timingModel) {
+  return ["downloading", "verifying"].includes(model?.installation?.state);
+}
+
+function canDeriveTimings() {
+  return state.timingModel?.ready === true;
+}
+
+function timingModelStatus() {
+  const model = state.timingModel;
+  const job = model?.installation;
+  const working = timingModelIsWorking(model);
+  const loaded = model !== null;
+  const canInstall = loaded && model.runtimeAvailable !== false && !working && (!model.ready || model.source === "existing");
+  const status = model?.ready ? badge("Verified", "good") : working ? badge("Installing", "warm") :
+    state.timingModelError ? badge("Check failed", "error") : model?.runtimeAvailable === false ? badge("Runtime unavailable", "warm") :
+      loaded ? badge("Model needed", "warm") : badge("Checking");
+  const readyCopy = model?.source === "existing" ? "Using a verified existing installation." : "Using the verified Bacchus installation.";
+  const total = Number(job?.totalBytes);
+  const downloaded = Number(job?.downloadedBytes);
+  const percent = total > 0 ? Math.min(100, Math.floor(100 * downloaded / total)) : null;
+  const progress = job?.state === "downloading" ? (percent === null ? "Downloading the timing model…" : `Downloading the timing model · ${percent}%`) :
+    job?.state === "verifying" ? "Checking the downloaded model files…" : "";
+  const error = state.timingModelError || model?.error || (job?.state === "failed" ? job.error : "");
+  const disabled = state.timingModelPending || state.pending;
+  const actions = [
+    canInstall ? button(job?.state === "failed" ? "Retry model download" : "Install timing model", "install-timing-model",
+      { primary: !model.ready, disabled }) : "",
+    state.timingModelError ? button("Refresh timing model status", "refresh-timing-model", { style: "quiet small", disabled }) : "",
+    model?.existingDirectory ? button("Clear saved model folder", "clear-timing-model-location", { style: "quiet small", disabled }) : "",
+  ].join("");
+  return `<div class="panel-header"><h2>Local word timings</h2>${status}</div>
+    ${model?.ready ? `<p class="hint">${readyCopy}${model.directory ? ` <code class="break-path">${escapeHtml(model.directory)}</code>` : ""}</p>` :
+      '<p class="hint">Bacchus uses Parakeet to derive word timings on this computer. You can also import a timing JSON matched to the recording.</p>'}
+    ${model?.runtimeAvailable === false ? `<p class="hint">${state.config.audioAvailable ?
+      "The local recognition runtime is unavailable in this installation." : "Install the media tools to enable local recognition."}</p>` : ""}
+    ${working ? `<p class="hint" role="status">${progress}</p>
+      <progress class="timing-progress" aria-label="Timing model download"${percent !== null && job.state === "downloading" ? ` value="${percent}" max="100"` : ""}></progress>` : ""}
+    ${state.timingModelPending ? '<p class="hint" role="status">Updating timing model…</p>' : ""}
+    ${error ? `<p class="notice${model?.ready && !state.timingModelError ? "" : " error"} inline">${escapeHtml(error)}</p>` : ""}
+    ${actions ? `<div class="cluster">${actions}</div>` : ""}
+    ${canInstall ? '<p class="hint">The model download is about 482 MB. Bacchus verifies it before use.</p>' : ""}`;
+}
+
+function timingModelCard() {
+  return `<section class="panel stack">
+    <div class="stack" data-timing-model-status>${timingModelStatus()}</div>
+    <details class="timing-panel">
+      <summary>Use an existing model folder</summary>
+      <form class="stack settings-note" data-form="timing-model-location">
+        <div class="field">
+          <label for="timing-model-directory">Parakeet model folder</label>
+          <input id="timing-model-directory" name="directory" value="${escapeHtml(state.timingModelDirectory)}" spellcheck="false" required>
+          <p class="hint">Paste the full folder path. Bacchus verifies the model files and remembers a valid location.</p>
+        </div>
+        <div><button class="button" data-timing-model-verify${state.timingModelPending ? " disabled" : ""}>Verify and use folder</button></div>
+      </form>
+    </details>
+  </section>`;
+}
+
+function updateTimingModel() {
+  if (state.closed) return;
+  const slot = content.querySelector("[data-timing-model-status]");
+  if (slot) {
+    const focused = slot.contains(document.activeElement) ? document.activeElement.dataset.action : null;
+    slot.innerHTML = timingModelStatus();
+    if (focused) slot.querySelector(`[data-action="${focused}"]`)?.focus({ preventScroll: true });
+  }
+  const verify = content.querySelector("[data-timing-model-verify]");
+  if (verify) verify.disabled = state.timingModelPending || state.pending;
+  const readiness = content.querySelector("#settings-readiness");
+  if (readiness) readiness.innerHTML = readinessList(state.settings);
+  const derive = content.querySelector("[data-timing-derive]");
+  if (derive) derive.disabled = !canDeriveTimings() || state.pending || Boolean(state.project?.busy);
+  const hint = content.querySelector("[data-timing-derive-hint]");
+  if (hint) hint.textContent = deriveTimingHint();
 }
 
 function settingsModel(id, label, value) {
@@ -416,6 +509,7 @@ function settingsView() {
           <ul class="readiness" id="settings-readiness">${readinessList(settings)}</ul>
           <div id="settings-readiness-actions">${readinessActions(settings)}</div>
         </section>
+        ${timingModelCard()}
         ${setup ? `<section class="panel">
           <h2>Production stages</h2>
           <ol class="read-list">${workflowOverview.map(step => `<li>${step}</li>`).join("")}</ol>
@@ -428,7 +522,8 @@ function settingsView() {
               <code>${escapeHtml(settings.dataPath)}</code></div>` : ""}
             <div><h3>Shared art library</h3>
               <p class="hint">Approved artwork available for reuse across projects.</p>
-              <code>${escapeHtml(settings.libraryPath)}</code></div>
+              <code>${escapeHtml(settings.libraryPath)}</code>
+              ${settings.libraryMigrationError ? `<p class="notice">${escapeHtml(settings.libraryMigrationError)}</p>` : ""}</div>
           </div>
         </section>
       </div>
@@ -465,7 +560,9 @@ function selectLibraryAsset(asset) {
 
 function libraryRows(matches) {
   if (state.library === null) return '<p class="hint actions">Loading the art library…</p>';
-  if (!state.library.length) return '<p class="hint actions">Artwork appears here after you publish it from a reviewed scene use.</p>';
+  if (!state.library.length) return state.libraryIssues.length || state.libraryError
+    ? '<p class="hint actions">No readable artwork is available in this library.</p>'
+    : '<p class="hint actions">Artwork appears here after you publish it from a reviewed scene use.</p>';
   if (!matches.length) return '<p class="hint actions">No artwork matches that search.</p>';
   return `<ul class="library-list">${matches.map(asset => {
     const latest = asset.versions.find(version => version.version === asset.latestVersion) ?? asset.versions.at(-1);
@@ -488,6 +585,8 @@ function setLibraryStyle(id) {
   if (state.libraryStyle === id) return;
   state.libraryStyle = id;
   state.library = null;
+  state.libraryIssues = [];
+  state.libraryError = "";
   state.libraryId = "";
   state.libraryVersion = null;
   state.libraryQuery = "";
@@ -545,18 +644,23 @@ function libraryInspector() {
 
 function libraryView() {
   const matches = libraryMatches();
-  const scope = styleById(state.libraryStyle);
+  const currentStyle = state.project?.styleSnapshot;
+  const visibleStyles = state.styles.length ? state.styles : currentStyle ? [currentStyle] : [];
+  const scope = visibleStyles.find(style => style.id === state.libraryStyle);
   if (!matches.some(item => item.id === state.libraryId)) selectLibraryAsset(matches[0]);
   return `
     ${heading("Art library", "Find approved artwork and pin a specific version to a project.")}
+    ${styleCatalogNotice()}
     <div class="columns library-columns">
       <section class="panel stack">
         <div class="field"><label for="library-style">Style library</label>
-          <select id="library-style">
-            ${state.styles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.libraryStyle ? " selected" : ""}>${escapeHtml(style.libraryName)} · ${escapeHtml(style.name)}</option>`).join("")}
+          <select id="library-style"${visibleStyles.length ? "" : " disabled"}>
+            ${visibleStyles.length ? "" : '<option>No style libraries loaded</option>'}
+            ${visibleStyles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.libraryStyle ? " selected" : ""}>${escapeHtml(style.libraryName)} · ${escapeHtml(style.name)}</option>`).join("")}
           </select>
           ${scope ? `<p class="hint">${styleAssetCount(scope)}</p>` : ""}
         </div>
+        ${libraryRecovery()}
         <div class="field"><label for="library-search">Search artwork</label>
           <input id="library-search" type="search" value="${escapeHtml(state.libraryQuery)}" placeholder="Search by name, brief, or style">
         </div>
@@ -564,6 +668,22 @@ function libraryView() {
       </section>
       <div id="library-inspector">${libraryInspector()}</div>
     </div>`;
+}
+
+function libraryRecovery() {
+  const error = state.libraryError;
+  const issues = state.libraryIssues;
+  if (!error && !issues.length) return "";
+  return `<div class="notice inline stack">
+    <strong>Library needs attention</strong>
+    ${error ? `<p class="hint">${escapeHtml(error)}</p>` : ""}
+    ${issues.length ? `<p class="hint">Readable artwork remains available. Move damaged metadata aside to clear it from this library and retain a copy for recovery.</p>
+      <ul class="read-list">${issues.map(({ id, message }) => `<li class="stack">
+        <span>${escapeHtml(message)} <code>${escapeHtml(id)}</code></span>
+        <div>${button("Move damaged entry aside", "quarantine-library-entry", { style: "quiet small", name: id })}</div>
+      </li>`).join("")}</ul>` : ""}
+    <div>${button("Refresh this library", "refresh-library", { style: "quiet small" })}</div>
+  </div>`;
 }
 
 function updateLibrarySearch() {
@@ -584,8 +704,25 @@ function styleById(id) {
 }
 
 function styleAssetCount(style) {
-  const count = style.assetCount ?? 0;
+  const count = style.assetCount;
+  if (!Number.isFinite(count)) return "Asset count unavailable";
   return `${count} ${count === 1 ? "asset" : "assets"}`;
+}
+
+function styleCatalogNotice() {
+  return state.stylesError ? `<div class="notice stack">
+    <strong>Style catalog unavailable</strong>
+    <p class="hint">${escapeHtml(state.stylesError)} You can open an existing project from the sidebar.</p>
+    <div>${button("Retry loading styles", "refresh-styles", { style: "quiet small" })}</div>
+  </div>` : "";
+}
+
+function styleLibraryNotice(style) {
+  if (!style?.libraryWarning && !style?.libraryIssueCount) return "";
+  return `<div class="notice inline cluster">
+    <span>${escapeHtml(style.libraryWarning || `${style.libraryIssueCount} damaged library ${style.libraryIssueCount === 1 ? "entry" : "entries"}.`)}</span>
+    ${button("Open library recovery", "open-library-recovery", { style: "quiet small", name: style.id })}
+  </div>`;
 }
 
 function kickoffStyleSummary(style) {
@@ -593,6 +730,7 @@ function kickoffStyleSummary(style) {
   return `<div class="style-summary">
     <p><strong>Version ${escapeHtml(style.revision)}</strong> · ${escapeHtml(style.libraryName)} · ${styleAssetCount(style)}</p>
     ${style.description ? `<p class="hint">${escapeHtml(style.description)}</p>` : ""}
+    ${styleLibraryNotice(style)}
   </div>`;
 }
 
@@ -721,24 +859,27 @@ function styleForm(style) {
 
 function stylesView() {
   return `${heading("Styles", "Set the guide, scene preferences, and approved artwork library for future projects.")}
+    ${styleCatalogNotice()}
     <div class="columns library-columns">
       <section class="panel stack">
         <div class="panel-header"><h2>Available styles</h2>${button("New style", "new-style", { style: "quiet small" })}</div>
         ${state.styles.length ? `<ul class="proof-list" aria-label="Available styles">
           ${state.styles.map(style => `<li><button type="button" class="proof-choice" data-action="select-style"
             data-name="${escapeHtml(style.id)}" aria-pressed="${state.styleEditor?.id === style.id}">
-            <span><strong>${escapeHtml(style.name)}</strong><small>${escapeHtml(style.libraryName)} · ${styleAssetCount(style)}</small></span>
+            <span><strong>${escapeHtml(style.name)}</strong><small>${escapeHtml(style.libraryName)} · ${styleAssetCount(style)}${style.libraryWarning || style.libraryIssueCount ? " · Library needs attention" : ""}</small></span>
             ${badge(`v${style.revision}`)}
           </button></li>`).join("")}
         </ul>` : '<p class="hint">Create a style to make it available at project kickoff.</p>'}
       </section>
-      ${state.styleEditor ? styleForm(state.styleEditor) : '<section class="panel"><p class="hint">Select a style to view its guide and preferences.</p></section>'}
+      ${state.styleEditor ? `<div class="stack">${styleLibraryNotice(styleById(state.styleEditor.id))}${styleForm(state.styleEditor)}</div>` :
+        '<section class="panel"><p class="hint">Select a style to view its guide and preferences.</p></section>'}
     </div>`;
 }
 
 function startView() {
   return `
     ${heading("New project", "Choose a style and add the narration recording here or in Intake.")}
+    ${styleCatalogNotice()}
     <div class="columns">
       <form class="panel" data-form="new-project">
         <div class="stack">
@@ -864,25 +1005,26 @@ function timingImport() {
       <div class="field">
         <label for="timing-file">Word timing file (JSON)</label>
         <input id="timing-file" type="file" name="file" accept=".json,application/json" required>
-        <p class="hint">Use a timing file matched to this recording.</p>
+        <p class="hint">Use a cue sheet with the original recording’s SHA-256, its duration, and a list of words with start and end times in seconds.</p>
       </div>
       <div><button class="button">Import timing file</button></div>
     </form>
   </details>`;
 }
 
+function deriveTimingHint() {
+  if (!state.config?.audioAvailable) return "Install the media tools before deriving word timings.";
+  if (state.timingModel?.runtimeAvailable === false) return "Local recognition is unavailable. Import recording-matched word timings instead.";
+  return canDeriveTimings() ? "Uses the verified Parakeet model on this computer." :
+    "Install a timing model or verify an existing folder to derive word timings here.";
+}
+
 function timingDerive(busy) {
-  const available = state.config.localTimingAvailable !== false;
   return `<details class="timing-import">
     <summary>Derive word timings locally</summary>
     <form class="stack" data-form="derive-timings">
-      <div class="field">
-        <label for="timing-model-directory">Parakeet model folder</label>
-        <input id="timing-model-directory" name="modelDirectory" value="${escapeHtml(state.timingModelDirectory)}" spellcheck="false" required>
-        <p class="hint">Enter the full path to the folder that contains the installed Parakeet model files.</p>
-      </div>
-      ${available ? "" : '<p class="hint">Local derivation requires the Parakeet runtime and media tools. You can import a recording-matched timing file above.</p>'}
-      <div><button class="button"${busy || !available ? " disabled" : ""}>Derive word timings</button></div>
+      <p class="hint" data-timing-derive-hint>${deriveTimingHint()}</p>
+      <div><button class="button" data-timing-derive${busy || !canDeriveTimings() ? " disabled" : ""}>Derive word timings</button></div>
     </form>
   </details>`;
 }
@@ -1010,7 +1152,7 @@ function intakeView(project) {
             <dt>Cue timing</dt><dd>${input.timing === "source-cues" ? "Recording-matched word timings" : "Estimated"}</dd>
             <dt>Input fingerprint</dt><dd>${shortHash(input.hash)}</dd>
           </dl>
-        </section>` : sourceTimings ? timingReview(project, busy) : ""}
+        </section>` : `<div class="stack">${sourceTimings ? timingReview(project, busy) : ""}${timingModelCard()}</div>`}
     </div>`;
 }
 
@@ -1284,6 +1426,7 @@ function artworkView(project) {
   const callsRemaining = Math.max(0, (state.config.maxArtGenerations ?? 0) - (project.artGenerations ?? 0));
   return `
     ${heading("Artwork", "Approve the source images, then review how each image appears in its planned scene.")}
+    ${styleLibraryNotice(styleById(projectStyleId(project)))}
     <div class="columns">
       <section class="panel">
         <div class="panel-header">
@@ -1301,6 +1444,7 @@ function artworkView(project) {
               ${asset?.name ? `<p class="art-copy">${escapeHtml(asset.name)}</p>` : ""}
               ${asset?.libraryVersion ? `<p class="art-copy">Library version ${escapeHtml(asset.libraryVersion)}</p>` : ""}
               ${url ? `<img src="${url}" alt="${escapeHtml(id)}" loading="lazy">` : ""}
+              ${asset?.libraryWarning ? `<p class="hint">Library: ${escapeHtml(asset.libraryWarning)} The project copy is available.</p>` : ""}
               ${asset?.issue ? `<p class="notice error actions">${escapeHtml(asset.issue.reason)}</p>
                 <p class="hint">${required.has(id) ? "Replace the image or update the scene plan to resolve this use." : "Unused in the current scene plan."}</p>` : ""}
             </div>
@@ -1711,18 +1855,62 @@ function exportLink(url, label, primary = false) {
   return href ? `<a class="button${primary ? " primary" : ""}" href="${href}" download>${label}</a>` : "";
 }
 
+function encoderPreference(mode) {
+  return mode === "cpu" ? "CPU only" : "Automatic GPU (CPU fallback)";
+}
+
+function deliveryDownloads(delivery) {
+  return `<div class="actions cluster">
+    ${exportLink(delivery.url, "Download MP4", true)}
+    ${exportLink(delivery.captionsUrl, "Download captions")}
+    ${exportLink(delivery.receiptUrl, "Download receipt")}
+  </div>`;
+}
+
+function deliveryNotices(delivery) {
+  const fallback = delivery?.media?.encoderFallback;
+  const note = delivery?.verificationNote;
+  const warnings = Array.isArray(delivery?.warnings) ? delivery.warnings.filter(item => typeof item === "string") : [];
+  return `${fallback ? `<p class="notice actions"><strong>CPU fallback.</strong> ${escapeHtml(fallback)}</p>` : ""}
+    ${note ? `<p class="hint actions">${escapeHtml(note)}</p>` : ""}
+    ${warnings.length ? `<ul class="notice read-list actions">${warnings.map(warning => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}`;
+}
+
+function previousDelivery(delivery) {
+  if (delivery?.status !== "complete" || delivery.verification !== "verified") return "";
+  return `<section class="panel slim">
+    <div class="panel-header"><h2>Previous delivery</h2>${badge("Verified", "good")}</div>
+    <p class="hint">This verified copy is still available.</p>
+    <dl class="receipt">
+      ${delivery.candidateHash ? `<dt>Candidate</dt><dd>${shortHash(delivery.candidateHash)}</dd>` : ""}
+      ${delivery.media?.encoder ? `<dt>Video encoder</dt><dd><code>${escapeHtml(delivery.media.encoder)}</code></dd>` : ""}
+    </dl>
+    ${deliveryNotices(delivery)}
+    ${deliveryDownloads(delivery)}
+  </section>`;
+}
+
 function exportView(project) {
-  if (!project.accepted) return prerequisite("Export", "Run QC and accept the candidate before exporting a video.", "review", "Open preview & QC");
+  if (!project.accepted) return `<div class="stack">
+    ${prerequisite("Export", "Run QC and accept the candidate before exporting a video.", "review", "Open preview & QC")}
+    ${previousDelivery(project.lastDelivery)}
+  </div>`;
   const output = project.export;
   const status = output?.status;
   const media = output?.media;
   const running = status === "running" || project.busy === "rendering";
+  const complete = status === "complete" && output?.verification === "verified";
+  const invalid = status === "invalid" || output?.verification === "corrupt";
+  const mode = state.settings?.videoEncoder ?? "auto";
+  const differentMode = complete && output.encoderMode && output.encoderMode !== mode;
+  const prior = complete ? null : project.lastDelivery;
   return `
     ${heading("Export", "Render the accepted candidate and download the finished files.")}
-    <section class="panel slim">
+    <div class="stack"><section class="panel slim">
       <div class="panel-header">
         <h2>Video export</h2>
-        ${status === "complete" ? badge("Complete", "good") : running ? badge("Rendering", "warm") : ""}
+        ${complete ? badge("Verified", "good") : invalid ? badge("Files failed verification", "error") :
+          status === "failed" ? badge("Render failed", "error") : running ? badge("Rendering", "warm") : ""}
       </div>
       <dl class="receipt">
         <dt>Candidate</dt><dd>${shortHash(project.qc?.candidateHash)}</dd>
@@ -1734,19 +1922,22 @@ function exportView(project) {
         ${typeof media?.hardwareEncoding === "boolean"
           ? `<dt>Encoding mode</dt><dd>${media.hardwareEncoding ? "Hardware encoding" : "CPU encoding"}</dd>` : ""}
       </dl>
-      ${media?.encoderFallback ? `<p class="notice actions"><strong>CPU fallback.</strong> ${escapeHtml(media.encoderFallback)}</p>` : ""}
+      ${deliveryNotices(output)}
       ${running ? '<p class="hint actions" role="status">Rendering the accepted candidate…</p>' : ""}
       ${status === "failed" ? `<p class="notice error actions">${escapeHtml(output.error || "The render failed.")}</p>` : ""}
+      ${invalid ? `<p class="notice error actions">${escapeHtml(output.integrityError || "Bacchus could not verify the delivery files.")}</p>` : ""}
       ${!state.config.renderAvailable ? mediaSettingsNotice("Set up the media tools to export a video.") : ""}
-      ${status === "complete" ? `<div class="actions cluster">
-        ${exportLink(output.url, "Download MP4", true)}
-        ${exportLink(output.captionsUrl, "Download captions")}
-        ${exportLink(output.receiptUrl, "Download receipt")}
-      </div>` : `<div class="actions">${button(status === "failed" ? "Retry export" : "Render video", "export", {
+      ${complete ? deliveryDownloads(output) : ""}
+      ${running ? "" : `<div class="actions stack">
+        <p class="hint">Next render uses ${encoderPreference(mode)}.${differentMode ? " The encoding setting changed after this delivery." : ""}${complete ? " Rerendering uses the accepted candidate and its existing approvals." : ""}</p>
+        <div class="cluster">${button(complete ? "Rerender video" : invalid ? "Render a fresh copy" : status === "failed" ? "Retry export" : "Render video", complete ? "rerender-export" : "export", {
         primary: true,
-        disabled: running || !state.config.renderAvailable,
-      })}</div>`}
-    </section>`;
+        disabled: !state.config.renderAvailable,
+      })}
+      ${complete ? button("Check delivery files", "check-delivery-files", { style: "quiet" }) : ""}
+      <button class="button quiet" type="button" data-view="settings">Encoding settings</button></div></div>`}
+    </section>
+    ${previousDelivery(prior)}</div>`;
 }
 
 function attachPreview(project) {
@@ -1919,6 +2110,52 @@ function schedulePoll() {
   }, 850);
 }
 
+function scheduleTimingModelPoll() {
+  clearTimeout(state.timingModelPoll);
+  if (!state.closed && timingModelIsWorking()) state.timingModelPoll = setTimeout(refreshTimingModel, 850);
+}
+
+async function refreshTimingModel() {
+  if (state.closed) return;
+  if (!state.timingModelPending) {
+    const query = ++state.timingModelQuery;
+    try {
+      const model = await api("/api/timing-model");
+      if (query !== state.timingModelQuery) return;
+      state.timingModel = model;
+      state.timingModelError = "";
+    } catch (error) {
+      if (query !== state.timingModelQuery) return;
+      state.timingModelError = error.message;
+    }
+    updateTimingModel();
+  }
+  scheduleTimingModelPoll();
+}
+
+async function changeTimingModel(endpoint, payload) {
+  if (state.timingModelPending) return;
+  state.timingModelQuery += 1;
+  clearTimeout(state.timingModelPoll);
+  state.timingModelPending = true;
+  state.timingModelError = "";
+  updateTimingModel();
+  try {
+    state.timingModel = await post(`/api/timing-model/${endpoint}`, payload);
+    if (endpoint === "location") {
+      state.timingModelDirectory = state.timingModel.existingDirectory ?? payload.directory;
+      const input = content.querySelector("#timing-model-directory");
+      if (input) input.value = state.timingModelDirectory;
+    }
+  } catch (error) {
+    state.timingModelError = error.message;
+  } finally {
+    state.timingModelPending = false;
+    updateTimingModel();
+    scheduleTimingModelPoll();
+  }
+}
+
 function beginRequest(busy) {
   state.pending = true;
   content.setAttribute("aria-busy", "true");
@@ -1956,6 +2193,7 @@ async function quitBacchus() {
   }
   if (!state.closed) return;
   clearTimeout(state.poll);
+  clearTimeout(state.timingModelPoll);
   state.stopPreview?.();
   content.querySelectorAll("audio").forEach(audio => audio.pause());
   picker.disabled = true;
@@ -2030,6 +2268,7 @@ async function refreshSettings() {
   } finally {
     finish();
   }
+  refreshTimingModel();
 }
 
 async function installMediaTools(control) {
@@ -2093,13 +2332,14 @@ async function refreshStyles() {
   try {
     const result = await api("/api/styles");
     state.styles = result.styles;
+    state.stylesError = "";
     if (state.view === "styles" && !state.styleEditor && state.styles.length) {
       state.styleEditor = structuredClone(state.styles[0]);
     }
-    if (!state.pending && (state.view === "styles" || state.view === "library" || (state.view === "project" && !state.project))) render();
   } catch (error) {
-    setMessage(error.message, "error");
+    state.stylesError = error.message;
   }
+  if (!state.pending && (state.view === "styles" || state.view === "library" || (state.view === "project" && !state.project))) render();
 }
 
 function captureStyleForm(form) {
@@ -2244,13 +2484,33 @@ async function refreshLibrary() {
     const listing = await api(`/api/library?${query}`);
     if (state.libraryStyle !== styleId) return;
     state.library = listing.assets;
-    if (state.view === "library" && !state.pending) render();
+    state.libraryIssues = listing.issues ?? [];
+    state.libraryError = listing.storageError || "";
   } catch (error) {
     if (state.view === "library" && state.libraryStyle === styleId) {
       state.library ??= [];
-      if (!state.pending) render();
-      setMessage(error.message, "error");
+      state.libraryError = error.message;
     }
+  }
+  if (state.view === "library" && state.libraryStyle === styleId && !state.pending) render();
+}
+
+async function quarantineLibraryEntry(entryId) {
+  const styleId = state.libraryStyle;
+  if (!state.libraryIssues.some(issue => issue.id === entryId)) return;
+  if (!window.confirm("Move this damaged metadata entry out of the active library and retain a recovery copy?")) return;
+  const finish = beginRequest("Moving damaged library metadata aside…");
+  let recovery;
+  try {
+    recovery = await post("/api/library/quarantine", { styleId, entryId });
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    finish();
+  }
+  if (recovery) {
+    await Promise.all([refreshLibrary(), refreshStyles()]);
+    setMessage(`Damaged metadata moved aside. Recovery copy: ${recovery.retainedPath}`, "good");
   }
 }
 
@@ -2520,6 +2780,7 @@ document.addEventListener("play", event => {
 document.addEventListener("input", event => {
   const control = event.target;
   if (control.id === "new-title") state.newTitle = control.value;
+  if (control.id === "timing-model-directory") state.timingModelDirectory = control.value;
   if (control.form?.dataset.form === "style") {
     const color = control.dataset.paletteOverride;
     if (color) control.form.querySelector(`#palette-${color}`).disabled = !control.checked;
@@ -2631,6 +2892,9 @@ document.addEventListener("submit", event => {
     }
     form.querySelectorAll('input[type="password"]').forEach(input => { input.value = ""; });
     saveSettings(payload, !state.settings.completed);
+  } else if (name === "timing-model-location") {
+    const directory = data.get("directory")?.trim();
+    if (directory) changeTimingModel("location", { directory });
   } else if (name === "library-pin") {
     pinArtwork(data);
   } else if (name === "art-issue") {
@@ -2664,10 +2928,9 @@ document.addEventListener("submit", event => {
     }
     createProject(title, style);
   } else if (name === "derive-timings") {
-    const modelDirectory = data.get("modelDirectory").trim();
-    state.timingModelDirectory = modelDirectory;
+    if (!canDeriveTimings()) return;
     if (state.project.transcript && !window.confirm("Replace the current word timings with new timings from the recording?")) return;
-    perform(() => mutate("/timings/derive", { modelDirectory }), {
+    perform(() => mutate("/timings/derive"), {
       busy: "Deriving exact word timings…", success: "Word timings are ready to review.",
     });
   } else if (name === "correct-timing") {
@@ -2799,6 +3062,29 @@ document.addEventListener("click", event => {
     render();
   } else if (action === "return-to-kickoff") {
     returnToNewProject();
+  } else if (action === "open-library-recovery") {
+    openStudioView("library", "", name);
+  } else if (action === "refresh-library") {
+    refreshLibrary();
+  } else if (action === "refresh-styles") {
+    refreshStyles().then(() => {
+      if (state.view === "library" && !state.libraryStyle && state.styles.length) {
+        setLibraryStyle(state.styles[0].id);
+        refreshLibrary();
+      }
+    });
+  } else if (action === "quarantine-library-entry") {
+    quarantineLibraryEntry(name);
+  } else if (action === "install-timing-model") {
+    changeTimingModel("install", {});
+  } else if (action === "clear-timing-model-location") {
+    changeTimingModel("location", { directory: "" });
+  } else if (action === "refresh-timing-model") {
+    refreshTimingModel();
+  } else if (action === "rerender-export") {
+    perform(() => mutate("/export", { rerender: true }), { busy: "Starting a fresh render…" });
+  } else if (action === "check-delivery-files") {
+    perform(() => api(projectPath()), { busy: "Checking the delivery files…" });
   } else if (action === "import-style-guide") {
     importStyleGuide();
   } else if (action === "upload-style-references") {
@@ -2920,22 +3206,27 @@ async function initialize() {
   newProject.disabled = true;
   render();
   try {
-    const [config, listing, settings, styleList] = await Promise.all([
-      api("/api/config"), api("/api/projects"), api("/api/settings"), api("/api/styles"),
+    const [config, listing, settings] = await Promise.all([
+      api("/api/config"), api("/api/projects"), api("/api/settings"),
     ]);
     state.config = config;
     state.projects = listing.projects;
     state.settings = settings;
-    state.styles = styleList.styles;
     if (!settings.completed) state.view = "settings";
     setConnection("online");
     let last = "";
     try { last = localStorage.getItem("bacchus-project") || ""; } catch { /* Browser storage is optional. */ }
     if (state.projects.some(item => item.id === last)) {
-      state.project = await api(`/api/projects/${encodeURIComponent(last)}`);
-      state.stage = nextStage(state.project);
+      try {
+        state.project = await api(`/api/projects/${encodeURIComponent(last)}`);
+        state.stage = nextStage(state.project);
+      } catch (error) {
+        setMessage(`The last project could not be opened. ${error.message}`, "error");
+      }
     }
     render();
+    refreshStyles();
+    refreshTimingModel();
   } catch (error) {
     setConnection("offline");
     content.innerHTML = heading("Studio unavailable", "Open Bacchus again to reconnect.");

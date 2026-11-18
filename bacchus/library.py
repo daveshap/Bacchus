@@ -20,6 +20,8 @@ CONTENT_HASH = re.compile(r"[a-f0-9]{64}")
 SCENE_ALIAS = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SOURCES = {"upload", "generated", "project"}
 VERSION_FIELDS = {"id", "version", "hash", "name", "brief", "style", "source", "createdAt"}
+ASSET_FIELDS = ("id", "name", "brief", "style", "latestVersion")
+SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 class LibraryError(Exception):
@@ -38,6 +40,17 @@ def _atomic_write(path, data):
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _metadata_text(value):
+    return isinstance(value, str) and not SURROGATE.search(value)
+
+
+def _proofs_valid(proofs):
+    return isinstance(proofs, dict) and bool(proofs) and all(
+        isinstance(key, str) and CONTENT_HASH.fullmatch(key) and isinstance(value, str) and CONTENT_HASH.fullmatch(value)
+        for key, value in proofs.items()
+    )
 
 
 class Library:
@@ -90,7 +103,7 @@ class Library:
             if optional:
                 return None
             raise LibraryError("Artwork was not found in the library.", 404) from error
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, RecursionError) as error:
             raise LibraryError("Library artwork metadata could not be read.", 409) from error
         asset = record.get("asset") if isinstance(record, dict) else None
         versions = asset.get("versions") if isinstance(asset, dict) else None
@@ -98,9 +111,11 @@ class Library:
         if (
             not isinstance(record, dict) or record.get("schema") != 1
             or not isinstance(asset, dict) or asset.get("id") != asset_id
-            or not isinstance(origin, dict) or not isinstance(origin.get("alias"), str)
+            or not isinstance(origin, dict) or not _metadata_text(origin.get("alias"))
+            or not isinstance(origin.get("projectId"), str)
             or not isinstance(versions, list) or not versions
-            or not isinstance(asset.get("name"), str) or type(asset.get("latestVersion")) is not int
+            or not all(_metadata_text(asset.get(key)) for key in ("name", "brief", "style"))
+            or type(asset.get("latestVersion")) is not int
         ):
             raise LibraryError("Library artwork metadata needs repair.", 409)
         previous = asset["latestVersion"] + 1
@@ -109,12 +124,25 @@ class Library:
                 not isinstance(version, dict) or set(version) != VERSION_FIELDS or version["id"] != asset_id
                 or type(version["version"]) is not int or not 0 < version["version"] < previous
                 or not isinstance(version["hash"], str) or not CONTENT_HASH.fullmatch(version["hash"])
-                or not isinstance(version["style"], str)
+                or not all(_metadata_text(version[key]) for key in ("name", "brief", "style", "source", "createdAt"))
             ):
                 raise LibraryError("Library artwork version metadata needs repair.", 409)
             previous = version["version"]
         if versions[0]["version"] != asset["latestVersion"]:
             raise LibraryError("Library artwork version metadata needs repair.", 409)
+        qualifications = record.get("qualifications", {})
+        if not isinstance(qualifications, dict) or any(
+            not isinstance(entry, dict) or not _metadata_text(entry.get("projectId")) or not _proofs_valid(entry.get("proofs"))
+            for entry in qualifications.values()
+        ):
+            raise LibraryError("Library artwork qualification metadata needs repair.", 409)
+        issues = record.get("issues", {})
+        if not isinstance(issues, dict) or any(
+            not isinstance(issue, dict) or set(issue) != {"kind", "reason", "at"}
+            or not all(_metadata_text(value) for value in issue.values())
+            for issue in issues.values()
+        ):
+            raise LibraryError("Library artwork issue metadata needs repair.", 409)
         return record
 
     def _blob_path(self, content_hash):
@@ -140,11 +168,7 @@ class Library:
             raise LibraryError("Publishing requires a project and a valid artwork alias.")
         if not all(isinstance(value, str) for value in (name, brief, style, source)) or not name.strip():
             raise LibraryError("Publishing requires an artwork name and text metadata.")
-        if (
-            not isinstance(proofs, dict) or not proofs
-            or not all(isinstance(key, str) and CONTENT_HASH.fullmatch(key) and isinstance(value, str)
-                       and CONTENT_HASH.fullmatch(value) for key, value in proofs.items())
-        ):
+        if not _proofs_valid(proofs):
             raise LibraryError("Publishing requires evidence from passed artwork-use checks.", 409)
         path = Path(path)
         try:
@@ -166,6 +190,8 @@ class Library:
         asset_id = hashlib.sha256(identity).hexdigest()[:32]
         with self._exclusive():
             record = self._read(asset_id, optional=True)
+            if record is None and next(self._safe_path("quarantine").glob(f"{asset_id}-*.json"), None):
+                raise LibraryError("This artwork has quarantined metadata. Restore the entry before publishing to it.", 409)
             if record and record.get("origin") != origin:
                 raise LibraryError("The library artwork identity does not match its origin.", 409)
             asset = record["asset"] if record else {"id": asset_id, "latestVersion": 0, "versions": []}
@@ -203,16 +229,26 @@ class Library:
 
     def copy_by_style(self, libraries):
         """Copy a legacy shared collection without changing its source files."""
-        for path in self._safe_path("entries").glob("*.json"):
-            if not ASSET_ID.fullmatch(path.stem):
+        failures = set()
+        for path in self._safe_path("entries").iterdir():
+            if path.suffix != ".json" or not ASSET_ID.fullmatch(path.stem):
                 continue
-            record = self._read(path.stem)
+            try:
+                record = self._read(path.stem)
+            except LibraryError:
+                failures.add(path.stem)
+                continue
             grouped = {}
             for version in record["asset"]["versions"]:
                 style = version["style"] if version["style"] in libraries else "warm-editorial"
                 grouped.setdefault(style, []).append(version)
             for style, versions in grouped.items():
-                libraries[style]._copy_versions(self, record, versions)
+                try:
+                    libraries[style]._copy_versions(self, record, versions)
+                except LibraryError:
+                    failures.add(path.stem)
+        if failures:
+            raise LibraryError(f"Bacchus could not copy {len(failures)} legacy artwork entries. Their source files were kept.", 409)
 
     def _copy_versions(self, source, record, versions):
         asset_id = record["asset"]["id"]
@@ -259,6 +295,8 @@ class Library:
     def issue(self, asset_id, version):
         with self._exclusive():
             record = self._read(asset_id, optional=True)
+            if record is None and next(self._safe_path("quarantine").glob(f"{asset_id}-*.json"), None):
+                raise LibraryError("The pinned library entry is in quarantine.", 409)
             return record.get("issues", {}).get(str(version)) if record else None
 
     @staticmethod
@@ -267,18 +305,42 @@ class Library:
         return {**version, "qualified": key in record.get("qualifications", {}),
                 "issue": record.get("issues", {}).get(key)}
 
-    def list_assets(self) -> list[dict]:
-        """Return artwork alphabetically, with revisions newest first."""
+    def catalog(self):
+        """Read each entry independently so damaged metadata cannot hide healthy artwork."""
+        entries, issues = [], []
         with self._exclusive():
-            records = [
-                self._read(path.stem)
-                for path in self._safe_path("entries").glob("*.json")
-                if ASSET_ID.fullmatch(path.stem)
-            ]
-            entries = [{**record["asset"], "alias": record["origin"]["alias"],
-                        "versions": [self._view_version(record, item) for item in record["asset"]["versions"]]}
-                       for record in records]
-        return sorted(entries, key=lambda entry: (entry["name"].casefold(), entry["id"]))
+            for path in sorted(self._safe_path("entries").iterdir()):
+                if path.suffix != ".json" or not ASSET_ID.fullmatch(path.stem):
+                    continue
+                try:
+                    record = self._read(path.stem)
+                except LibraryError as error:
+                    issues.append({"id": path.stem, "message": str(error)})
+                    continue
+                entries.append({**{key: record["asset"][key] for key in ASSET_FIELDS}, "alias": record["origin"]["alias"],
+                                "versions": [self._view_version(record, item) for item in record["asset"]["versions"]]})
+        return {"assets": sorted(entries, key=lambda entry: (entry["name"].casefold(), entry["id"])), "issues": issues}
+
+    def list_assets(self) -> list[dict]:
+        return self.catalog()["assets"]
+
+    def quarantine(self, asset_id):
+        with self._exclusive():
+            source = self._entry_path(asset_id)
+            try:
+                self._read(asset_id)
+            except LibraryError as error:
+                if error.status != 409:
+                    raise
+            else:
+                raise LibraryError("Only damaged artwork metadata can be quarantined.", 409)
+            if not source.is_file() or source.is_symlink():
+                raise LibraryError("Bacchus could not safely move this artwork metadata.", 409)
+            folder = self._safe_path("quarantine")
+            folder.mkdir(exist_ok=True)
+            destination = self._safe_path("quarantine", f"{asset_id}-{uuid4().hex}.json")
+            source.replace(destination)
+            return {"id": asset_id, "retainedPath": str(destination)}
 
     def get(self, asset_id, version: int) -> dict:
         with self._exclusive():

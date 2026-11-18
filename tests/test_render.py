@@ -116,6 +116,34 @@ class RendererTests(unittest.TestCase):
         self.assertIn("NVIDIA NVENC", media["encoderFallback"])
 
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
+    def test_decode_rejects_video_payload_corruption_with_intact_container_metadata(self):
+        with TemporaryDirectory(prefix="bacchus-bad-payload-") as temporary:
+            path = Path(temporary) / "video.mp4"
+            subprocess.run([
+                render.media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=24", "-t", "1",
+                "-c:v", "libx264", "-movflags", "+faststart", str(path),
+            ], check=True, capture_output=True)
+            render._decode(path, 24, False)
+            data = bytearray(path.read_bytes())
+            cursor = 0
+            while cursor + 8 < len(data):
+                size = int.from_bytes(data[cursor:cursor + 4], "big")
+                self.assertGreaterEqual(size, 8)
+                if data[cursor + 4:cursor + 8] == b"mdat":
+                    start = cursor + size // 2
+                    end = min(cursor + size, start + 4000)
+                    data[start:end] = bytes(end - start)
+                    break
+                cursor += size
+            else:
+                self.fail("The MP4 did not contain a media payload.")
+            path.write_bytes(data)
+            self.assertEqual(render._inspect(path, 24, False)["frames"], 24)
+            with self.assertRaisesRegex(render.RenderError, "could not be decoded"):
+                render._decode(path, 24, False)
+
+    @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_mix_and_mp4_duck_loop_and_place_sound(self):
         with TemporaryDirectory(prefix="bacchus-sound-test-") as temporary:
             folder = Path(temporary)

@@ -7,13 +7,13 @@ from pathlib import Path
 import subprocess
 
 from . import media_tools
+from .timing_models import MODEL_FILES
 from .timing import TimingError
 
 
 SAMPLE_RATE = 16_000
 WINDOW_SECONDS = 30
 CONTEXT_SECONDS = 2
-MODEL_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
 
 
 def available():

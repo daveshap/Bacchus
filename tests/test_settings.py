@@ -116,6 +116,18 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.Settings(self.root).get()["apiLogPath"], str(directory))
         self.assertEqual(settings.provider_secrets(), ("inherited-key",))
 
+    def test_external_timing_model_folder_survives_restart_and_can_be_cleared(self):
+        directory = self.root / "Parakeet model"
+        setup = settings.Settings(self.root)
+        self.assertEqual(settings.timing_model_directory(), "")
+        with self.assertRaises(settings.SettingsError):
+            setup.save({"timingModelDirectory": "models/parakeet"})
+        setup.save({"timingModelDirectory": str(directory)})
+        restarted = settings.Settings(self.root)
+        self.assertEqual(restarted.get()["timingModelDirectory"], str(directory))
+        restarted.save({"timingModelDirectory": ""})
+        self.assertEqual(settings.Settings(self.root).get()["timingModelDirectory"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

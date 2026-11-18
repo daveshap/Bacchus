@@ -8,12 +8,13 @@ import uuid
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from . import ENGINE_VERSION, api_log, audio, gates, local_timing, planning, providers, render, score, styles, timing, visual_review
+from . import ENGINE_VERSION, api_log, audio, delivery, gates, local_timing, planning, providers, render, score, styles, timing, timing_models, visual_review
 from .library import Library, LibraryError
-from .settings import video_encoder_mode
+from .settings import timing_model_directory, video_encoder_mode
 
 
 MAX_ART_BYTES = 12 * 1024 * 1024
@@ -402,10 +403,9 @@ class Studio:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.timing_models = timing_models.TimingModels(self.root)
         self.styles = styles.StyleCatalog(self.root)
         self.library_root = self.root / "style-libraries"
-        if not self.library_root.resolve().is_relative_to(self.root):
-            raise WorkflowError("Style libraries must stay inside Bacchus data.", 409)
         self.libraries = {}
         legacy_roots = [self.root / "library"]
         if library_root is not None:
@@ -414,24 +414,36 @@ class Studio:
         for existing in dict.fromkeys(legacy_roots):
             try:
                 self._migrate_library(existing)
-            except (LibraryError, OSError) as error:
+            except (LibraryError, WorkflowError, OSError) as error:
                 self.library_migration_error = str(error)
-        self.library = self.library_for("warm-editorial")
         self.mix_lock = threading.Lock()
         self.active_style_drafts = 0
         self.jobs = set()
         self._recover_jobs()
 
+    @property
+    def library(self):
+        return self.library_for("warm-editorial")
+
     def library_for(self, style_id):
         if not isinstance(style_id, str) or len(style_id) > 80 or not ART_ID.fullmatch(style_id):
             raise WorkflowError("Style library was not found.", 404)
         with self.lock:
+            root = self.library_root.resolve()
+            directory = self.library_root / style_id
+            if not root.is_relative_to(self.root) or directory.resolve() != root / style_id:
+                raise WorkflowError("The style library must stay in its own Bacchus data folder.", 409)
             if style_id not in self.libraries:
-                directory = self.library_root / style_id
-                if not directory.resolve().is_relative_to(self.library_root.resolve()):
-                    raise WorkflowError("The style library must stay inside Bacchus data.", 409)
                 self.libraries[style_id] = Library(directory)
             return self.libraries[style_id]
+
+    def library_catalog(self, style_id):
+        try:
+            return {**self.library_for(style_id).catalog(), "storageError": None}
+        except (LibraryError, WorkflowError) as error:
+            return {"assets": [], "issues": [], "storageError": str(error)}
+        except (OSError, RuntimeError):
+            return {"assets": [], "issues": [], "storageError": "This style’s artwork library could not be opened."}
 
     @staticmethod
     def project_style_id(project):
@@ -440,6 +452,8 @@ class Studio:
     def _migrate_library(self, source):
         if not (source / "entries").is_dir():
             return
+        if not self.library_root.resolve().is_relative_to(self.root):
+            raise WorkflowError("Style libraries must stay inside Bacchus data.", 409)
         marker = self.library_root / f".legacy-{digest(str(source).encode('utf-8'))}.json"
         if marker.is_file() or source.is_relative_to(self.library_root):
             return
@@ -450,9 +464,11 @@ class Studio:
         view = {**style, "referenceImages": [{**ref, "url": f"/api/style-references/{ref['sha256']}"}
                                              for ref in style["referenceImages"]]}
         if include_count:
-            library = self.library_for(style["id"])
+            catalog = self.library_catalog(style["id"])
+            view["libraryIssueCount"] = len(catalog["issues"])
+            view["libraryWarning"] = catalog["storageError"]
             view["assetCount"] = sum(any(version["qualified"] and not version["issue"] for version in entry["versions"])
-                                     for entry in library.list_assets())
+                                     for entry in catalog["assets"])
         return view
 
     def _style_reference_bytes(self, project):
@@ -468,6 +484,7 @@ class Studio:
                 project = self._read(path.parent.name)
             except WorkflowError:
                 continue
+            changed = bool(self._catalog_legacy_deliveries(project) or project["busy"])
             if project["busy"]:
                 stage = project["busy"]
                 project["busy"] = None
@@ -480,7 +497,30 @@ class Studio:
                 for name in ("transcriptionRuns", "artRuns"):
                     if project[name] and project[name][-1]["status"] == "running":
                         project[name][-1].update(status="interrupted", finishedAt=now())
+            if changed:
                 self._save(project)
+
+    def _catalog_legacy_deliveries(self, project):
+        if project.get("legacyDeliveriesIndexed"):
+            return False
+        folder = self._folder(project["id"])
+        candidates = delivery.legacy_receipts(folder)
+        if not candidates:
+            return False
+        active = project.get("export") or {}
+        active_key = active.get("candidateHash") if active.get("status") == "complete" and "deliveryId" not in active else None
+        known = {item["deliveryId"]: item for item in project.get("deliveries", [])}
+        for key in candidates:
+            if key in known:
+                continue
+            prior = active if key == active_key else {"candidateHash": key, "status": "complete"}
+            if record := delivery.legacy_record(folder, prior):
+                known[key] = record
+        if active_key in known:
+            project["export"] = known[active_key]
+        project["deliveries"] = sorted(known.values(), key=lambda item: item.get("finishedAt") or "")
+        project["legacyDeliveriesIndexed"] = True
+        return True
 
     def _folder(self, project_id):
         if not PROJECT_ID.fullmatch(project_id):
@@ -546,9 +586,11 @@ class Studio:
         view = deepcopy(project)
         project_id = view["id"]
         base = f"/api/projects/{project_id}"
-        self._apply_library_issues(view)
+        warnings = self._apply_library_issues(view)
         for asset in view["assets"]:
             asset["url"] = f"{base}/media/art/{asset['hash']}"
+            if asset["id"] in warnings:
+                asset["libraryWarning"] = warnings[asset["id"]]
         if view["audio"]:
             view["audio"]["url"] = f"{base}/media/audio/{view['audio']['hash']}"
         mix = view["mix"]
@@ -566,7 +608,7 @@ class Studio:
         view.pop("review")
         for asset in view["assets"]:
             uses = [check for check in view["assetChecks"] if check["assetId"] == asset["id"]]
-            asset["publishEligible"] = bool(uses) and not asset.get("issue") and all(
+            asset["publishEligible"] = bool(uses) and not (asset.get("issue") or asset.get("libraryWarning")) and all(
                 check["status"] == "passed" for check in uses
             )
         view["assetReviewReady"] = (not view["missing"] and bool(project["plan"] and project["plan"]["approved"])) and all(
@@ -591,13 +633,40 @@ class Studio:
         view["artGenerations"] = len(art_runs)
         view["requiresAudio"] = not project["demo"]
         view.pop("approvals")
-        if view["export"] and view["export"]["status"] == "complete":
-            output = view["export"]
-            candidate_hash = output["candidateHash"]
-            output["url"] = f"{base}/media/video/{candidate_hash}"
-            output["captionsUrl"] = f"{base}/media/captions/{candidate_hash}"
-            output["receiptUrl"] = f"{base}/media/receipt/{candidate_hash}"
+        view.pop("deliveries", None)
+        view.pop("legacyDeliveriesIndexed", None)
+        current = self._delivery_view(folder, base, project["export"])
+        view["export"] = current
+        view["lastDelivery"] = current if current and current["status"] == "complete" else None
+        if view["lastDelivery"] is None:
+            for record in reversed(project.get("deliveries", [])):
+                if current and record["deliveryId"] == current.get("deliveryId"):
+                    continue
+                previous = self._delivery_view(folder, base, record)
+                if previous["status"] == "complete":
+                    view["lastDelivery"] = previous
+                    break
         return view
+
+    @staticmethod
+    def _delivery_view(folder, base, record):
+        if record is None:
+            return None
+        output = {key: value for key, value in record.items() if key != "fileHashes"}
+        if output["status"] != "complete":
+            return output
+        output.setdefault("deliveryId", record.get("candidateHash"))
+        try:
+            delivery.verify(folder, record, full=False)
+        except delivery.DeliveryError as error:
+            output.update(status="invalid", verification="corrupt", integrityError=str(error))
+        else:
+            key = record["deliveryId"]
+            output.update(verification="verified", url=f"{base}/media/video/{key}",
+                          captionsUrl=f"{base}/media/captions/{key}", receiptUrl=f"{base}/media/receipt/{key}")
+            if output.get("legacy"):
+                output["verificationNote"] = "The earlier receipt recorded the MP4 hash. Bacchus fingerprinted its captions and receipt on upgrade."
+        return output
 
     def list_projects(self):
         with self.lock:
@@ -681,12 +750,21 @@ class Studio:
         return project
 
     def _apply_library_issues(self, project):
-        library = self.library_for(self.project_style_id(project))
+        warnings = {}
         for asset in project["assets"]:
             if asset.get("libraryId") and not asset.get("issue"):
-                issue = library.issue(asset["libraryId"], asset["libraryVersion"])
+                try:
+                    library = self.library_for(self.project_style_id(project))
+                    issue = library.issue(asset["libraryId"], asset["libraryVersion"])
+                except (LibraryError, WorkflowError) as error:
+                    warnings[asset["id"]] = str(error)
+                    continue
+                except (OSError, RuntimeError):
+                    warnings[asset["id"]] = "Bacchus could not read this artwork’s library record."
+                    continue
                 if issue:
                     asset["issue"] = issue
+        return warnings
 
     @staticmethod
     def _library_contains_pin(library, asset):
@@ -734,6 +812,8 @@ class Studio:
             params = ("reviewed",)
         if action == "mix/preset":
             params = ("preset",)
+        if action == "export" and isinstance(data, dict) and "rerender" in data:
+            params = ("rerender",)
         fields(data, ("revision", *params))
         if action == "plan/generate":
             return self._generate(project_id, data["revision"])
@@ -742,7 +822,10 @@ class Studio:
         if action == "mix/prepare":
             return self._prepare_mix(project_id, data["revision"])
         if action == "export":
-            return self._queue_export(project_id, data["revision"])
+            rerender = data.get("rerender", False)
+            if type(rerender) is not bool:
+                raise WorkflowError("Choose whether to render a new delivery.")
+            return self._queue_export(project_id, data["revision"], rerender=rerender)
         with self.lock:
             project = self._edit(project_id, data["revision"])
             folder = self._folder(project_id)
@@ -1088,7 +1171,7 @@ class Studio:
                                  "audioHash": recording["hash"], "timingHash": content_hash}
 
     def derive_timings(self, project_id, data):
-        fields(data, ("revision", "modelDirectory"))
+        fields(data, ("revision", "modelDirectory") if isinstance(data, dict) and "modelDirectory" in data else ("revision",))
         with self.lock:
             project = self._edit(project_id, data["revision"])
             recording = self._timing_recording(project)
@@ -1098,7 +1181,10 @@ class Studio:
             project["busy"] = "recognizing word cues"
             self._save(project)
         try:
-            result = local_timing.derive(path, data["modelDirectory"])
+            model = data.get("modelDirectory")
+            if "modelDirectory" not in data:
+                model = str(self.timing_models.resolve(timing_model_directory() or None))
+            result = local_timing.derive(path, model)
             if file_digest(path) != recording["hash"]:
                 raise WorkflowError("The narration WAV changed during cue recognition.", 409)
             raw = encoded({"audio": {"sha256": recording["originalHash"]},
@@ -1282,9 +1368,10 @@ class Studio:
             if asset.get("issue"):
                 raise WorkflowError("This version already has an open issue. Replace it with corrected artwork.", 409)
             issue = {"kind": data["kind"], "reason": reason, "at": now()}
-            library = self.library_for(self.project_style_id(project))
-            if self._library_contains_pin(library, asset):
-                library.flag(asset["libraryId"], asset["libraryVersion"], issue)
+            if asset.get("libraryId"):
+                library = self.library_for(self.project_style_id(project))
+                if self._library_contains_pin(library, asset):
+                    library.flag(asset["libraryId"], asset["libraryVersion"], issue)
             asset.update(issue=issue, approved=False)
             project.setdefault("assetIssues", []).append({**issue, "id": asset_id, "hash": asset["hash"]})
             reset_candidate(project)
@@ -1307,8 +1394,8 @@ class Studio:
         narration = project["input"]
         wanted = asset_terms(f"{project['title']} {narration['intention']} {narration['script']}")
         ranked = []
-        library = self.library_for(self.project_style_id(project))
-        for entry in library.list_assets():
+        style_id = self.project_style_id(project)
+        for entry in self.library_catalog(style_id)["assets"]:
             if entry["id"] in excludes or entry["id"] in pinned_entries:
                 continue
             terms = asset_terms(f"{entry['alias']} {Path(entry['name']).stem} {entry['brief']}")
@@ -1324,6 +1411,10 @@ class Studio:
         for _, _, version in ranked:
             if version["hash"] not in seen_hashes:
                 seen_hashes.add(version["hash"])
+                try:
+                    self.library_for(style_id).blob(version["hash"])
+                except (LibraryError, WorkflowError):
+                    continue
                 reusable.append(version)
                 if len(reusable) == limit:
                     break
@@ -1588,7 +1679,7 @@ class Studio:
             self._require_prepared(project, folder, verify=False)
         return render.preview(project, folder, time)
 
-    def _queue_export(self, project_id, revision):
+    def _queue_export(self, project_id, revision, *, rerender=False):
         with self.lock:
             project = self._edit(project_id, revision)
             folder = self._folder(project_id)
@@ -1596,86 +1687,104 @@ class Studio:
             key = digest(encoded(record))
             if not project["accepted"] or project["accepted"]["hash"] != key:
                 raise WorkflowError("Accept the current candidate before exporting.", 409)
-            if project["export"] and project["export"]["status"] == "complete":
+            previous = project["export"] or {}
+            encoder_mode = video_encoder_mode()
+            if (not rerender and previous.get("status") == "complete" and previous.get("candidateHash") == key
+                    and previous.get("encoderMode") == encoder_mode):
                 try:
-                    self.media(project_id, "video", key)
-                    self.media(project_id, "captions", key)
-                    self.media(project_id, "receipt", key)
-                    return self._view(project)
-                except WorkflowError:
+                    delivery.verify(folder, previous)
+                except delivery.DeliveryError:
                     pass
+                else:
+                    return self._view(project)
             self._require_prepared(project, folder)
             self._require_animation_review(project, folder, record)
             if not render.render_available():
                 raise WorkflowError("FFmpeg and ffprobe must be installed and on PATH.", 409)
             snapshot = deepcopy(project)
-            encoder_mode = video_encoder_mode()
+            delivery_id = digest(uuid.uuid4().bytes)
             project["busy"] = "rendering"
-            project["export"] = {"status": "running", "candidateHash": key, "startedAt": now()}
+            project["export"] = {"status": "running", "candidateHash": key, "deliveryId": delivery_id,
+                                 "encoderMode": encoder_mode, "startedAt": now()}
             self._save(project)
             job = threading.Thread(
-                target=self._export, args=(snapshot, folder, key, record, encoder_mode),
+                target=self._export, args=(snapshot, folder, key, record, encoder_mode, delivery_id),
                 name=f"render-{project_id[:8]}",
             )
             self.jobs.add(job)
             job.start()
             return self._view(project)
 
-    def _export(self, snapshot, folder, key, record, encoder_mode):
+    def _export(self, snapshot, folder, key, record, encoder_mode, delivery_id):
         output_dir = folder / "exports"
-        temporary = output_dir / f".{uuid.uuid4().hex}.mp4"
         result = {}
         try:
             output_dir.mkdir(exist_ok=True)
-            details = render.export_video(snapshot, folder, temporary,
-                                          approved_mix=record["mix"]["rendered"], encoder_mode=encoder_mode)
-            self._apply_library_issues(snapshot)
-            if candidate(snapshot, folder) != record:
-                raise WorkflowError("An input changed while the candidate was rendering.", 409)
-            self._require_review(snapshot, folder, "assets")
-            self._require_animation_review(snapshot, folder, record)
-            receipt = {
-                "candidateHash": key, "candidate": record, "accepted": snapshot["accepted"],
-                "qc": snapshot["qc"], "media": details, "videoHash": file_digest(temporary),
-                "captionsTiming": snapshot["input"].get("timing", "estimated"), "createdAt": now(),
-                "review": {
-                    scope: {check["id"]: {**check, **snapshot["review"][scope][check["id"]]}
-                            for check in gates.checks(snapshot, scope)}
-                    for scope in ("assets", "animation")
-                },
-            }
-            receipt["libraryArtwork"] = {
-                asset["id"]: {"id": asset["libraryId"], "version": asset["libraryVersion"]}
-                for asset in snapshot["assets"] if "libraryId" in asset and asset["id"] in record["artwork"]
-            }
-            write_file(output_dir / f"{key}.srt", subtitles(snapshot).encode("utf-8"))
-            write_json(output_dir / f"{key}.json", receipt)
-            temporary.replace(output_dir / f"{key}.mp4")
-            result.update(status="complete", media=details)
+            with TemporaryDirectory(prefix=".bacchus-delivery-", dir=output_dir) as work:
+                bundle = Path(work) / "bundle"
+                bundle.mkdir()
+                paths = delivery.bundle_paths(bundle)
+                details = render.export_video(snapshot, folder, paths["video"],
+                                              approved_mix=record["mix"]["rendered"], encoder_mode=encoder_mode)
+                self._apply_library_issues(snapshot)
+                if candidate(snapshot, folder) != record:
+                    raise WorkflowError("An input changed while the candidate was rendering.", 409)
+                self._require_review(snapshot, folder, "assets")
+                self._require_animation_review(snapshot, folder, record)
+                write_file(paths["captions"], subtitles(snapshot).encode("utf-8"))
+                hashes = {kind: delivery.file_hash(paths[kind]) for kind in ("video", "captions")}
+                receipt = {
+                    "candidateHash": key, "deliveryId": delivery_id, "candidate": record,
+                    "accepted": snapshot["accepted"], "qc": snapshot["qc"], "media": details,
+                    "videoHash": hashes["video"], "captionsHash": hashes["captions"],
+                    "captionsTiming": snapshot["input"].get("timing", "estimated"), "createdAt": now(),
+                    "review": {
+                        scope: {check["id"]: {**check, **snapshot["review"][scope][check["id"]]}
+                                for check in gates.checks(snapshot, scope)}
+                        for scope in ("assets", "animation")
+                    },
+                }
+                receipt["libraryArtwork"] = {
+                    asset["id"]: {"id": asset["libraryId"], "version": asset["libraryVersion"]}
+                    for asset in snapshot["assets"] if "libraryId" in asset and asset["id"] in record["artwork"]
+                }
+                write_json(paths["receipt"], receipt)
+                hashes["receipt"] = delivery.file_hash(paths["receipt"])
+                bundle.rename(output_dir / delivery_id)
+                result.update(status="complete", media=details, fileHashes=hashes)
         except (WorkflowError, render.RenderError) as error:
             result.update(status="failed", error=str(error))
         except Exception:
             result.update(status="failed", error="Bacchus could not finish writing the export.")
         finally:
-            temporary.unlink(missing_ok=True)
             with self.lock:
                 self.jobs.discard(threading.current_thread())
                 project = self._read(snapshot["id"])
                 project["busy"] = None
                 project["export"].update(result, finishedAt=now())
+                if result.get("status") == "complete":
+                    project.setdefault("deliveries", []).append(project["export"])
                 self._save(project)
 
     def media(self, project_id, kind, key):
         if not DIGEST.fullmatch(key):
             raise WorkflowError("Media not found.", 404)
         folder = self._folder(project_id)
-        extensions = {"art": ("assets", ".png", "image/png"), "audio": ("audio", ".wav", "audio/wav"),
-                      "video": ("exports", ".mp4", "video/mp4"), "captions": ("exports", ".srt", "text/plain; charset=utf-8"),
-                      "receipt": ("exports", ".json", "application/json")}
+        if kind in delivery.FILES:
+            project = self._read(project_id)
+            for record in reversed(project.get("deliveries", [])):
+                if record["deliveryId"] == key:
+                    try:
+                        paths = delivery.verify(folder, record)
+                    except delivery.DeliveryError as error:
+                        raise WorkflowError(str(error), 409) from error
+                    return paths[kind], delivery.FILES[kind][1]
+            raise WorkflowError("Delivery not found.", 404)
+        extensions = {"art": ("assets", ".png", "image/png"), "audio": ("audio", ".wav", "audio/wav")}
         if kind not in extensions:
             raise WorkflowError("Media not found.", 404)
         sub_dir, suffix, content_type = extensions[kind]
         path = folder / sub_dir / (key + suffix)
-        if not path.is_file() or (sub_dir == "exports" and not (path.parent / f"{key}.mp4").is_file()):
+        if not path.is_file():
             raise WorkflowError("Media not found.", 404)
         return path, content_type

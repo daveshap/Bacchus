@@ -116,7 +116,7 @@ def check_styles(url):
         raise RuntimeError("The project did not retain its selected revision and guide preferences.")
     for scope, name in ((style_id, saved["libraryName"]), ("warm-editorial", "Warm Editorial Artwork")):
         library = json.loads(request(url, f"/api/library?styleId={scope}"))
-        if library != {"assets": [], "styleId": scope, "libraryName": name}:
+        if library != {"assets": [], "issues": [], "storageError": None, "styleId": scope, "libraryName": name}:
             raise RuntimeError("An empty project did not have its own named style library.")
     return project
 
@@ -149,7 +149,7 @@ def check_style_mix(url, project):
         raise RuntimeError("Approving a plan did not apply the pinned style's speech-only mix preference.")
 
 
-def run_export(url, project, custom_style_id):
+def run_export(url, root, project, custom_style_id):
     route = f"/api/projects/{project['id']}"
 
     def action(name, **data):
@@ -189,6 +189,7 @@ def run_export(url, project, custom_style_id):
     published_ids = {entry["id"] for entry in warm["assets"]}
     if published_ids != {published["libraryId"]} or custom["assets"]:
         raise RuntimeError("The published demo artwork did not stay in its Warm Editorial library.")
+    check_library_isolation(url, root, project, published["libraryId"])
     project = action("animation/prepare")
     if not request(url, f"{route}/preview?time=0.5").startswith(b"\x89PNG"):
         raise RuntimeError("The prepared example lacked a renderer preview.")
@@ -205,6 +206,8 @@ def run_export(url, project, custom_style_id):
         project = json.loads(request(url, route))
         export = project["export"]
         if export["status"] == "complete":
+            if export.get("verification") != "verified":
+                raise RuntimeError("The completed delivery did not report file verification.")
             if request(url, export["url"])[4:8] != b"ftyp":
                 raise RuntimeError("Export downloaded but lacked an MP4 file header.")
             receipt = json.loads(request(url, export["receiptUrl"]))
@@ -224,11 +227,57 @@ def run_export(url, project, custom_style_id):
                     check["status"] != "passed" or not check["proofHash"] for check in checks.values()
                 ):
                     raise RuntimeError(f"The exported receipt did not bind the passed {scope} proofs.")
-            return media["encoder"]
+            return project
         if export["status"] == "failed":
             raise RuntimeError(export["error"])
         time.sleep(0.25)
     raise RuntimeError("The example export exceeded its time limit.")
+
+
+def check_library_isolation(url, root, project, healthy_id):
+    damaged_id = "f" * 32
+    directory = root / "style-libraries" / "warm-editorial" / "entries"
+    damaged = directory / f"{damaged_id}.json"
+    damaged.write_bytes(b"broken library metadata")
+    styles = json.loads(request(url, "/api/styles"))["styles"]
+    warm = next(style for style in styles if style["id"] == "warm-editorial")
+    if warm["assetCount"] != 1 or warm["libraryIssueCount"] != 1:
+        raise RuntimeError("A damaged entry hid usable artwork from the style picker.")
+    catalog = json.loads(request(url, "/api/library?styleId=warm-editorial"))
+    if [asset["id"] for asset in catalog["assets"]] != [healthy_id] or [issue["id"] for issue in catalog["issues"]] != [damaged_id]:
+        raise RuntimeError("The library failed to isolate its damaged entry.")
+    request(url, f"/api/projects/{project['id']}")
+    recovery = json.loads(request(url, "/api/library/quarantine", {"styleId": "warm-editorial", "entryId": damaged_id}))
+    if damaged.exists() or Path(recovery["retainedPath"]).read_bytes() != b"broken library metadata":
+        raise RuntimeError("Quarantine did not preserve the damaged entry’s original bytes.")
+
+
+def check_export_recovery(url, root, project):
+    route = f"/api/projects/{project['id']}"
+    previous = project["export"]
+    old_video = root / project["id"] / "exports" / previous["deliveryId"] / "video.mp4"
+    old_video.write_bytes(b"broken")
+    project = json.loads(request(url, route))
+    if project["export"]["status"] != "invalid" or project["export"].get("url") or project.get("lastDelivery"):
+        raise RuntimeError("A replaced MP4 was still presented as a completed delivery.")
+    expect_conflict(url, previous["url"])
+    request(url, "/api/settings", {"videoEncoder": "cpu"})
+    request(url, f"{route}/export", {"revision": project["revision"], "rerender": True})
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        repaired = json.loads(request(url, route))["export"]
+        if repaired["status"] == "failed":
+            raise RuntimeError(repaired["error"])
+        if repaired["status"] == "complete":
+            if (
+                repaired["verification"] != "verified" or repaired["deliveryId"] == previous["deliveryId"]
+                or repaired["candidateHash"] != previous["candidateHash"] or repaired["media"]["encoder"] != "libx264"
+                or request(url, repaired["url"])[4:8] != b"ftyp" or old_video.read_bytes() != b"broken"
+            ):
+                raise RuntimeError("A repaired render did not keep its approval, use the requested encoder, and create a new MP4.")
+            return
+        time.sleep(0.25)
+    raise RuntimeError("The repair render exceeded its time limit.")
 
 
 def verify_checks(url, route, project, scope, key):
@@ -286,6 +335,7 @@ def main():
         for variable in PROVIDER_SETTINGS:
             env.pop(variable, None)
         env.pop("BACCHUS_VIDEO_ENCODER", None)
+        env.pop("BACCHUS_TIMING_MODEL_DIR", None)
         process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             url = endpoint(root, process)
@@ -299,13 +349,18 @@ def main():
                     raise RuntimeError(f"Missing embedded asset {asset}.")
             check_provider_defaults(url)
             check_audit_directory(url, root)
+            timing = json.loads(request(url, "/api/timing-model"))
+            if timing["ready"] or timing["existingDirectory"] or not timing["installation"]:
+                raise RuntimeError("Fresh setup did not report that Parakeet model files were needed.")
             custom = check_styles(url)
             project = json.loads(request(url, "/api/demo", {}))
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")
             if args.render:
                 check_style_mix(url, custom)
-                print(f"Verified default export encoder: {run_export(url, project, custom['styleSnapshot']['id'])}")
+                project = run_export(url, root, project, custom["styleSnapshot"]["id"])
+                print(f"Verified default export encoder: {project['export']['media']['encoder']}")
+                check_export_recovery(url, root, project)
             request(url, "/api/quit", {})
             if process.wait(15) != 0:
                 raise RuntimeError("Bacchus returned a failure status after quitting.")

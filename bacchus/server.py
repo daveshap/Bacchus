@@ -8,10 +8,10 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, styles, visual_review
+from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, styles, timing_models, visual_review
 from .library import LibraryError
 from .runtime import APP_VERSION
-from .settings import SettingsError
+from .settings import SettingsError, directory_preference, provider_secrets, timing_model_directory
 from .workflow import (
     MAX_ART_BYTES, MAX_ART_GENERATIONS, MAX_AUDIO_BYTES, MAX_DURATION, MAX_EFFECTS,
     MAX_FX_BYTES, MAX_FX_DURATION, MAX_TRANSCRIPTIONS, PACK_PIN, STYLES, WorkflowError, fields,
@@ -56,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._post(target.path, parse_qs(target.query))
             else:
                 self._get(target.path, parse_qs(target.query))
-        except (WorkflowError, LibraryError, SettingsError, styles.StyleError) as error:
+        except (WorkflowError, LibraryError, SettingsError, styles.StyleError, timing_models.TimingModelError) as error:
             self._json({"error": str(error)}, error.status)
         except render.RenderError as error:
             self._json({"error": str(error)}, 422)
@@ -96,7 +96,7 @@ class Handler(BaseHTTPRequestHandler):
                 "styleDraftAvailable": studio.styles.available(),
                 "maxStyleReferenceBytes": styles.MAX_REFERENCE_BYTES,
                 "maxStyleReferenceImages": styles.MAX_REFERENCE_IMAGES,
-                "localTimingAvailable": local_timing.available(),
+                "localTimingAvailable": self._timing_status()["ready"],
                 "styles": [{"id": style, "name": label} for style, label in STYLES.items()],
                 "maxEffects": MAX_EFFECTS, "maxFxDuration": MAX_FX_DURATION,
                 "maxArtGenerations": MAX_ART_GENERATIONS, "maxTranscriptionCalls": MAX_TRANSCRIPTIONS,
@@ -112,6 +112,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             self._json(self._settings_view(self.server.settings.get()))
             return
+        if path == "/api/timing-model":
+            self._json(self._timing_status())
+            return
         if path == "/api/styles":
             self._json({"styles": [studio.style_view(style) for style in studio.styles.list_styles()]})
             return
@@ -126,11 +129,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/library":
             style_id = query.get("styleId", ["warm-editorial"])[0]
             style = studio.styles.get(style_id)
-            assets = studio.library_for(style_id).list_assets()
-            for entry in assets:
+            catalog = studio.library_catalog(style_id)
+            for entry in catalog["assets"]:
                 for version in entry["versions"]:
                     version["url"] = f"/api/library/media/{version['hash']}?styleId={style_id}"
-            self._json({"assets": assets, "styleId": style_id, "libraryName": style["libraryName"]})
+            self._json({**catalog, "styleId": style_id, "libraryName": style["libraryName"]})
             return
         if path.startswith("/api/library/media/"):
             style_id = query.get("styleId", ["warm-editorial"])[0]
@@ -177,10 +180,40 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/settings":
             data = self._body()
+            if isinstance(data, dict) and "timingModelDirectory" in data:
+                raise SettingsError("Select and verify Parakeet folders in the timing model settings.")
             with studio.lock:
                 if studio.providers_in_use():
                     raise WorkflowError("Wait for the active AI request before changing provider settings.", 409)
                 self._json(self._settings_view(self.server.settings.save(data)))
+            return
+        if path == "/api/timing-model/install":
+            fields(self._body(), ())
+            if not local_timing.available():
+                raise WorkflowError("The local Parakeet runtime is missing from this Bacchus installation.", 409)
+            with studio.lock:
+                if self.server.closing:
+                    raise WorkflowError("Bacchus is closing.", 409)
+                studio.timing_models.start_install()
+            self._json(self._timing_status(), 202)
+            return
+        if path == "/api/timing-model/location":
+            data = self._body()
+            fields(data, ("directory",))
+            directory = directory_preference("timingModelDirectory", data["directory"], provider_secrets())
+            if directory:
+                directory = str(studio.timing_models.validate_existing(directory))
+            with studio.lock:
+                if self.server.closing:
+                    raise WorkflowError("Bacchus is closing.", 409)
+                self.server.settings.save({"timingModelDirectory": directory})
+            self._json(self._timing_status())
+            return
+        if path == "/api/library/quarantine":
+            data = self._body()
+            fields(data, ("styleId", "entryId"))
+            studio.styles.get(data["styleId"])
+            self._json(studio.library_for(data["styleId"]).quarantine(data["entryId"]))
             return
         if path == "/api/style-references":
             reference = studio.styles.store_reference(query.get("name", ["reference.png"])[0],
@@ -281,10 +314,18 @@ class Handler(BaseHTTPRequestHandler):
             "mediaInstallAvailable": media_tools.can_install() and not render_available,
         }
 
+    def _timing_status(self):
+        directory = timing_model_directory()
+        status = self.server.studio.timing_models.status(directory or None)
+        runtime_available = local_timing.available()
+        return {**status, "ready": status["ready"] and runtime_available, "runtimeAvailable": runtime_available,
+                "existingDirectory": directory}
+
     def _quit(self):
         studio = self.server.studio
         with studio.lock:
-            if studio.jobs or studio.providers_in_use() or media_tools.INSTALL_LOCK.locked():
+            if (studio.jobs or studio.providers_in_use() or media_tools.INSTALL_LOCK.locked()
+                    or studio.timing_models.installing):
                 raise WorkflowError("Wait for the current operation to finish before quitting.", 409)
             self.server.closing = True
         try:
@@ -362,7 +403,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
             remaining = last - first + 1
-            self._headers(206 if requested else 200, mime, remaining, cache="private, max-age=3600")
+            cache = "no-store" if kind in ("video", "captions", "receipt") else "private, max-age=3600"
+            self._headers(206 if requested else 200, mime, remaining, cache=cache)
             if kind in ("audio", "video"):
                 self.send_header("Accept-Ranges", "bytes")
             if requested:

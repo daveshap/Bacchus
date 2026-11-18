@@ -25,6 +25,11 @@ _MODELS = {
 _PROVIDER_KEY = "BACCHUS_PLANNER_PROVIDER"
 _API_LOG_DIR = "BACCHUS_API_LOG_DIR"
 _VIDEO_ENCODER = "BACCHUS_VIDEO_ENCODER"
+_TIMING_MODEL_DIR = "BACCHUS_TIMING_MODEL_DIR"
+_DIRECTORIES = {
+    "apiLogDirectory": (_API_LOG_DIR, "API logs"),
+    "timingModelDirectory": (_TIMING_MODEL_DIR, "the Parakeet model"),
+}
 _ENCODER_MODES = ("auto", "cpu")
 _PROVIDERS = ("anthropic", "openai")
 _FEATURES = {
@@ -40,7 +45,7 @@ _KEYS = {
     "OPENAI_API_KEY": ("openAIKey", "clearOpenAIKey", "OpenAI"),
     "ANTHROPIC_API_KEY": ("anthropicKey", "clearAnthropicKey", "Anthropic"),
 }
-_PREFERENCES = {"plannerProvider", "apiLogDirectory", "videoEncoder", *_BOOLEANS, *_MODELS}
+_PREFERENCES = {"plannerProvider", "videoEncoder", *_DIRECTORIES, *_BOOLEANS, *_MODELS}
 _INPUT_FIELDS = _PREFERENCES | {field for key, clear, _ in _KEYS.values() for field in (key, clear)}
 _MODEL_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _LOCK = RLock()
@@ -67,26 +72,34 @@ def provider_secrets():
         return tuple(value for name in _KEYS if (value := provider_value(name, "").strip()))
 
 
-def _log_directory(value, secrets):
-    if not isinstance(value, str):
-        raise SettingsError("Enter an absolute folder path for API logs.")
-    value = value.strip()
-    if not value:
+def directory_preference(field, value, secrets):
+    _, label = _DIRECTORIES[field]
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return ""
+        if (
+            len(value) <= 2048 and not any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in value)
+            and not any(secret and secret in value for secret in secrets) and Path(value).is_absolute()
+        ):
+            return str(Path(value))
+    raise SettingsError(f"Enter an absolute folder path for {label}, or leave it empty to use the default.")
+
+
+def _saved_directory(field):
+    try:
+        return directory_preference(field, provider_value(_DIRECTORIES[field][0], ""), provider_secrets())
+    except SettingsError:
         return ""
-    if (
-        len(value) > 2048 or any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in value)
-        or any(secret and secret in value for secret in secrets) or not Path(value).is_absolute()
-    ):
-        raise SettingsError("Enter an absolute folder path for API logs, or leave it empty to use the default.")
-    return str(Path(value))
 
 
 def api_log_directory():
-    try:
-        selected = _log_directory(provider_value(_API_LOG_DIR, ""), provider_secrets())
-    except SettingsError:
-        selected = ""
+    selected = _saved_directory("apiLogDirectory")
     return Path(selected) if selected else api_log.default_directory()
+
+
+def timing_model_directory():
+    return _saved_directory("timingModelDirectory")
 
 
 def _normalize_planner(value):
@@ -162,9 +175,9 @@ class Settings:
         if stored.get("videoEncoder") in _ENCODER_MODES:
             preferences["videoEncoder"] = stored["videoEncoder"]
         secrets = {provider_value(name) for name in _KEYS}
-        if "apiLogDirectory" in stored:
+        for field in _DIRECTORIES.keys() & stored.keys():
             with suppress(SettingsError):
-                preferences["apiLogDirectory"] = _log_directory(stored["apiLogDirectory"], secrets)
+                preferences[field] = directory_preference(field, stored[field], secrets)
         for field, (_, default) in _MODELS.items():
             if field in stored:
                 try:
@@ -177,8 +190,9 @@ class Settings:
     def _apply_preferences(preferences):
         if "plannerProvider" in preferences:
             _OVERRIDES[_PROVIDER_KEY] = preferences["plannerProvider"]
-        if "apiLogDirectory" in preferences:
-            _OVERRIDES[_API_LOG_DIR] = preferences["apiLogDirectory"]
+        for field, (name, _) in _DIRECTORIES.items():
+            if field in preferences:
+                _OVERRIDES[name] = preferences[field]
         if "videoEncoder" in preferences:
             _OVERRIDES[_VIDEO_ENCODER] = preferences["videoEncoder"]
         for field, name in _FEATURES.items():
@@ -200,9 +214,8 @@ class Settings:
                 "hasAnthropicKey": bool(provider_value("ANTHROPIC_API_KEY", "").strip()),
             }
             secrets = {provider_value(name) for name in _KEYS}
-            with suppress(SettingsError):
-                view["apiLogDirectory"] = _log_directory(provider_value(_API_LOG_DIR, ""), secrets)
-            view.setdefault("apiLogDirectory", "")
+            for field in _DIRECTORIES:
+                view[field] = _saved_directory(field)
             view["apiLogPath"] = str(api_log_directory())
             for field, (name, default) in _MODELS.items():
                 try:
@@ -231,9 +244,9 @@ class Settings:
                     raise SettingsError("Choose automatic hardware encoding or CPU only.")
                 preferences["videoEncoder"] = data["videoEncoder"]
             secrets = {provider_value(name) for name in _KEYS} | set(credentials.values())
-            if "apiLogDirectory" in data or "apiLogDirectory" in preferences:
-                value = data.get("apiLogDirectory", preferences.get("apiLogDirectory"))
-                preferences["apiLogDirectory"] = _log_directory(value, secrets)
+            for field in _DIRECTORIES.keys() & (data.keys() | preferences.keys()):
+                value = data.get(field, preferences.get(field))
+                preferences[field] = directory_preference(field, value, secrets)
             for field, (_, default) in _MODELS.items():
                 if field in data:
                     preferences[field] = _model(data[field], default, secrets)

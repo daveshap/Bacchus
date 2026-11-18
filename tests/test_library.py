@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -64,6 +65,42 @@ class LibraryTests(unittest.TestCase):
             self.library.get(version["id"], 2)
         self.assertEqual(error.exception.status, 404)
         self.assertEqual(self.library.list_assets()[0]["latestVersion"], 1)
+
+    def test_catalog_isolates_damaged_metadata_and_quarantine_retains_it(self):
+        bad = self.publish("tan")
+        good = self.publish("red", project_id="other-project")
+        damaged = self.root / "entries" / f"{bad['id']}.json"
+        record = json.loads(damaged.read_bytes())
+        record["issues"] = ["malformed"]
+        original = json.dumps(record).encode()
+        damaged.write_bytes(original)
+
+        catalog = self.library.catalog()
+        self.assertEqual([entry["id"] for entry in catalog["assets"]], [good["id"]])
+        self.assertEqual([issue["id"] for issue in catalog["issues"]], [bad["id"]])
+        with self.assertRaisesRegex(LibraryError, "Only damaged"):
+            self.library.quarantine(good["id"])
+
+        staged = self.library.quarantine(bad["id"])
+        self.assertFalse(damaged.exists())
+        self.assertEqual(Path(staged["retainedPath"]).read_bytes(), original)
+        self.assertTrue(self.library.blob(bad["hash"]).is_file())
+        self.assertEqual(self.library.catalog(), {"assets": catalog["assets"], "issues": []})
+        with self.assertRaisesRegex(LibraryError, "in quarantine"):
+            self.library.issue(bad["id"], 1)
+        with self.assertRaisesRegex(LibraryError, "quarantined metadata"):
+            self.publish("tan")
+
+    def test_migration_continues_after_a_damaged_entry(self):
+        bad = self.publish("tan")
+        good = self.publish("red", project_id="other-project")
+        damaged = self.root / "entries" / f"{bad['id']}.json"
+        damaged.write_bytes(b"broken")
+        target = Library(self.root.parent / "warm-editorial")
+        with self.assertRaisesRegex(LibraryError, "could not copy 1"):
+            self.library.copy_by_style({"warm-editorial": target})
+        self.assertEqual(target.get(good["id"], 1), good)
+        self.assertEqual(damaged.read_bytes(), b"broken")
 
     def test_migration_separates_historical_versions_and_preserves_issue_records(self):
         first = self.publish("tan")

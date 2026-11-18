@@ -462,6 +462,18 @@ class StudioWorkflowTests(unittest.TestCase):
         path, _ = self.studio.media(second["id"], "art", pinned["hash"])
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), original["hash"])
 
+        library = self.studio.library
+        metadata = library.root / "entries" / f"{original['libraryId']}.json"
+        metadata.write_bytes(b"broken library entry")
+        reopened = Studio(self.studio.root)
+        damaged = reopened.get(second["id"])["assets"][0]
+        self.assertIn("libraryWarning", damaged)
+        self.assertEqual(damaged["hash"], original["hash"])
+        self.assertTrue(path.is_file())
+        reopened.library.quarantine(original["libraryId"])
+        quarantined = reopened.get(second["id"])["assets"][0]
+        self.assertIn("in quarantine", quarantined["libraryWarning"])
+
     def test_art_only_joins_library_after_passed_use_and_flagged_version_stays_quarantined(self):
         self.plan_with_art()
         self.assertNotIn("libraryId", self.project["assets"][0])
@@ -596,17 +608,23 @@ class StudioWorkflowTests(unittest.TestCase):
         result = self.studio.get(self.project_id)["export"]
         self.assertEqual(result["status"], "complete", result.get("error"))
         key = result["candidateHash"]
-        video, _ = self.studio.media(self.project_id, "video", key)
-        captions, _ = self.studio.media(self.project_id, "captions", key)
-        receipt, _ = self.studio.media(self.project_id, "receipt", key)
+        delivery_id = result["deliveryId"]
+        self.assertEqual(result["verification"], "verified")
+        video, _ = self.studio.media(self.project_id, "video", delivery_id)
+        captions, _ = self.studio.media(self.project_id, "captions", delivery_id)
+        receipt, _ = self.studio.media(self.project_id, "receipt", delivery_id)
         file = json.loads(receipt.read_bytes())
         self.assertEqual(file["candidateHash"], key)
+        self.assertEqual(file["deliveryId"], delivery_id)
         self.assertEqual(file["accepted"]["hash"], key)
         self.assertEqual(file["videoHash"], hashlib.sha256(video.read_bytes()).hexdigest())
+        self.assertEqual(file["captionsHash"], hashlib.sha256(captions.read_bytes()).hexdigest())
         self.assertEqual(file["candidate"]["mix"]["rendered"]["sha256"], self.project["mix"]["rendered"]["sha256"])
         self.assertEqual(file["captionsTiming"], "source-cues")
         self.assertEqual(file["media"]["audio"], "aac")
         self.assertEqual(file["media"]["frames"], 48)
+        self.assertEqual(file["media"]["decodedFrames"], 48)
+        self.assertTrue(file["media"]["decodedAudio"])
         self.assertAlmostEqual(file["media"]["duration"], 2, places=2)
         self.assertEqual(len(file["review"]["assets"]), 1)
         self.assertEqual(len(file["review"]["animation"]), 2)
@@ -619,6 +637,111 @@ class StudioWorkflowTests(unittest.TestCase):
         captions_text = captions.read_text(encoding="utf-8")
         self.assertIn("00:00:00,000 --> 00:00:01,000", captions_text)
         self.assertIn("The cup catches the light.", captions_text)
+
+    @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
+    def test_delivery_rerender_and_repair_keep_acceptance_and_last_good_files(self):
+        self.plan_with_art()
+        self.approve_dry_mix()
+        self.prepare_animation()
+        self.pass_animation_review()
+
+        def current():
+            self.wait_for_jobs()
+            self.project = self.studio.get(self.project_id)
+            self.assertEqual(self.project["export"]["status"], "complete", self.project["export"])
+            return self.project["export"]
+
+        with patch("bacchus.workflow.video_encoder_mode", return_value="cpu"):
+            self.change("export")
+            previous = current()
+            self.assertEqual(self.change("export")["export"]["deliveryId"], previous["deliveryId"])
+        with patch("bacchus.workflow.video_encoder_mode", return_value="auto"):
+            started = self.change("export")
+            self.assertEqual(started["lastDelivery"]["deliveryId"], previous["deliveryId"])
+            second = current()
+            self.assertNotEqual(second["deliveryId"], previous["deliveryId"])
+            self.assertEqual(second["encoderMode"], "auto")
+            self.assertEqual(second["candidateHash"], previous["candidateHash"])
+
+            with patch.object(render, "export_video", side_effect=render.RenderError("Test encoder failure.")):
+                self.change("export", rerender=True)
+                self.wait_for_jobs()
+            self.project = self.studio.get(self.project_id)
+            self.assertEqual(self.project["export"]["status"], "failed")
+            self.assertEqual(self.project["lastDelivery"]["deliveryId"], second["deliveryId"])
+
+            self.change("export")
+            third = current()
+            captions, _ = self.studio.media(self.project_id, "captions", third["deliveryId"])
+            captions.write_bytes(b"invalid captions")
+            self.project = self.studio.get(self.project_id)
+            self.assertEqual(self.project["export"]["status"], "invalid")
+            self.assertEqual(self.project["export"]["verification"], "corrupt")
+            self.assertIn("captions", self.project["export"]["integrityError"])
+            self.assertNotIn("url", self.project["export"])
+            self.assertEqual(self.project["lastDelivery"]["deliveryId"], second["deliveryId"])
+            with self.assertRaisesRegex(WorkflowError, "captions"):
+                self.studio.media(self.project_id, "video", third["deliveryId"])
+            self.change("export")
+            repaired = current()
+        self.assertNotEqual(repaired["deliveryId"], third["deliveryId"])
+        self.assertEqual(repaired["candidateHash"], previous["candidateHash"])
+        self.assertTrue(self.project["accepted"])
+        self.studio.media(self.project_id, "video", previous["deliveryId"])
+
+    def test_completed_legacy_delivery_keeps_its_link_and_verifies_against_adopted_hashes(self):
+        project = self.studio._read(self.project_id)
+        exports = self.studio._folder(self.project_id) / "exports"
+        exports.mkdir()
+        key = "1" * 64
+        previous_mp4 = b"Bytes from the earlier verified delivery."
+        (exports / f"{key}.mp4").write_bytes(previous_mp4)
+        (exports / f"{key}.srt").write_bytes(b"Caption bytes")
+        receipt = {"videoHash": hashlib.sha256(previous_mp4).hexdigest(), "candidateHash": key, "accepted": {"hash": key}}
+        (exports / f"{key}.json").write_text(json.dumps(receipt), encoding="utf-8")
+        project["export"] = {"status": "complete", "candidateHash": key, "media": {"encoderMode": "auto"}}
+        self.studio._save(project)
+
+        reopened = Studio(self.studio.root, self.studio.library_root)
+        adopted = reopened.get(self.project_id)["export"]
+        self.assertEqual(adopted["deliveryId"], key)
+        self.assertEqual(adopted["verification"], "verified")
+        self.assertIn("on upgrade", adopted["verificationNote"])
+        self.assertTrue(adopted["url"].endswith(key))
+        video, _ = reopened.media(self.project_id, "video", key)
+        self.assertEqual(video.read_bytes(), previous_mp4)
+        (exports / f"{key}.srt").write_bytes(b"Edited caption bytes")
+        self.assertEqual(reopened.get(self.project_id)["export"]["status"], "invalid")
+        with self.assertRaisesRegex(WorkflowError, "captions"):
+            reopened.media(self.project_id, "video", key)
+
+    def test_legacy_catalog_restores_historical_links_and_last_valid_delivery(self):
+        project = self.studio._read(self.project_id)
+        exports = self.studio._folder(self.project_id) / "exports"
+        exports.mkdir()
+        oldest, previous, broken = "a" * 64, "2" * 64, "3" * 64
+        for index, key in enumerate((oldest, previous, broken), start=1):
+            mp4 = f"Legacy delivery {index}".encode()
+            (exports / f"{key}.mp4").write_bytes(mp4 if key != broken else b"wrong bytes")
+            (exports / f"{key}.srt").write_bytes(b"Caption bytes")
+            receipt = {"candidateHash": key, "accepted": {"hash": key},
+                       "videoHash": hashlib.sha256(mp4).hexdigest(), "createdAt": f"2026-11-{index:02d}T00:00:00+00:00"}
+            (exports / f"{key}.json").write_text(json.dumps(receipt), encoding="utf-8")
+        project["export"] = {"status": "failed", "candidateHash": broken, "error": "Render interrupted."}
+        self.studio._save(project)
+
+        reopened = Studio(self.studio.root, self.studio.library_root)
+        view = reopened.get(self.project_id)
+        self.assertEqual(view["export"]["status"], "failed")
+        self.assertEqual(view["lastDelivery"]["deliveryId"], previous)
+        self.assertTrue(view["lastDelivery"]["url"].endswith(previous))
+        for key in (oldest, previous):
+            reopened.media(self.project_id, "video", key)
+        with self.assertRaisesRegex(WorkflowError, "Delivery not found"):
+            reopened.media(self.project_id, "video", broken)
+
+        reopened_again = Studio(self.studio.root, self.studio.library_root)
+        self.assertEqual(reopened_again.get(self.project_id)["revision"], view["revision"])
 
 
 if __name__ == "__main__":

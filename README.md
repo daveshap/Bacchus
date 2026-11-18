@@ -4,11 +4,12 @@ Bacchus turns recorded narration and a creative brief into a reviewed MP4. AI ca
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.5.0 Windows installer](releases/0.5.0/Bacchus-0.5.0-windows-x64.msi) and its [SHA-256 checksum](releases/0.5.0/Bacchus-0.5.0-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.5.0` tag records the source and installer for this release.
+Download the [Bacchus 0.5.1 Windows installer](releases/0.5.1/Bacchus-0.5.1-windows-x64.msi) and its [SHA-256 checksum](releases/0.5.1/Bacchus-0.5.1-windows-x64.sha256). This unsigned preview includes Python and the app's runtime dependencies. The `v0.5.1` tag records the source and installer for this release.
 
 1. Run the MSI, then open **Bacchus** from the Start menu. Bacchus opens its local workspace in your default browser.
 2. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data.
-3. To close the app, select **Quit Bacchus** in the sidebar. Quit Bacchus before running a newer installer or uninstalling it from **Settings → Apps** in Windows.
+3. For local word cues, choose **Install timing model** in Setup. Bacchus downloads and verifies the 460 MiB English Parakeet model archive in its own data folder. If you already have a compatible model, choose **Verify and use folder** to save its location. You can also import measured cues for a recording.
+4. To close the app, select **Quit Bacchus** in the sidebar. Quit Bacchus before running a newer installer or uninstalling it from **Settings → Apps** in Windows.
 
 Manual workflows work offline once the media tools are available. Add provider keys in Bacchus **Settings** to use AI features.
 
@@ -54,11 +55,15 @@ Logs can contain prompts, transcripts, artwork, and audio. Bacchus omits authent
 
 The offline example starts with an approved visual plan. The local starter plan, image import and built-in soundtracks work offline. The app supports recordings up to 30 minutes, with three visual treatments and title, editorial, illustration, and layered layouts. Export is 720p at 24 fps.
 
-The recording is the timing authority. Import a `timing.json` with its `audio.sha256`, `duration`, and `words` with `text`, `start`, and `end`. For audio-only intake, extract the Parakeet TDT model separately and select the folder containing `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx` and `tokens.txt`. The local recognizer derives individual timestamps from the waveform. Review its draft against the audio before locking it. Older project exports remain downloadable. Resume a project with recording-bound cues by reopening its intake. [Parakeet TDT model instructions](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html#sherpa-onnx-nemo-parakeet-tdt-0-6b-v2-int8-english)
+The recording is the timing authority. Import a `timing.json` with its `audio.sha256`, `duration`, and `words` with `text`, `start`, and `end`. For audio-only intake, install the model from Setup, Settings, or Intake. An existing Parakeet TDT v2 INT8 folder must contain `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx` and `tokens.txt`. Bacchus verifies those files and remembers the folder. The local recognizer derives individual timestamps from the waveform without a provider key. Review its draft against the audio before locking it. Resume a project with recording-bound cues by reopening its intake. [Parakeet TDT model instructions](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html#sherpa-onnx-nemo-parakeet-tdt-0-6b-v2-int8-english)
+
+The ONNX files are the sherpa-onnx INT8 conversion of NVIDIA Parakeet TDT 0.6B v2, licensed under CC BY 4.0. [NVIDIA model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) · [CC BY 4.0 license](https://creativecommons.org/licenses/by/4.0/)
 
 Bacchus keeps original recordings, normalized media, plans, review proofs, decisions, and exports in its data folder. Proofs bind to the artwork version and the scene inputs they show. Changes to the cut invalidate its acceptance. Checks that still show the current inputs can carry forward.
 
 **Video encoding** in Settings defaults to **Automatic GPU**. Bacchus tries a real encode with the delivery format. It prefers NVIDIA NVENC where available, can use Intel Quick Sync or AMD AMF on Windows, VAAPI on Linux, and VideoToolbox on macOS. On Windows it can use a compatible FFmpeg on PATH if the app-managed FFmpeg cannot initialize the GPU. It falls back to libx264 if a hardware encoder is unavailable or fails the export checks. Choose **CPU only** to skip hardware tests. Export and its receipt identify the actual encoder and any fallback. Scene composition uses the local Pillow renderer.
+
+Bacchus decodes the rendered video and audio before it marks the delivery complete. It fingerprints the MP4, captions, and receipt and checks the files before reuse or download. If any file is missing or changed, use **Rerender video** to write a new delivery from the accepted candidate using the current encoder setting. The most recent intact delivery stays available during a rerender. For older deliveries, Bacchus checks the MP4 against the original receipt and fingerprints the captions and receipt on upgrade.
 
 ## Reuse artwork
 
@@ -67,6 +72,8 @@ After an uploaded or generated version passes its planned uses, publish it to th
 The planner receives a shortlist of up to 20 checked library images from the selected style, ranked by title, filename, and art description. If it selects a match, Bacchus pins that version when it saves the plan. Review those selections along with the scene plan. Requalify versions saved by older releases by passing their current uses and publishing that evidence.
 
 Style guides and reference images live in `styles/` and artwork versions in `style-libraries/` inside the Bacchus data folder. On upgrade, Bacchus copies versions from its old shared library into the original styles. Use `--library <folder>` to copy from a previously configured external Bacchus library. The legacy files stay available at their original locations. Keep each style's `entries/` and `blobs/` together for backup. The library's JSON files store version histories, and the blobs are PNGs named by content hash.
+
+The library shows damaged metadata alongside usable artwork. Use **Move damaged entry aside** to retain the original record under that library’s `quarantine/` folder for repair. If you have an intact backup of the entry, restore it under `entries/` with Bacchus closed. Existing projects can open and use their own copies of previously pinned images. Bacchus checks each image’s fingerprint when you reuse it from the library.
 
 ## Build and test
 

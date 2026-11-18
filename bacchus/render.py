@@ -664,10 +664,38 @@ def _frame_count(duration):
     return math.ceil(duration * FPS)
 
 
+def _decode(output, frame_count, has_audio):
+    """Decode the complete delivery and require an output frame for every authored frame."""
+    streams = ["-map", "0:v:0"]
+    if has_audio:
+        streams += ["-map", "0:a:0"]
+    command = [
+        media_tools.command("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-nostats",
+        "-xerror", "-err_detect", "explode", "-i", str(output), *streams,
+        "-fps_mode", "passthrough", "-abort_on", "empty_output_stream", "-progress", "pipe:1", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True,
+                                timeout=max(45, min(3600, frame_count / FPS * 3 + 45)),
+                                **media_tools.process_options())
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or "").strip().splitlines()
+        suffix = f" {details[0][:240]}" if details else ""
+        raise RenderError(f"The delivered video or soundtrack could not be decoded.{suffix}") from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RenderError("FFmpeg could not finish decoding the delivery.") from error
+    frames = re.findall(r"^frame=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+    if not frames or int(frames[-1]) != frame_count or "progress=end" not in result.stdout.splitlines():
+        raise RenderError("The decoded delivery does not contain every approved picture frame.")
+
+
 def _encode_verified(project, folder, composition, frame_count, scratch, encoder, approved_mix):
     output, has_audio = _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix)
     try:
-        return output, _inspect(output, frame_count, has_audio)
+        media = _inspect(output, frame_count, has_audio)
+        _decode(output, frame_count, has_audio)
+        media.update(decodedFrames=frame_count, decodedAudio=has_audio)
+        return output, media
     except RenderError as error:
         raise _EncodingFailure(str(error)) from error
 
