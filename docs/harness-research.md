@@ -2,6 +2,8 @@
 
 Research checked November 18, 2026.
 
+This note records the design rationale. In v0.6.0, Bacchus keeps project revisions and approvals in local JSON, fingerprints media and proof files, and gates render on the accepted candidate. The model can propose scenes, draft a style guide, or advise on a proof. The application validates proposals and the operator records review decisions. See the [README](../README.md) for the current workflow and the [source workflow comparison](source-workflows.md) for how it relates to earlier production methods.
+
 Bacchus should give the model responsibility for creative decisions within a production stage. For planning, that includes where a scene begins, what it should communicate, which available assets and motions serve it, and where new artwork is needed. The application owns stage transitions, project state, approvals, and execution. This gives the model room to solve a creative problem while making the consequences of a decision inspectable and controllable. Anthropic's workflow guide describes this division as predefined orchestration around model calls. Thoughtworks' November Radar identifies the harness around a model as a maintained, versioned engineering asset. [Building effective AI agents](https://www.anthropic.com/research/building-effective-agents) · [Technology Radar, vol. 35](https://www.thoughtworks.com/content/dam/thoughtworks/documents/radar/2026/11/tr_technology_radar_vol_35_en.pdf)
 
 ## Design the handoff before adding autonomy
