@@ -4,7 +4,7 @@ Bacchus turns recorded narration and a creative brief into a reviewed MP4. AI ca
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.5.1 Windows installer](releases/0.5.1/Bacchus-0.5.1-windows-x64.msi) and its [SHA-256 checksum](releases/0.5.1/Bacchus-0.5.1-windows-x64.sha256). This unsigned preview includes Python and the app's runtime dependencies. The `v0.5.1` tag records the source and installer for this release.
+Download the [Bacchus 0.6.0 Windows installer](releases/0.6.0/Bacchus-0.6.0-windows-x64.msi) and its [SHA-256 checksum](releases/0.6.0/Bacchus-0.6.0-windows-x64.sha256). This unsigned preview includes Python and the app's runtime dependencies. The `v0.6.0` tag records the source and installer for this release.
 
 1. Run the MSI, then open **Bacchus** from the Start menu. Bacchus opens its local workspace in your default browser.
 2. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data.
@@ -74,6 +74,12 @@ The planner receives a shortlist of up to 20 checked library images from the sel
 Style guides and reference images live in `styles/` and artwork versions in `style-libraries/` inside the Bacchus data folder. On upgrade, Bacchus copies versions from its old shared library into the original styles. Use `--library <folder>` to copy from a previously configured external Bacchus library. The legacy files stay available at their original locations. Keep each style's `entries/` and `blobs/` together for backup. The library's JSON files store version histories, and the blobs are PNGs named by content hash.
 
 The library shows damaged metadata alongside usable artwork. Use **Move damaged entry aside** to retain the original record under that library’s `quarantine/` folder for repair. If you have an intact backup of the entry, restore it under `entries/` with Bacchus closed. Existing projects can open and use their own copies of previously pinned images. Bacchus checks each image’s fingerprint when you reuse it from the library.
+
+### Back up and share a style
+
+On **Styles**, select a saved style and choose **Export style and library**. The ZIP contains the current `style.md`, older guide revisions, reference images, artwork versions, and a `manifest.json` with style settings, fingerprints, and artwork issue records. Move damaged entries aside before exporting the healthy library. Projects and quarantined files stay in Bacchus data.
+
+Choose **Import style and library** on another Bacchus installation and open the ZIP. Bacchus checks the archive and creates a separate, editable style and library. Archives support up to 512 MiB of contents. The imported style is available for new projects. Each project reviews and approves its own planned artwork uses.
 
 ## Build and test
 

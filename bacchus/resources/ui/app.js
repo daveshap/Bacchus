@@ -11,6 +11,7 @@ const stages = [
 
 const audioFormats = ".mp3,.flac,.wav,audio/mpeg,audio/flac,audio/wav,audio/x-flac,audio/x-wav";
 const newStyleOption = "__new_style__";
+const maxStyleArchiveBytes = 512 * 1024 * 1024;
 
 const state = {
   config: null,
@@ -38,6 +39,7 @@ const state = {
   stylesError: "",
   styleEditor: null,
   styleProposal: "",
+  interruptedStyleDrafts: new Map(),
   returnToKickoff: false,
   inputDraft: null,
   planDraft: null,
@@ -82,14 +84,20 @@ function projectPath(suffix = "", project = state.project) {
   return `/api/projects/${encodeURIComponent(project.id)}${suffix}`;
 }
 
-async function api(path, options) {
+async function apiResponse(path, options) {
   const response = await fetch(path, { cache: "no-store", ...options });
-  const data = await response.json().catch(() => null);
   if (!response.ok) {
+    const data = await response.json().catch(() => null);
     const error = new Error(data?.error || `The studio returned HTTP ${response.status}.`);
     error.status = response.status;
     throw error;
   }
+  return response;
+}
+
+async function api(path, options) {
+  const response = await apiResponse(path, options);
+  const data = await response.json().catch(() => null);
   if (!data) throw new Error("The studio returned an unreadable response.");
   return data;
 }
@@ -656,10 +664,11 @@ function libraryView() {
         <div class="field"><label for="library-style">Style library</label>
           <select id="library-style"${visibleStyles.length ? "" : " disabled"}>
             ${visibleStyles.length ? "" : '<option>No style libraries loaded</option>'}
-            ${visibleStyles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.libraryStyle ? " selected" : ""}>${escapeHtml(style.libraryName)} · ${escapeHtml(style.name)}</option>`).join("")}
+            ${visibleStyles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.libraryStyle ? " selected" : ""}>${escapeHtml(style.libraryName)} · ${escapeHtml(styleChoiceLabel(style))}</option>`).join("")}
           </select>
           ${scope ? `<p class="hint">${styleAssetCount(scope)}</p>` : ""}
         </div>
+        ${scope ? `<div>${button("Export style and library", "export-style-archive", { style: "quiet small", name: scope.id })}</div>` : ""}
         ${libraryRecovery()}
         <div class="field"><label for="library-search">Search artwork</label>
           <input id="library-search" type="search" value="${escapeHtml(state.libraryQuery)}" placeholder="Search by name, brief, or style">
@@ -701,6 +710,12 @@ function projectStyleId(project) {
 
 function styleById(id) {
   return state.styles.find(style => style.id === id);
+}
+
+function styleChoiceLabel(style) {
+  const duplicate = state.styles.some(entry => entry.id !== style.id && entry.name === style.name);
+  if (!duplicate) return style.name;
+  return `${style.name} · ${style.builtIn ? "Built-in" : style.id.slice(-8)}`;
 }
 
 function styleAssetCount(style) {
@@ -802,7 +817,11 @@ function styleForm(style) {
       <h2>${existing ? escapeHtml(style.name) : "Create a style"}</h2>
       ${existing ? badge(`Active version ${style.revision}`, "good") : ""}
     </div>
-    ${existing ? '<p class="hint">Saving a new version makes it available to future projects. Existing projects keep their pinned versions.</p>' : ""}
+    ${existing ? `<div class="cluster">
+      ${button("Export style and library", "export-style-archive", { style: "quiet", name: style.id })}
+      <span class="hint">ZIP includes saved style versions, references, and artwork history.</span>
+    </div>
+    <p class="hint">Saving a new version makes it available to future projects. Existing projects keep their pinned versions.</p>` : ""}
     <div class="field"><label for="style-name">Style name</label>
       <input id="style-name" name="name" value="${escapeHtml(style.name)}" maxlength="120" required>
     </div>
@@ -852,9 +871,24 @@ function styleForm(style) {
     </section>` : ""}
     <div class="cluster">
       <button class="button primary">${existing ? "Save as new version" : "Create style"}</button>
+      ${state.returnToKickoff && existing ? button("Use this saved style", "return-to-kickoff", { style: "quiet", name: style.id }) : ""}
       ${state.returnToKickoff ? button("Back to new project", "return-to-kickoff", { style: "quiet" }) : ""}
     </div>
   </form>`;
+}
+
+function styleArchiveImport() {
+  return `<details class="timing-panel">
+    <summary>Import style and library</summary>
+    <form class="stack settings-note" data-form="style-archive">
+      <p class="hint">Import a Bacchus ZIP to create a separate style and artwork library.</p>
+      <div class="field">
+        <label for="style-archive-file">Style and library ZIP</label>
+        <input id="style-archive-file" name="archive" type="file" accept=".zip,application/zip,application/x-zip-compressed" required>
+      </div>
+      <div><button class="button">Import ZIP</button></div>
+    </form>
+  </details>`;
 }
 
 function stylesView() {
@@ -862,11 +896,12 @@ function stylesView() {
     ${styleCatalogNotice()}
     <div class="columns library-columns">
       <section class="panel stack">
-        <div class="panel-header"><h2>Available styles</h2>${button("New style", "new-style", { style: "quiet small" })}</div>
+        <div class="panel-header"><h2>Available styles</h2>${button(state.interruptedStyleDrafts.has("") ? "Resume new style" : "New style", "new-style", { style: "quiet small" })}</div>
+        ${styleArchiveImport()}
         ${state.styles.length ? `<ul class="proof-list" aria-label="Available styles">
           ${state.styles.map(style => `<li><button type="button" class="proof-choice" data-action="select-style"
             data-name="${escapeHtml(style.id)}" aria-pressed="${state.styleEditor?.id === style.id}">
-            <span><strong>${escapeHtml(style.name)}</strong><small>${escapeHtml(style.libraryName)} · ${styleAssetCount(style)}${style.libraryWarning || style.libraryIssueCount ? " · Library needs attention" : ""}</small></span>
+            <span><strong>${escapeHtml(styleChoiceLabel(style))}</strong><small>${escapeHtml(style.libraryName)} · ${styleAssetCount(style)}${style.libraryWarning || style.libraryIssueCount ? " · Library needs attention" : ""}</small></span>
             ${badge(`v${style.revision}`)}
           </button></li>`).join("")}
         </ul>` : '<p class="hint">Create a style to make it available at project kickoff.</p>'}
@@ -891,7 +926,7 @@ function startView() {
             <label for="new-style-id">Project style</label>
             <select id="new-style-id" name="styleId" required>
               <option value="">Choose a style</option>
-              ${state.styles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.newStyleId ? " selected" : ""}>${escapeHtml(style.name)}</option>`).join("")}
+              ${state.styles.map(style => `<option value="${escapeHtml(style.id)}"${style.id === state.newStyleId ? " selected" : ""}>${escapeHtml(styleChoiceLabel(style))}</option>`).join("")}
               <option value="${newStyleOption}">New style…</option>
             </select>
             <div id="kickoff-style-details" aria-live="polite">${kickoffStyleSummary(styleById(state.newStyleId))}</div>
@@ -2372,6 +2407,76 @@ function stylePayload(style) {
   };
 }
 
+function selectStyleEditor(style) {
+  const key = style.id ?? "";
+  const draft = state.interruptedStyleDrafts.get(key);
+  state.styleEditor = draft?.style ?? structuredClone(style);
+  state.styleProposal = draft?.proposal ?? "";
+  state.interruptedStyleDrafts.delete(key);
+}
+
+function recordStyle(style) {
+  if (styleById(style.id)) {
+    state.styles = state.styles.map(entry => entry.id === style.id ? style : entry);
+  } else {
+    state.styles.push(style);
+  }
+}
+
+async function importStyleArchive(archive) {
+  if (!archive?.size) {
+    setMessage("Choose a Bacchus ZIP to import.", "error");
+    return;
+  }
+  if (archive.size > maxStyleArchiveBytes) {
+    setMessage("Choose a ZIP no larger than 512 MiB.", "error");
+    return;
+  }
+  const finish = beginRequest("Importing the style and library…");
+  let imported;
+  try {
+    imported = await api("/api/styles/import", { method: "POST", headers: { "Content-Type": "application/zip" }, body: archive });
+    if (state.styleEditor) {
+      state.interruptedStyleDrafts.set(state.styleEditor.id ?? "", { style: state.styleEditor, proposal: state.styleProposal });
+    }
+    recordStyle(imported);
+    selectStyleEditor(imported);
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    finish();
+  }
+  if (!imported) return;
+  render();
+  setMessage(`Imported ${imported.name} as a separate style and artwork library.`, "good");
+  content.querySelector("#style-name")?.focus();
+}
+
+async function exportStyleArchive(id) {
+  const finish = beginRequest("Preparing the style and library ZIP…");
+  try {
+    const response = await apiResponse(`/api/styles/${encodeURIComponent(id)}/archive`);
+    const archive = await response.blob();
+    const filename = response.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/i)?.[1] ?? "bacchus-style-library.zip";
+    const url = URL.createObjectURL(archive);
+    try {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }
+    setMessage("Style and library ZIP download started.", "good");
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    finish();
+  }
+}
+
 function returnToNewProject(styleId) {
   state.returnToKickoff = false;
   if (styleId) state.newStyleId = styleId;
@@ -2389,10 +2494,8 @@ async function saveStyle(form) {
   let saved = null;
   try {
     saved = await post(endpoint, payload);
-    const listed = state.styles.some(entry => entry.id === saved.id);
-    state.styles = listed ? state.styles.map(entry => entry.id === saved.id ? saved : entry) : [...state.styles, saved];
-    state.styleEditor = structuredClone(saved);
-    state.styleProposal = "";
+    recordStyle(saved);
+    selectStyleEditor(saved);
   } catch (error) {
     setMessage(error.message, "error");
   } finally {
@@ -2730,8 +2833,7 @@ document.addEventListener("change", event => {
   if (control.id === "new-style-id") {
     if (control.value === newStyleOption) {
       state.returnToKickoff = true;
-      state.styleEditor = emptyStyle();
-      state.styleProposal = "";
+      selectStyleEditor(emptyStyle());
       openStudioView("styles");
     } else {
       state.newStyleId = control.value;
@@ -2884,6 +2986,8 @@ document.addEventListener("submit", event => {
   const data = new FormData(form);
   if (name === "style") {
     saveStyle(form);
+  } else if (name === "style-archive") {
+    importStyleArchive(data.get("archive"));
   } else if (name === "settings") {
     const payload = settingsPayload(data);
     if ((payload.openAIKey && payload.clearOpenAIKey) || (payload.anthropicKey && payload.clearAnthropicKey)) {
@@ -3049,19 +3153,19 @@ document.addEventListener("click", event => {
     content.querySelector("#kickoff-recording-details").innerHTML = kickoffRecordingSummary();
     input.focus();
   } else if (action === "new-style") {
-    state.styleEditor = emptyStyle();
-    state.styleProposal = "";
+    selectStyleEditor(emptyStyle());
     render();
     content.querySelector("#style-name")?.focus();
   } else if (action === "select-style") {
     const selected = styleById(name);
     if (!selected) return;
-    state.styleEditor = structuredClone(selected);
-    state.styleProposal = "";
+    selectStyleEditor(selected);
     setMessage();
     render();
   } else if (action === "return-to-kickoff") {
-    returnToNewProject();
+    returnToNewProject(name);
+  } else if (action === "export-style-archive") {
+    exportStyleArchive(name);
   } else if (action === "open-library-recovery") {
     openStudioView("library", "", name);
   } else if (action === "refresh-library") {

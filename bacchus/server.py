@@ -1,14 +1,17 @@
 """Loopback HTTP interface for the desktop workspace."""
 
+from contextlib import contextmanager
 import json
 import math
+from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, styles, timing_models, visual_review
+from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, style_archive, styles, timing_models, visual_review
 from .library import LibraryError
 from .runtime import APP_VERSION
 from .settings import SettingsError, directory_preference, provider_secrets, timing_model_directory
@@ -56,7 +59,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._post(target.path, parse_qs(target.query))
             else:
                 self._get(target.path, parse_qs(target.query))
-        except (WorkflowError, LibraryError, SettingsError, styles.StyleError, timing_models.TimingModelError) as error:
+        except (WorkflowError, LibraryError, SettingsError, styles.StyleError, timing_models.TimingModelError,
+                style_archive.ArchiveError) as error:
             self._json({"error": str(error)}, error.status)
         except render.RenderError as error:
             self._json({"error": str(error)}, 422)
@@ -117,6 +121,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/styles":
             self._json({"styles": [studio.style_view(style) for style in studio.styles.list_styles()]})
+            return
+        if re.fullmatch(r"/api/styles/[^/]+/archive", path):
+            style_id = path.split("/")[3]
+            with self._archive_transfer() as work:
+                style = studio.styles.get(style_id)
+                name = re.sub(r"[^a-z0-9]+", "-", style["name"].lower()).strip("-")[:72].rstrip("-")
+                archive = work / f"{name or 'bacchus-style'}-library.zip"
+                style_archive.export_style(studio, style_id, archive)
+                self._file(archive, "application/zip", "archive")
             return
         if re.fullmatch(r"/api/styles/[^/]+", path):
             style_id = path.rsplit("/", 1)[-1]
@@ -223,6 +236,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/styles":
             self._json(studio.style_view(studio.styles.create(self._body())), 201)
             return
+        if path == "/api/styles/import":
+            if self.headers.get_content_type() not in ("application/zip", "application/x-zip-compressed"):
+                raise WorkflowError("Choose a Bacchus style and library ZIP file.", 415)
+            length = self._request_length(style_archive.MAX_ARCHIVE_BYTES)
+            with self._archive_transfer() as work:
+                archive = work / "import.zip"
+                with archive.open("xb") as stream:
+                    remaining = length
+                    while remaining:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise WorkflowError("The ZIP upload did not finish.")
+                        stream.write(chunk)
+                        remaining -= len(chunk)
+                imported = style_archive.import_style(studio, archive)
+                self._json(studio.style_view(imported), 201)
+            return
         if path == "/api/styles/draft":
             spec = self._body()
             with studio.lock:
@@ -325,13 +355,27 @@ class Handler(BaseHTTPRequestHandler):
         studio = self.server.studio
         with studio.lock:
             if (studio.jobs or studio.providers_in_use() or media_tools.INSTALL_LOCK.locked()
-                    or studio.timing_models.installing):
+                    or studio.timing_models.installing or self.server.active_archive_transfers):
                 raise WorkflowError("Wait for the current operation to finish before quitting.", 409)
             self.server.closing = True
         try:
             self._json({"quitting": True})
         finally:
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    @contextmanager
+    def _archive_transfer(self):
+        studio = self.server.studio
+        with studio.lock:
+            if self.server.closing:
+                raise WorkflowError("Bacchus is closing.", 409)
+            self.server.active_archive_transfers += 1
+        try:
+            with TemporaryDirectory(prefix=".style-transfer-", dir=studio.root) as folder:
+                yield Path(folder)
+        finally:
+            with studio.lock:
+                self.server.active_archive_transfers -= 1
 
     def _project_route(self, path):
         segments = path.split("/")
@@ -345,13 +389,17 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, ValueError) as error:
             raise WorkflowError("The project revision is required.") from error
 
-    def _raw(self, limit):
+    def _request_length(self, limit):
         try:
             length = int(self.headers.get("Content-Length", "-1"))
         except ValueError as error:
             raise WorkflowError("Invalid content length.") from error
         if length < 1 or length > limit:
             raise WorkflowError(f"Request size must be between 1 and {limit:,} bytes.", 413)
+        return length
+
+    def _raw(self, limit):
+        length = self._request_length(limit)
         raw = self.rfile.read(length)
         if len(raw) != length:
             raise WorkflowError("Request data was incomplete.")
@@ -403,13 +451,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
             remaining = last - first + 1
-            cache = "no-store" if kind in ("video", "captions", "receipt") else "private, max-age=3600"
+            cache = "no-store" if kind in ("video", "captions", "receipt", "archive") else "private, max-age=3600"
             self._headers(206 if requested else 200, mime, remaining, cache=cache)
             if kind in ("audio", "video"):
                 self.send_header("Accept-Ranges", "bytes")
             if requested:
                 self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
-            if kind in ("captions", "receipt"):
+            if kind in ("captions", "receipt", "archive"):
                 self.send_header("Content-Disposition", f'attachment; filename="{file.name}"')
             self.end_headers()
             source.seek(first)
@@ -426,5 +474,6 @@ class StudioServer(ThreadingHTTPServer):
         self.studio = studio
         self.settings = settings
         self.closing = False
+        self.active_archive_transfers = 0
         self.instance_id = uuid.uuid4().hex
         super().__init__(("127.0.0.1", port), Handler)

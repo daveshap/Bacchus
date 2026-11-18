@@ -324,6 +324,21 @@ class Library:
     def list_assets(self) -> list[dict]:
         return self.catalog()["assets"]
 
+    def archive_records(self):
+        """Return active records for an exact archive, failing on damaged metadata."""
+        with self._exclusive():
+            records = []
+            for path in sorted(self._safe_path("entries").iterdir()):
+                if path.suffix != ".json":
+                    continue
+                if not ASSET_ID.fullmatch(path.stem):
+                    raise LibraryError("The artwork library contains entry metadata with an invalid ID.", 409)
+                try:
+                    records.append(self._read(path.stem))
+                except LibraryError as error:
+                    raise LibraryError(f"Artwork entry {path.stem} needs repair before export. {error}", 409) from error
+            return records
+
     def quarantine(self, asset_id):
         with self._exclusive():
             source = self._entry_path(asset_id)

@@ -14,6 +14,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import wave
+from zipfile import ZipFile
 
 from PIL import Image
 
@@ -149,6 +150,28 @@ def check_style_mix(url, project):
         raise RuntimeError("Approving a plan did not apply the pinned style's speech-only mix preference.")
 
 
+def check_style_archive(url, style_id):
+    scope = f"/api/styles/{style_id}"
+    original = json.loads(request(url, scope))
+    raw = request(url, f"{scope}/archive")
+    with ZipFile(BytesIO(raw)) as archive:
+        if archive.read("style.md").decode("utf-8") != original["guide"] or "manifest.json" not in archive.namelist():
+            raise RuntimeError("The ZIP did not include its active Markdown guide and manifest.")
+    imported = json.loads(request(url, "/api/styles/import", raw, content_type="application/zip"))
+    if imported["id"] == style_id or imported["builtIn"] or any(
+        imported[key] != original[key] for key in ("guide", "name", "referenceImages", "answers", "revision", "assetCount")
+    ):
+        raise RuntimeError("The imported ZIP did not reproduce its guide, references, revisions, and separate library.")
+    original_library = json.loads(request(url, f"/api/library?styleId={style_id}"))
+    imported_library = json.loads(request(url, f"/api/library?styleId={imported['id']}"))
+    original_hashes = {v["hash"] for asset in original_library["assets"] for v in asset["versions"]}
+    imported_urls = {v["hash"]: v["url"] for asset in imported_library["assets"] for v in asset["versions"]}
+    if original_hashes != imported_urls.keys() or any(
+        hashlib.sha256(request(url, path)).hexdigest() != digest for digest, path in imported_urls.items()
+    ):
+        raise RuntimeError("The imported library did not keep its original artwork bytes.")
+
+
 def run_export(url, root, project, custom_style_id):
     route = f"/api/projects/{project['id']}"
 
@@ -190,6 +213,7 @@ def run_export(url, root, project, custom_style_id):
     if published_ids != {published["libraryId"]} or custom["assets"]:
         raise RuntimeError("The published demo artwork did not stay in its Warm Editorial library.")
     check_library_isolation(url, root, project, published["libraryId"])
+    check_style_archive(url, "warm-editorial")
     project = action("animation/prepare")
     if not request(url, f"{route}/preview?time=0.5").startswith(b"\x89PNG"):
         raise RuntimeError("The prepared example lacked a renderer preview.")
@@ -353,6 +377,7 @@ def main():
             if timing["ready"] or timing["existingDirectory"] or not timing["installation"]:
                 raise RuntimeError("Fresh setup did not report that Parakeet model files were needed.")
             custom = check_styles(url)
+            check_style_archive(url, custom["styleSnapshot"]["id"])
             project = json.loads(request(url, "/api/demo", {}))
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")

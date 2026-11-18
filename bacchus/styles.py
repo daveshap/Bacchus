@@ -161,7 +161,7 @@ class StyleCatalog:
             except OSError as error:
                 raise StyleError("Bacchus could not write the style folder.", 500) from error
 
-    def _spec(self, data, previous=None):
+    def _spec(self, data, previous=None, *, reference_lookup=None):
         if not isinstance(data, dict) or not data.keys() <= SPEC_KEYS:
             raise StyleError("The style has unknown fields.")
         defaults = {"description": "", "visualPreset": "warm-editorial", "palette": {},
@@ -177,10 +177,10 @@ class StyleCatalog:
         spec["answers"] = _answers(spec["answers"])
         spec["palette"] = _palette(spec["palette"])
         spec["guide"] = _text(spec["guide"], "Style guide", MAX_GUIDE_CHARS)
-        spec["referenceImages"] = self._references(spec["referenceImages"])
+        spec["referenceImages"] = self._references(spec["referenceImages"], reference_lookup=reference_lookup)
         return spec
 
-    def _references(self, entries):
+    def _references(self, entries, *, reference_lookup=None):
         if not isinstance(entries, list) or len(entries) > MAX_REFERENCE_IMAGES:
             raise StyleError(f"Use up to {MAX_REFERENCE_IMAGES} style reference images.")
         result = []
@@ -190,7 +190,7 @@ class StyleCatalog:
                 raise StyleError("Select an uploaded reference image.")
             name = _text(entry["name"], "Reference image name", 160, required=True)
             digest = entry["sha256"]
-            path = self.reference(digest)
+            path = (reference_lookup or self.reference)(digest)
             width, height = _reference_dimensions(path)
             if (width, height) != (entry["width"], entry["height"]) or digest in seen:
                 raise StyleError("Reference images must be distinct and match their recorded dimensions.")
@@ -256,6 +256,16 @@ class StyleCatalog:
         custom = [self.get(folder.name) for folder in self._path("snapshots").iterdir()
                   if folder.is_dir() and folder.name not in BUILT_INS and any(folder.glob("*.json"))]
         return defaults + sorted(custom, key=lambda style: (style["name"].casefold(), style["id"]))
+
+    def history(self, style_id, *, maximum):
+        with self._exclusive():
+            latest = self.get(style_id)
+            if latest["revision"] > maximum:
+                raise StyleError(f"This archive supports up to {maximum} saved style revisions.", 413)
+            try:
+                return [self.get(style_id, number) for number in range(1, latest["revision"])] + [latest]
+            except StyleError as error:
+                raise StyleError("A saved style revision is missing or damaged. Restore its history before exporting.", 409) from error
 
     def store_reference(self, name, raw):
         name = _text(name, "Reference image name", 160, required=True).replace("\\", "/").rsplit("/", 1)[-1].strip()
