@@ -1,0 +1,99 @@
+name: Build Bacchus desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: windows-x64
+            executable: dist/Bacchus/Bacchus.exe
+          - os: macos-15
+            target: macos-arm64
+            executable: dist/Bacchus.app/Contents/MacOS/Bacchus
+          - os: macos-15-intel
+            target: macos-x64
+            executable: dist/Bacchus.app/Contents/MacOS/Bacchus
+          - os: ubuntu-22.04
+            target: linux-x64
+            executable: dist/Bacchus/Bacchus
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            packaging/requirements.txt
+      - name: Install FFmpeg on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          "$env:ChocolateyInstall\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - run: python -m pip install -r requirements.txt -r packaging/requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python packaging/build.py
+      - name: Verify the frozen application and MP4 export
+        run: python packaging/smoke_bundle.py "${{ matrix.executable }}" --render
+      - name: Create the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $appVersion = python -c "from bacchus.runtime import APP_VERSION; print(APP_VERSION)"
+          python packaging/build_msi.py --bundle dist/Bacchus --version $appVersion --output release/Bacchus-windows-x64.msi
+      - name: Verify Windows installation and removal
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path -LiteralPath 'release/Bacchus-windows-x64.msi').Path
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\Bacchus\Bacchus.exe'
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Bacchus.lnk'
+          $result = Start-Process msiexec.exe -WindowStyle Hidden -Wait -PassThru -ArgumentList "/i `"$installer`" /qn /norestart"
+          if ($result.ExitCode -ne 0) { throw "Bacchus setup exited with $($result.ExitCode)" }
+          try {
+            if (!(Test-Path -LiteralPath $installed) -or !(Test-Path -LiteralPath $shortcut)) { throw 'Bacchus install files or Start menu shortcut missing' }
+            python packaging/smoke_bundle.py $installed --render
+            if ($LASTEXITCODE -ne 0) { throw 'Installed Bacchus failed the packaged workflow smoke test' }
+          } finally {
+            $result = Start-Process msiexec.exe -WindowStyle Hidden -Wait -PassThru -ArgumentList "/x `"$installer`" /qn /norestart"
+            if ($result.ExitCode -ne 0) { throw "Bacchus removal exited with $($result.ExitCode)" }
+          }
+          if ((Test-Path -LiteralPath $installed) -or (Test-Path -LiteralPath $shortcut)) { throw 'Bacchus install files or Start menu shortcut remained after removal' }
+      - name: Archive the macOS application
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent dist/Bacchus.app "release/Bacchus-${{ matrix.target }}.zip"
+      - name: Archive the Linux application
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p release
+          tar -czf release/Bacchus-linux-x64.tar.gz -C dist Bacchus
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Bacchus-${{ matrix.target }}
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
