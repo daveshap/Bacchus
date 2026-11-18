@@ -1,6 +1,7 @@
 """Start and verify a frozen Bacchus executable over localhost."""
 
 import argparse
+import hashlib
 from io import BytesIO
 import json
 import os
@@ -78,6 +79,14 @@ def run_export(url, project):
         url, f"{route}/assets/{artwork}?revision={project['revision']}&name=smoke-art.png", raw,
     ))
     project = action(f"assets/{artwork}/approve")
+    expect_conflict(url, f"{route}/assets/{artwork}/publish", {"revision": project["revision"]})
+    expect_conflict(url, f"{route}/mix/approve", {"revision": project["revision"], "reviewed": True})
+    project = action("mix/prepare")
+    prepared = project["mix"]["rendered"]
+    wav = request(url, prepared["url"])
+    if not wav.startswith(b"RIFF") or hashlib.sha256(wav).hexdigest() != prepared["sha256"]:
+        raise RuntimeError("The mix preview did not match the measured WAV.")
+    project = action("mix/approve", reviewed=True)
 
     project = action("assets/checks")
     if len(project["assetChecks"]) != 1:
@@ -85,6 +94,9 @@ def run_export(url, project):
     expect_conflict(url, f"{route}/animation/prepare", {"revision": project["revision"]})
     expect_conflict(url, f"{route}/preview?time=0.5")
     project = verify_checks(url, route, project, "assets", "assetChecks")
+    project = action(f"assets/{artwork}/publish")
+    if project["assetChecks"][0]["status"] != "passed":
+        raise RuntimeError("Publishing discarded a passed artwork use.")
     project = action("animation/prepare")
     if not request(url, f"{route}/preview?time=0.5").startswith(b"\x89PNG"):
         raise RuntimeError("The prepared example lacked a renderer preview.")
@@ -104,6 +116,8 @@ def run_export(url, project):
             if request(url, export["url"])[4:8] != b"ftyp":
                 raise RuntimeError("Export downloaded but lacked an MP4 file header.")
             receipt = json.loads(request(url, export["receiptUrl"]))
+            if receipt["candidate"]["mix"]["rendered"]["sha256"] != prepared["sha256"]:
+                raise RuntimeError("The exported receipt did not bind the approved WAV.")
             for scope, key in (("assets", "assetChecks"), ("animation", "animationChecks")):
                 checks = receipt["review"][scope]
                 if set(checks) != {check["id"] for check in project[key]} or any(

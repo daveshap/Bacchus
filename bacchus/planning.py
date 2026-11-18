@@ -1,7 +1,7 @@
 import hashlib
 import json
 
-from . import RESOURCES
+from . import RESOURCES, layer_spec
 from .providers import ProviderError, openai_json, post_json
 from .settings import DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, planner_choice, provider_value
 
@@ -13,7 +13,7 @@ PROMPT_BYTES = (PACK_FOLDER / "plan.md").read_bytes()
 LAYOUTS = PACK["layouts"]
 MOTIONS = PACK["motions"]
 MAX_LINES = 240
-MAX_SCENES = 100
+MAX_SCENES = 160
 MAX_PLANNER_CALLS = 8
 OUTPUT_TOKENS = 16000
 
@@ -26,6 +26,7 @@ SCENE_FIELDS = {
     "caption": {"type": "string"},
     "artId": {"type": "string"},
     "artBrief": {"type": "string"},
+    "layers": {"type": "array", "items": layer_spec.LAYER_SCHEMA},
 }
 OUTPUT_SCHEMA = {
     "type": "object",
@@ -50,6 +51,16 @@ PACK_HASH = hashlib.sha256(
 
 class PlannerError(Exception):
     pass
+
+
+scene_art = layer_spec.scene_art
+
+
+def validate_layers(project, scene):
+    try:
+        return layer_spec.validate_layers(project, scene)
+    except layer_spec.LayerError as error:
+        raise PlannerError(str(error)) from error
 
 
 def planner_provider():
@@ -85,13 +96,16 @@ def starter_plan(lines):
 
 def plan_request(project, reusable=()):
     source = project["input"]
+    output_tokens = min(48_000, max(OUTPUT_TOKENS, len(source["lines"]) * 180))
     context = {
         "intention": source["intention"],
         "visualTreatment": project.get("style", "warm-editorial"),
         "narration": source["lines"],
+        "wordTiming": source.get("timing", "demo"),
+        "wordCues": [[word["id"], word["text"], word["start"]] for word in source.get("words", [])],
         "availableAssets": [
             {"id": asset["id"], "name": asset["name"], "description": asset.get("brief", "")}
-            for asset in project["assets"] if asset["approved"]
+            for asset in project["assets"] if asset["approved"] and not asset.get("issue")
         ] + [
             {"id": asset["id"], "name": asset["alias"], "description": asset["brief"]}
             for asset in reusable
@@ -102,13 +116,13 @@ def plan_request(project, reusable=()):
     system = (
         PROMPT_BYTES.decode("utf-8") + "\nHonor the supplied visual treatment. "
         "Keep the number of new illustrations under the specified limit and reuse recurring visuals when helpful. "
-        "Use the existing layout and motion choices to design meaningful visual beats."
+        "Use layers when distinct elements, live data or cue-timed changes help explain the narration."
     )
     content = json.dumps(context, ensure_ascii=False)
     if planner_choice() == "openai":
         return {
             "model": provider_value("BACCHUS_OPENAI_MODEL", "").strip() or DEFAULT_OPENAI_MODEL,
-            "max_output_tokens": OUTPUT_TOKENS, "store": False,
+            "max_output_tokens": output_tokens, "store": False,
             "instructions": system, "input": content,
             "text": {"format": {"type": "json_schema", "name": "scene_plan", "strict": True, "schema": OUTPUT_SCHEMA}},
         }
@@ -118,7 +132,7 @@ def plan_request(project, reusable=()):
         output["effort"] = "high"
     return {
         "model": model,
-        "max_tokens": OUTPUT_TOKENS,
+        "max_tokens": output_tokens,
         "system": system,
         "messages": [{"role": "user", "content": content}],
         "output_config": output,
@@ -139,9 +153,10 @@ def request_plan(payload):
             key = provider_value("ANTHROPIC_API_KEY", "").strip()
             if not key or not payload["model"]:
                 raise PlannerError("Add an Anthropic API key in Settings.")
+            options = {"timeout": 240} if payload.get("max_tokens", OUTPUT_TOKENS) > OUTPUT_TOKENS else {}
             result, request_id = post_json(
                 "https://api.anthropic.com/v1/messages", payload,
-                {"x-api-key": key, "anthropic-version": "2023-06-01"}, "Anthropic",
+                {"x-api-key": key, "anthropic-version": "2023-06-01"}, "Anthropic", **options,
             )
             if result["stop_reason"] != "end_turn":
                 raise PlannerError(f"Claude did not complete the plan ({result['stop_reason']}).")

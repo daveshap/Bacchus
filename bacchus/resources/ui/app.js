@@ -31,6 +31,8 @@ const state = {
   inputDraft: null,
   planDraft: null,
   mixDraft: null,
+  timingWord: 1,
+  timingModelDirectory: "",
   assetProofId: "",
   animationReviewId: "",
   previewPosition: null,
@@ -135,19 +137,27 @@ async function openStudioView(view, alias = "") {
   if (view === "settings" && !state.settings) await refreshSettings();
 }
 
+function sceneArtwork(scene) {
+  return [scene, ...(scene.layers ?? []).filter(layer => layer.kind === "art")].filter(layer => layer.artId);
+}
+
 function pendingArt(project) {
-  const approved = new Set(project.assets.filter(asset => asset.approved).map(asset => asset.id));
-  const required = new Set(project.plan?.scenes.map(scene => scene.artId).filter(Boolean));
+  const approved = new Set(project.assets.filter(asset => asset.approved && !asset.issue).map(asset => asset.id));
+  const required = new Set(project.plan?.scenes.flatMap(sceneArtwork).map(layer => layer.artId));
   return [...required].filter(id => !approved.has(id));
 }
 
 function artworkComplete(project) {
   if (!project?.plan?.approved || pendingArt(project).length) return false;
-  return project.assetReviewReady ?? !project.plan.scenes.some(scene => scene.artId);
+  return project.assetReviewReady ?? !project.plan.scenes.some(scene => sceneArtwork(scene).length);
+}
+
+function mixComplete(project) {
+  return Boolean(project?.mix?.approved && project.mix.rendered?.sha256);
 }
 
 function afterArtwork(project) {
-  return project.mix?.approved ? "review" : "composition";
+  return mixComplete(project) ? "review" : "composition";
 }
 
 function afterArtworkButton(project) {
@@ -160,7 +170,7 @@ function stageStates(project) {
     intake: Boolean(project?.input),
     plan: Boolean(project?.plan?.approved),
     art: artworkComplete(project),
-    composition: Boolean(project?.mix?.approved),
+    composition: mixComplete(project),
     review: Boolean(project?.accepted),
     export: project?.export?.status === "complete",
   };
@@ -277,14 +287,11 @@ function readiness(label, available, waitingLabel, readyLabel = "Ready", waiting
 
 function readinessList(settings) {
   const planner = settings.plannerProvider === "openai" ? "OpenAI" : "Anthropic";
-  const transcriptionEnabled = Boolean(settings.useOpenAITranscription);
   const imagesEnabled = Boolean(settings.useOpenAIImages);
   return [
     readiness("Audio tools", settings.audioAvailable, "Install FFmpeg and ffprobe"),
     readiness("Video export", settings.renderAvailable, "Install FFmpeg and ffprobe"),
     readiness(`Scene planning · ${planner}`, state.config.plannerAvailable, `Needs ${planner} key`, "Configured"),
-    readiness("OpenAI transcription", state.config.transcriberAvailable, transcriptionEnabled ? "Needs OpenAI key" : "Off",
-      "Configured", transcriptionEnabled ? "warm" : ""),
     readiness("OpenAI image generation", state.config.imageAvailable, imagesEnabled ? "Needs OpenAI key" : "Off",
       "Configured", imagesEnabled ? "warm" : ""),
   ].join("");
@@ -315,7 +322,7 @@ function settingsModel(id, label, value) {
 }
 
 const workflowOverview = [
-  "Import a recording and verify its transcript.",
+  "Import a recording and review exact word timings.",
   "Generate or edit a scene plan and approve it.",
   "Approve the artwork and review the soundtrack.",
   "Preview the cut, run quality checks, and export.",
@@ -352,7 +359,6 @@ function settingsView() {
         <fieldset class="setup-fieldset stack optional-settings">
           <legend>Optional OpenAI features</legend>
           <div class="stack provider-switches">
-            <label class="music-option"><input type="checkbox" name="useOpenAITranscription"${settings.useOpenAITranscription === true ? " checked" : ""}> Transcribe recordings with OpenAI</label>
             <label class="music-option"><input type="checkbox" name="useOpenAIImages"${settings.useOpenAIImages === true ? " checked" : ""}> Generate artwork with OpenAI</label>
           </div>
           <div class="field">
@@ -365,7 +371,6 @@ function settingsView() {
             <summary>OpenAI model names</summary>
             <div class="stack settings-note">
               ${settingsModel("openAIModel", "OpenAI scene model", settings.openAIModel)}
-              ${settingsModel("transcribeModel", "Transcription model", settings.transcribeModel)}
               ${settingsModel("imageModel", "Image model", settings.imageModel)}
             </div>
           </details>
@@ -441,7 +446,7 @@ function selectLibraryAsset(asset) {
 
 function libraryRows(matches) {
   if (state.library === null) return '<p class="hint actions">Loading the art library…</p>';
-  if (!state.library.length) return '<p class="hint actions">Approved artwork appears here as you make projects.</p>';
+  if (!state.library.length) return '<p class="hint actions">Artwork appears here after you publish it from a reviewed scene use.</p>';
   if (!matches.length) return '<p class="hint actions">No artwork matches that search.</p>';
   return `<ul class="library-list">${matches.map(asset => {
     const latest = asset.versions.find(version => version.version === asset.latestVersion) ?? asset.versions.at(-1);
@@ -467,18 +472,22 @@ function libraryInspector() {
   if (!version) return "";
   const image = localMedia(version.url);
   const name = version.name || asset.name || asset.id;
+  const usable = version.qualified === true && !version.issue;
   const created = libraryDate(version.createdAt);
   const target = state.libraryProject || state.project?.id || state.projects[0]?.id;
   return `<section class="panel stack">
-    <h2>${escapeHtml(name)}</h2>
+    <div class="panel-header"><h2>${escapeHtml(name)}</h2>
+      ${version.issue ? badge("Flagged", "error") : usable ? badge("Qualified", "good") : badge("Awaiting qualification", "warm")}
+    </div>
     <div class="field">
       <label for="library-version">Version</label>
       <select id="library-version">
-        ${[...asset.versions].sort((left, right) => right.version - left.version).map(item => `<option value="${escapeHtml(item.version)}"${version.version === item.version ? " selected" : ""}>Version ${escapeHtml(item.version)}${item.version === asset.latestVersion ? " (latest)" : ""}</option>`).join("")}
+        ${[...asset.versions].sort((left, right) => right.version - left.version).map(item => `<option value="${escapeHtml(item.version)}"${version.version === item.version ? " selected" : ""}>Version ${escapeHtml(item.version)}${item.version === asset.latestVersion ? " (latest)" : ""}${item.issue ? " · flagged" : item.qualified === true ? "" : " · awaiting qualification"}</option>`).join("")}
       </select>
     </div>
     ${image ? `<figure class="library-preview"><img src="${image}" alt="${escapeHtml(name)}"></figure>` : ""}
     ${version.brief ? `<p class="hint">${escapeHtml(version.brief)}</p>` : ""}
+    ${version.issue?.reason ? `<p class="notice error inline">${escapeHtml(version.issue.reason)}</p>` : ""}
     <dl class="receipt">
       ${version.style ? `<dt>Style</dt><dd>${escapeHtml(version.style)}</dd>` : ""}
       ${version.source ? `<dt>Source</dt><dd>${escapeHtml(version.source)}</dd>` : ""}
@@ -496,7 +505,7 @@ function libraryInspector() {
         <input id="library-alias" name="alias" value="${escapeHtml(state.libraryAlias)}" pattern="[a-z0-9\\-]+" maxlength="64" required>
         <p class="hint">Enter the ID you’ll reference in the scene plan. Use lowercase letters, digits, and hyphens.</p>
       </div>
-      <div class="cluster"><button class="button primary">Use in project</button>
+      <div class="cluster"><button class="button primary"${usable ? "" : " disabled"}>Use in project</button>
         ${state.project ? '<button class="button quiet" type="button" data-view="project">Back to project</button>' : ""}</div>
       <p id="library-pin-status" class="notice inline" role="status" aria-live="polite" hidden></p>
     </form>` : '<div><button class="button primary" type="button" data-action="new-project">Create a project to use this image</button></div>'}
@@ -643,18 +652,78 @@ function timingImport() {
   </details>`;
 }
 
+function timingDerive(busy) {
+  const available = state.config.localTimingAvailable !== false;
+  return `<details class="timing-import">
+    <summary>Derive word timings locally</summary>
+    <form class="stack" data-form="derive-timings">
+      <div class="field">
+        <label for="timing-model-directory">Parakeet model folder</label>
+        <input id="timing-model-directory" name="modelDirectory" value="${escapeHtml(state.timingModelDirectory)}" spellcheck="false" required>
+        <p class="hint">Enter the full path to the folder that contains the installed Parakeet model files.</p>
+      </div>
+      ${available ? "" : '<p class="hint">Local derivation requires the Parakeet runtime and media tools. You can import a recording-matched timing file above.</p>'}
+      <div><button class="button"${busy || !available ? " disabled" : ""}>Derive word timings</button></div>
+    </form>
+  </details>`;
+}
+
+function timingWordFields(word, duration) {
+  return `<div class="field"><label for="timing-word-text">Word</label>
+      <input id="timing-word-text" name="text" value="${escapeHtml(word.text)}" required>
+    </div>
+    <div class="mix-controls">
+      <div class="field"><label for="timing-word-start">Start (seconds)</label>
+        <input id="timing-word-start" name="start" type="number" step="any" min="0" max="${escapeHtml(duration)}" value="${escapeHtml(word.start)}" required>
+      </div>
+      <div class="field"><label for="timing-word-end">End (seconds)</label>
+        <input id="timing-word-end" name="end" type="number" step="any" min="0" max="${escapeHtml(duration)}" value="${escapeHtml(word.end)}" required>
+      </div>
+    </div>`;
+}
+
+function timingReview(project, busy) {
+  const words = project.transcript.words;
+  const index = Math.min(Math.max(1, state.timingWord), words.length);
+  state.timingWord = index;
+  const word = words[index - 1];
+  const lines = project.transcript.lines ?? [];
+  return `<div class="stack">
+    <section class="panel stack">
+      <div class="panel-header"><h2>Timing review</h2>${badge(`${words.length} words`)}</div>
+      <p class="hint">Jump to a cue in the recording to verify the timing and wording.</p>
+      <ol class="proof-list" aria-label="Narration cues">
+        ${lines.map(line => `<li><button class="proof-choice" type="button" data-action="seek-timing" data-name="${escapeHtml(line.start)}">
+          <span><strong>${escapeHtml(line.text)}</strong><small>${proofSeconds(line.start)} to ${proofSeconds(line.end)}</small></span><span>${escapeHtml(line.id)}</span>
+        </button></li>`).join("")}
+      </ol>
+    </section>
+    <section class="panel">
+      <details class="timing-panel">
+        <summary>Correct a word or its timing</summary>
+        <form class="stack settings-note" data-form="correct-timing">
+          <div class="field"><label for="timing-word-index">Word number</label>
+            <input id="timing-word-index" name="index" type="number" min="1" max="${words.length}" value="${index}" required>
+          </div>
+          <div id="timing-word-fields" class="stack">${timingWordFields(word, project.audio.duration)}</div>
+          <div><button class="button"${busy ? " disabled" : ""}>Save word correction</button></div>
+        </form>
+      </details>
+    </section>
+  </div>`;
+}
+
 function intakeView(project) {
   const input = project.input;
   const audio = project.audio;
   const draft = state.inputDraft;
   const busy = Boolean(project.busy);
   const hasSource = Boolean(audio || input || project.requiresAudio === false);
-  const attempts = Math.max(0, (state.config.maxTranscriptionCalls ?? 0) - (project.transcriptionCalls ?? 0));
   const styles = state.config.styles ?? [{ id: "warm-editorial", name: "Warm editorial" }];
   const style = input?.style ?? draft?.style ?? project.style ?? styles[0].id;
-  const sourceTimings = project.transcript?.timing === "source-cues";
+  const sourceTimings = project.transcript?.timing === "source-cues" && Boolean(project.transcript.words?.length);
   return `
-    ${heading("Intake", "Import the narration recording, then review its transcript and add creative direction.")}
+    ${heading("Intake", "Import the narration recording, verify its word timings, and add creative direction.")}
     <div class="columns">
       <div class="stack">
       <section class="panel">
@@ -664,7 +733,7 @@ function intakeView(project) {
             project.requiresAudio === false ? badge("Optional for this project") : badge("Required", "warm")}
         </div>
         ${audio ? `<p class="audio-name">${escapeHtml(audio.name)} · ${timecode(audio.duration)}</p>
-          <audio controls preload="none" aria-label="Listen to narration" src="${localMedia(audio.url)}"></audio>` : input ?
+          <audio id="narration-source" controls preload="none" aria-label="Listen to narration" src="${localMedia(audio.url)}"></audio>` : input ?
           '<p class="hint">This project has no narration recording.</p>' : ""}
         ${input ? "" : `
           <form data-form="audio" class="stack">
@@ -682,29 +751,19 @@ function intakeView(project) {
       </section>
       ${hasSource ? `<section class="panel">
         <div class="panel-header">
-          <h2>Transcript and brief</h2>
+          <h2>Word timings and brief</h2>
           ${input ? badge("Locked", "good") : ""}
         </div>
         ${!input ? `<div class="transcription-control">
-          ${audio && state.config.transcriberAvailable
-            ? `<div class="cluster">${button(project.transcript ? "Transcribe again" : "Transcribe recording", "transcribe-audio", { disabled: busy || !attempts })}
-                <span class="hint">${attempts ? "Sends the recording to OpenAI for transcription." : "This project has used its transcription requests."}</span></div>`
-            : audio ? providerNotice(state.settings?.useOpenAITranscription
-              ? "Paste a transcript, import word timings, or add an OpenAI key to draft it here."
-              : "Paste a transcript or import recording-matched word timings.", "Transcription settings") :
-            '<p class="hint">Import a recording to transcribe it, or paste your transcript below.</p>'}
-          ${project.busy === "transcribing" ? '<p class="hint">Transcription is in progress.</p>' :
-          sourceTimings ? '<p class="hint"><strong>Recording-matched word timings.</strong> Editing the cue text switches to estimated timing.</p>' :
-          project.transcript ? `<p class="hint">Draft from ${escapeHtml(project.transcript.model || "OpenAI")}. Review it against the recording.</p>` : ""}
-          ${audio && !busy ? timingImport() : ""}
+          ${sourceTimings ? '<p class="hint">Recording-matched word timings are ready to review.</p>' :
+            '<p class="hint">Import a timing file or derive word timings from the recording.</p>'}
+          ${audio && !busy ? timingImport() + timingDerive(busy) : ""}
         </div>` : ""}
         <form data-form="input" class="stack">
-          <div class="field">
+          ${input || sourceTimings ? `<div class="field">
             <label for="script">Narration transcript</label>
-            <textarea id="script" name="script" rows="12" required ${input ? "readonly" : ""}
-              placeholder="Review or paste the spoken text, one cue per line.">${escapeHtml(input?.script ?? draft?.script ?? project.transcript?.script)}</textarea>
-            <p class="hint">Each nonempty line becomes a narration cue. Up to ${escapeHtml(state.config.maxLines)} cues.</p>
-          </div>
+            <textarea id="script" name="script" rows="8" readonly>${escapeHtml(input?.script ?? project.transcript?.script)}</textarea>
+          </div>` : ""}
           <div class="field">
             <label for="style">Visual style</label>
             <select id="style" name="style"${input ? " disabled" : ""}>
@@ -720,7 +779,8 @@ function intakeView(project) {
             <div class="cluster">
               <button class="button primary" type="button" data-stage="plan">Open scene plan</button>
               ${button("Unlock intake", "unlock-input", { style: "quiet", disabled: busy })}
-            </div>` : `<div><button class="button primary"${busy ? " disabled" : ""}>Lock recording and transcript</button></div>`}
+            </div>` : `${sourceTimings ? '<label class="music-option"><input type="checkbox" name="confirmTiming" required> I reviewed the word timings against the recording.</label>' : ""}
+            <div><button class="button primary"${busy || !sourceTimings ? " disabled" : ""}>Lock recording and timings</button></div>`}
         </form>
       </section>` : ""}
       </div>
@@ -732,7 +792,7 @@ function intakeView(project) {
             <dt>Cue timing</dt><dd>${input.timing === "source-cues" ? "Recording-matched word timings" : "Estimated"}</dd>
             <dt>Input fingerprint</dt><dd>${shortHash(input.hash)}</dd>
           </dl>
-        </section>` : ""}
+        </section>` : sourceTimings ? timingReview(project, busy) : ""}
     </div>`;
 }
 
@@ -761,24 +821,113 @@ function plannerReceipt(project) {
   </details>`;
 }
 
+function newLayer(id) {
+  return {
+    id, kind: "text", box: { x: 6, y: 8, w: 48, h: 35 }, text: "", artId: "", artBrief: "", items: [], unit: "",
+    enter: { line: 0, word: 0, effect: "show", duration: 0 }, leave: { line: 0, word: 0 },
+  };
+}
+
+function layerInput(prefix, key, label, value, attributes = "") {
+  const id = `${prefix}-${key.replace(".", "-")}`;
+  return `<div class="field"><label for="${id}">${label}</label>
+    <input id="${id}" data-layer-field="${key}" value="${escapeHtml(value)}" ${attributes}>
+  </div>`;
+}
+
+function layerEditor(layer, sceneIndex, index, count, project) {
+  const prefix = `scene-${sceneIndex}-layer-${index}`;
+  const reference = `${sceneIndex}/${index}`;
+  const kinds = ["text", "art", "bar-chart", "flow"];
+  const effects = ["show", "fade", "rise", "wipe"];
+  const chart = layer.kind === "bar-chart";
+  const diagram = layer.kind === "flow";
+  const lineMax = project.input.lines.length;
+  const wordMax = project.input.words?.length ?? 0;
+  return `<fieldset class="stack scene-layer" data-layer>
+    <legend>Layer ${index + 1}</legend>
+    <div class="stack scene-fields">
+      ${layerInput(prefix, "id", "Layer ID", layer.id, 'maxlength="64" required')}
+      <div class="field"><label for="${prefix}-kind">Layer type</label>
+        <select id="${prefix}-kind" data-layer-field="kind">${options(kinds, layer.kind)}</select>
+      </div>
+    </div>
+    <div class="stack scene-fields">
+      ${Object.entries({ x: "Left (%)", y: "Top (%)", w: "Width (%)", h: "Height (%)" }).map(([key, label]) =>
+        layerInput(prefix, `box.${key}`, label, layer.box[key],
+          `type="number" min="${key === "w" || key === "h" ? 1 : 0}" max="100" required`)).join("")}
+    </div>
+    ${layer.kind === "art" ? `<div class="stack">
+      ${layerInput(prefix, "artId", "Artwork ID", layer.artId, 'list="project-art-ids" maxlength="64" required')}
+      <div class="field"><label for="${prefix}-art-brief">Artwork brief</label>
+        <textarea id="${prefix}-art-brief" data-layer-field="artBrief" maxlength="380" rows="2">${escapeHtml(layer.artBrief)}</textarea>
+      </div>
+    </div>` : `<div class="field"><label for="${prefix}-text">${chart || diagram ? "Heading" : "Layer text"}</label>
+      <textarea id="${prefix}-text" data-layer-field="text" maxlength="220" rows="2"${layer.kind === "text" ? " required" : ""}>${escapeHtml(layer.text)}</textarea>
+    </div>`}
+    ${chart || diagram ? `<div class="field"><label for="${prefix}-items">${chart ? "Bar labels and values" : "Flow steps"}</label>
+      <textarea id="${prefix}-items" data-layer-field="items" rows="3" required>${escapeHtml(layer.items.map(item => chart ? `${item.label} | ${item.value}` : item.label).join("\n"))}</textarea>
+      <p class="hint">${chart ? "Enter 1–6 lines in the form Label | Value." : "Enter 2–5 steps, one per line."}</p>
+    </div>` : ""}
+    ${chart ? layerInput(prefix, "unit", "Chart unit", layer.unit, 'maxlength="24"') : ""}
+    <div class="stack scene-fields">
+      ${layerInput(prefix, "enter.line", "Entrance cue", layer.enter.line, `type="number" min="0" max="${lineMax}" required`)}
+      ${layerInput(prefix, "enter.word", "Entrance word ID", layer.enter.word, `type="number" min="0" max="${wordMax}" required`)}
+      <div class="field"><label for="${prefix}-effect">Entrance effect</label>
+        <select id="${prefix}-effect" data-layer-field="enter.effect">${options(effects, layer.enter.effect)}</select>
+      </div>
+      ${layer.enter.effect === "show" ? "" : layerInput(prefix, "enter.duration", "Effect length (seconds)", layer.enter.duration,
+        'type="number" min=".001" max="3" step="any" required')}
+      ${layerInput(prefix, "leave.line", "Exit cue", layer.leave.line, `type="number" min="0" max="${lineMax}" required`)}
+      ${layerInput(prefix, "leave.word", "Exit word ID", layer.leave.word, `type="number" min="0" max="${wordMax}" required`)}
+    </div>
+    <div class="cluster">
+      ${button("Move back", "layer-back", { name: reference, style: "quiet small", disabled: index === 0 })}
+      ${button("Move forward", "layer-forward", { name: reference, style: "quiet small", disabled: index === count - 1 })}
+      ${button("Remove layer", "remove-layer", { name: reference, style: "quiet danger small" })}
+    </div>
+  </fieldset>`;
+}
+
+function sceneWords(scene, source) {
+  if (!source.words?.length) return "";
+  const start = scene.startLine === 1 ? 0 : source.lines[scene.startLine - 1]?.start ?? 0;
+  const end = source.lines[scene.endLine]?.start ?? source.duration;
+  const words = source.words.filter(word => word.start >= start && word.start < end);
+  if (!words.length) return "";
+  return `<details class="timing-panel">
+    <summary>Show word IDs for this scene</summary>
+    <ol class="layer-word-list">${words.map(word => `<li><strong>${word.id}</strong> ${escapeHtml(word.text)} <small>${proofSeconds(word.start)}</small></li>`).join("")}</ol>
+  </details>`;
+}
+
 function sceneEditor(scene, index, project, expanded) {
   const prefix = `scene-${index}`;
   const lines = project.input.lines.length;
   const title = scene.title || `Scene ${index + 1}`;
+  const layered = scene.layout === "layered";
+  const layers = scene.layers ?? [];
   return `
-    <details class="scene-editor"${expanded ? " open" : ""} data-scene="${index}">
+    <details class="scene-editor"${expanded ? " open" : ""} data-scene="${index}" data-layout="${escapeHtml(scene.layout)}">
       <summary>${escapeHtml(title)}<span class="scene-meta">Cues ${escapeHtml(scene.startLine)}–${escapeHtml(scene.endLine)} · ${escapeHtml(scene.layout)}</span></summary>
       <div class="stack">
         <div class="stack scene-fields">
           <div class="field"><label for="${prefix}-start">Start cue</label><input id="${prefix}-start" data-field="startLine" type="number" min="1" max="${lines}" value="${escapeHtml(scene.startLine)}" required></div>
           <div class="field"><label for="${prefix}-end">End cue</label><input id="${prefix}-end" data-field="endLine" type="number" min="1" max="${lines}" value="${escapeHtml(scene.endLine)}" required></div>
           <div class="field"><label for="${prefix}-layout">Layout</label><select id="${prefix}-layout" data-field="layout">${options(state.config.layouts, scene.layout)}</select></div>
-          <div class="field"><label for="${prefix}-motion">Motion</label><select id="${prefix}-motion" data-field="motion">${options(state.config.motions, scene.motion)}</select></div>
+          ${layered ? '<input type="hidden" data-field="motion" value="still">' :
+            `<div class="field"><label for="${prefix}-motion">Motion</label><select id="${prefix}-motion" data-field="motion">${options(state.config.motions, scene.motion)}</select></div>`}
         </div>
         <div class="field"><label for="${prefix}-title">Title</label><input id="${prefix}-title" data-field="title" value="${escapeHtml(scene.title)}"></div>
         <div class="field"><label for="${prefix}-caption">On-screen caption</label><textarea id="${prefix}-caption" data-field="caption" rows="2">${escapeHtml(scene.caption)}</textarea></div>
-        <div class="field"><label for="${prefix}-art">Artwork ID</label><input id="${prefix}-art" data-field="artId" list="project-art-ids" pattern="[a-z0-9\\-]*" value="${escapeHtml(scene.artId)}" placeholder="e.g. opening-collage"></div>
-        <div class="field"><label for="${prefix}-brief">Artwork brief</label><textarea id="${prefix}-brief" data-field="artBrief" rows="2">${escapeHtml(scene.artBrief)}</textarea></div>
+        ${layered ? `<div class="stack">
+          <h3>Layers in back-to-front order</h3>
+          <p class="hint">Place layers using percentages of the content area. Use either a cue or a word ID for each entrance or exit. Two zeroes select the scene edge.</p>
+          ${sceneWords(scene, project.input)}
+          ${layers.map((layer, layerIndex) => layerEditor(layer, index, layerIndex, layers.length, project)).join("")}
+          <div>${button("Add layer", "add-layer", { name: index.toString(), disabled: layers.length >= (state.config.maxLayers ?? 12) })}</div>
+        </div>` : `<div class="field"><label for="${prefix}-art">Artwork ID</label><input id="${prefix}-art" data-field="artId" list="project-art-ids" pattern="[a-z0-9\\-]*" value="${escapeHtml(scene.artId)}" placeholder="e.g. opening-collage"></div>
+        <div class="field"><label for="${prefix}-brief">Artwork brief</label><textarea id="${prefix}-brief" data-field="artBrief" rows="2">${escapeHtml(scene.artBrief)}</textarea></div>`}
         <div>${button("Remove scene", "remove-scene", { name: index.toString(), style: "quiet danger small" })}</div>
       </div>
     </details>`;
@@ -859,11 +1008,11 @@ function assetUseReview(project) {
           <h2>Artwork use review</h2>
           ${badge(`${approved} / ${records.length} approved`, approved === records.length ? "good" : "warm")}
         </div>
-        <p class="hint">Check each use of approved artwork in its planned scene.</p>
-        ${pendingImages ? '<p class="hint">Import and approve the required images to prepare these proofs.</p>' : ""}
+        <p class="hint">Check each planned use against the source image and rendered scene.</p>
+        ${pendingImages ? '<p class="hint">Resolve artwork issues and approve the required source images before preparing proofs.</p>' : ""}
         ${needsProof && !pendingImages ? `<div>${button("Prepare artwork proofs", "prepare-asset-proofs", { primary: true, disabled: busy })}</div>` : ""}
         <ul class="proof-list" aria-label="Planned artwork uses">
-          ${records.map(record => proofChoice(record.id, record.title, record.assetId, record.status, record.id === selected.id,
+          ${records.map(record => proofChoice(record.id, record.title, [record.assetId, record.layerId].filter(Boolean).join(" · "), record.status, record.id === selected.id,
             "select-asset-proof")).join("")}
         </ul>
         ${artworkComplete(project) ? afterArtworkButton(project) : ""}
@@ -879,14 +1028,38 @@ function assetUseReview(project) {
         ${selected.status === "failed" ? '<p class="hint">Fix the artwork or update the scene plan, then prepare a new proof.</p>' : ""}
         ${proofAdvisory(selected, "assets", busy)}
         ${selected.proofUrl ? proofReviewActions(selected, "assets", "Approve this use", "Reject this use", busy) : ""}
+        ${selected.proofUrl && original && !original.issue ? artworkIssueForm(original, "proof", busy) : ""}
       </section>
     </div>
   </section>`;
 }
 
+function artworkIssueForm(asset, section, busy) {
+  const prefix = `${section}-issue-${asset.id}`;
+  return `<details class="proof-review">
+    <summary>Report artwork issue</summary>
+    <form class="stack" data-form="art-issue" data-asset-id="${escapeHtml(asset.id)}">
+      <div class="field"><label for="${prefix}-kind">Issue type</label>
+        <select id="${prefix}-kind" name="kind"><option value="defective">Defective artwork</option><option value="incomplete">Incomplete artwork</option></select>
+      </div>
+      <div class="field"><label for="${prefix}-reason">What needs to change?</label>
+        <textarea id="${prefix}-reason" name="reason" rows="2" maxlength="1000" required></textarea>
+      </div>
+      <div><button class="button danger"${busy ? " disabled" : ""}>Record artwork issue</button></div>
+    </form>
+  </details>`;
+}
+
+function artworkAssetStatus(asset) {
+  if (asset?.issue) return badge(asset.issue.kind === "incomplete" ? "Incomplete" : "Defective", "error");
+  if (!asset) return badge("Missing", "warm");
+  if (!asset.approved) return badge("Awaiting source approval", "warm");
+  return badge("Source approved", "good");
+}
+
 function artworkView(project) {
   if (!project.plan?.approved) return prerequisite("Artwork", "Approve a scene plan to see its complete artwork request.", "plan", "Open scene plan");
-  const required = new Map(project.plan.scenes.filter(scene => scene.artId).map(scene => [scene.artId, scene.artBrief]));
+  const required = new Map(project.plan.scenes.flatMap(sceneArtwork).map(layer => [layer.artId, layer.artBrief]));
   const assets = new Map(project.assets.map(asset => [asset.id, asset]));
   const entries = [...new Set([...required.keys(), ...assets.keys()])];
   const pending = pendingArt(project).length;
@@ -902,6 +1075,7 @@ function artworkView(project) {
         ${entries.length ? `<ul class="art-list">${entries.map(id => {
           const asset = assets.get(id);
           const url = localMedia(asset?.url);
+          const canPublish = asset?.publishEligible;
           return `<li class="art-item">
             <div>
               <h3>${escapeHtml(id)}</h3>
@@ -909,24 +1083,28 @@ function artworkView(project) {
               ${asset?.name ? `<p class="art-copy">${escapeHtml(asset.name)}</p>` : ""}
               ${asset?.libraryVersion ? `<p class="art-copy">Library version ${escapeHtml(asset.libraryVersion)}</p>` : ""}
               ${url ? `<img src="${url}" alt="${escapeHtml(id)}" loading="lazy">` : ""}
+              ${asset?.issue ? `<p class="notice error actions">${escapeHtml(asset.issue.reason)}</p>
+                <p class="hint">${required.has(id) ? "Replace the image or update the scene plan to resolve this use." : "Unused in the current scene plan."}</p>` : ""}
             </div>
             <div class="stack">
-              ${badge(asset?.approved ? "Approved" : asset ? "Awaiting approval" : "Missing", asset?.approved ? "good" : "warm")}
-              ${asset && !asset.approved ? button("Approve artwork", "approve-art", { primary: true, name: id, disabled: Boolean(project.busy) }) : ""}
-              ${asset?.approved && !asset.libraryId ? button("Save to library", "save-art-library", { name: id, disabled: Boolean(project.busy) }) : ""}
+              ${artworkAssetStatus(asset)}
+              ${asset && !asset.approved && !asset.issue ? button("Approve source image", "approve-art", { primary: true, name: id, disabled: Boolean(project.busy) }) : ""}
+              ${canPublish ? button("Publish to art library", "publish-art", { name: id, disabled: Boolean(project.busy) }) : ""}
               ${!asset && state.config.imageAvailable ? button("Generate image", "generate-art", {
                 name: id,
                 disabled: Boolean(project.busy) || !callsRemaining,
                 style: "small",
               }) : ""}
               ${button(asset ? "Replace file" : "Select for upload", "select-art", { name: id, style: "quiet small" })}
-              ${asset ? "" : libraryShortcut("Use library artwork", id)}
+              ${asset?.issue ? libraryShortcut("Replace from library", id) : asset ? "" : libraryShortcut("Use library artwork", id)}
+              ${asset && !asset.issue ? artworkIssueForm(asset, "source", Boolean(project.busy)) : ""}
+              ${asset?.issue && required.has(id) ? goTo("plan", "Edit scene use") : ""}
             </div>
           </li>`;
         }).join("")}</ul>` : '<p class="hint">This plan uses the built-in text layouts.</p>'}
         <div class="cluster actions">
           ${libraryShortcut()}
-          <span class="hint">Approving artwork saves it to the shared art library.</span>
+          <span class="hint">You can publish an image after its planned uses pass review.</span>
         </div>
         ${project.missing.length ? state.config.imageAvailable
           ? `<p class="hint actions">${callsRemaining ? "Image generation sends one art brief at a time to OpenAI." : "This project has used its image generation requests."}</p>`
@@ -965,11 +1143,13 @@ function mixSettings(mix) {
     musicMode: mix.musicMode ?? "",
     musicGainDb: mix.music?.gainDb ?? -24,
     effects: mix.effects.map(({ id, start, gainDb }) => ({ id, start, gainDb })),
+    musicRegions: mix.musicRegions ?? [],
   };
 }
 
 function mixPreviewUrl(project) {
-  return `${projectPath("/mix/preview")}?revision=${encodeURIComponent(project.revision)}`;
+  const url = project.mix?.rendered?.url ?? projectPath("/mix/preview");
+  return `${url}?revision=${encodeURIComponent(project.revision)}`;
 }
 
 function hasAudibleTracks(project) {
@@ -1012,11 +1192,52 @@ function sceneTiming(project) {
   </details>`;
 }
 
+function musicRegionEditor(region, index, lineCount) {
+  const prefix = `music-region-${index}`;
+  return `<li class="mix-item" data-music-region>
+    <div class="panel-header"><h3>Region ${index + 1}</h3>
+      ${button("Remove region", "remove-music-region", { name: index.toString(), style: "quiet danger small" })}
+    </div>
+    <div class="mix-controls">
+      <div class="field"><label for="${prefix}-start">First cue</label>
+        <input id="${prefix}-start" data-region-start data-mix-setting type="number" min="1" max="${lineCount}" value="${escapeHtml(region.startLine)}" required>
+      </div>
+      <div class="field"><label for="${prefix}-end">Last cue</label>
+        <input id="${prefix}-end" data-region-end data-mix-setting type="number" min="1" max="${lineCount}" value="${escapeHtml(region.endLine)}" required>
+      </div>
+      <div class="field"><label for="${prefix}-gain">Level (dB)</label>
+        <input id="${prefix}-gain" data-region-gain data-mix-setting type="number" min="-48" max="0" step="any" value="${escapeHtml(region.gainDb ?? -24)}"${region.gainDb === null ? " disabled" : ""} required>
+      </div>
+    </div>
+    <label class="music-option"><input type="checkbox" data-region-mute data-mix-setting${region.gainDb === null ? " checked" : ""}> Mute music in this region</label>
+  </li>`;
+}
+
+function measuredValue(value, unit) {
+  return Number.isFinite(value) ? `${value.toFixed(2)} ${unit}` : "—";
+}
+
+function mixEvidence(rendered) {
+  if (!rendered) return "";
+  return `<div class="stack" data-mix-evidence>
+    <dl class="receipt">
+      <dt>Verified WAV</dt><dd>${shortHash(rendered.sha256)}</dd>
+      <dt>Duration</dt><dd>${proofSeconds(rendered.duration)}</dd>
+      <dt>Format</dt><dd>${escapeHtml(rendered.sampleRate)} Hz · ${escapeHtml(rendered.channels)} channels</dd>
+      <dt>Integrated loudness</dt><dd>${measuredValue(rendered.levels?.integratedLufs, "LUFS")}</dd>
+      <dt>True peak</dt><dd>${measuredValue(rendered.levels?.truePeakDbtp, "dBTP")}</dd>
+    </dl>
+    ${rendered.warnings?.length ? `<ul class="read-list">${rendered.warnings.map(warning => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  </div>`;
+}
+
 function compositionView(project) {
   if (!project.input) return prerequisite("Composition", "Lock the narration recording and transcript before composing the soundtrack.", "intake", "Open intake");
   if (!project.plan?.approved) return prerequisite("Composition", "Approve the scene plan before composing the soundtrack.", "plan", "Open scene plan");
   if (!artworkComplete(project)) return prerequisite("Composition", "Approve the planned artwork uses before composing the soundtrack.", "art", "Open artwork");
   const mix = project.mix ?? { musicMode: null, music: null, effects: [], approved: false };
+  const rendered = mix.rendered;
+  const approved = mixComplete(project);
   const values = state.mixDraft?.settings ?? mixSettings(mix);
   const dirty = Boolean(state.mixDraft);
   const busy = Boolean(project.busy);
@@ -1024,7 +1245,7 @@ function compositionView(project) {
   const effects = mix.effects;
   const duration = project.input.duration;
   const hasDecision = mix.musicMode === "none" || (mix.musicMode === "track" && mix.music);
-  const canListen = hasDecision && hasAudibleTracks(project);
+  const canListen = Boolean(rendered?.sha256 && hasAudibleTracks(project));
   const full = effects.length >= (state.config.maxEffects ?? 12);
   return `
     ${heading("Composition", "Choose the music, time any sound effects, and listen to the mix before approving it.")}
@@ -1033,7 +1254,7 @@ function compositionView(project) {
         <section class="panel">
           <div class="panel-header">
             <h2>Music</h2>
-            ${mix.approved ? badge("Approved", "good") : ""}
+            ${approved ? badge("Approved", "good") : ""}
           </div>
           <div class="stack">
             <div class="cluster">
@@ -1053,6 +1274,13 @@ function compositionView(project) {
                 <input id="music-gain" data-mix-setting name="musicGainDb" type="number" min="-48" max="0" step=".1" value="${escapeHtml(values.musicGainDb)}" required>
               </div>
             </div>` : '<p class="hint">Import a track or create a soundtrack to add music.</p>'}
+            ${mix.music ? `<section class="stack">
+              <h3>Music regions</h3>
+              <p class="hint">Set a music level or mute it from the first selected cue through the last selected cue.</p>
+              ${values.musicRegions.length ? `<ul class="mix-items">${values.musicRegions.map((region, index) =>
+                musicRegionEditor(region, index, project.input.lines.length)).join("")}</ul>` : ""}
+              <div>${button("Add music region", "add-music-region", { disabled: busy || values.musicRegions.length >= (state.config.maxMusicRegions ?? 24) })}</div>
+            </section>` : ""}
           </div>
         </section>
         <section class="panel">
@@ -1062,15 +1290,25 @@ function compositionView(project) {
         </section>
         <section class="panel">
           <div class="panel-header"><h2>Review mix</h2></div>
-          <div data-mix-listen${dirty || !canListen ? " hidden" : ""}>${canListen ? previewAudio(mixPreviewUrl(project), "Listen to the complete mix") : ""}</div>
-          <p class="hint" data-mix-unsaved${dirty ? "" : " hidden"}>Save these settings to hear the updated mix.</p>
-          ${!hasDecision ? '<p class="hint" data-mix-no-decision>Make an explicit music choice to review the mix.</p>' : ""}
-          ${hasDecision && !canListen ? '<p class="hint" data-mix-silent>This cut is silent.</p>' : ""}
+          <div class="stack" data-mix-saved-review${dirty ? " hidden" : ""}>
+            ${mixEvidence(rendered)}
+            ${canListen ? previewAudio(mixPreviewUrl(project), "Listen to the verified mix") : ""}
+            ${rendered && !canListen ? '<p class="hint">This cut is silent.</p>' : ""}
+            ${!hasDecision ? '<p class="hint">Save a music choice before preparing the mix.</p>' :
+              !rendered ? '<p class="hint">Prepare the WAV and measure its audio before approving it for export.</p>' : ""}
+            ${rendered && !approved ? `<label class="music-option"><input id="confirm-mix-review" type="checkbox">
+              ${canListen ? "I listened to and checked the verified mix." : "I checked the silent deliverable."}</label>` : ""}
+          </div>
+          <p class="hint" data-mix-unsaved${dirty ? "" : " hidden"}>Save these settings to prepare and review the updated mix.</p>
           <div class="cluster">
             <button class="button" type="submit" data-mix-save${busy || !dirty || !values.musicMode ? " disabled" : ""}>Save composition</button>
-            ${!mix.approved ? button("Approve composition", "approve-mix", { primary: true, disabled: busy || !hasDecision || dirty }) : ""}
+            ${!approved ? button(rendered ? "Prepare mix again" : "Prepare verified mix", "prepare-mix", {
+              primary: !rendered,
+              disabled: busy || state.config.audioAvailable === false || !hasDecision || dirty,
+            }) : ""}
+            ${!approved && rendered ? button("Approve composition", "approve-mix", { primary: true, disabled: true }) : ""}
           </div>
-          <div data-mix-next${dirty || !mix.approved ? " hidden" : ""}>${goTo("review", "Open preview")}</div>
+          <div data-mix-next${dirty || !approved ? " hidden" : ""}>${goTo("review", "Open preview")}</div>
         </section>
       </form>
       <div class="stack">
@@ -1218,7 +1456,7 @@ function reviewView(project) {
   }
   if (!project.plan?.approved) return prerequisite("Preview & QC", "Approve a scene plan to prepare animation.", "plan", "Open scene plan");
   if (!artworkComplete(project)) return prerequisite("Preview & QC", "Approve the planned artwork uses to prepare animation.", "art", "Open artwork");
-  if (!project.mix?.approved) return prerequisite("Preview & QC", "Approve the audio composition to prepare animation.", "composition", "Open composition");
+  if (!mixComplete(project)) return prerequisite("Preview & QC", "Review and approve the verified mix to prepare animation.", "composition", "Open composition");
   if (!project.animationPrepared) return `
     ${heading("Preview & QC")}
     <section class="panel slim">
@@ -1505,6 +1743,7 @@ async function perform(operation, { busy, success, stage, resetPlan = false, vie
     if (!project?.id) throw new Error("The studio did not return a project.");
     updated = true;
     if (state.project?.id !== project.id) {
+      state.timingWord = 1;
       state.assetProofId = "";
       state.animationReviewId = "";
       try { localStorage.setItem("bacchus-project", project.id); } catch { /* Browser storage is optional. */ }
@@ -1600,13 +1839,12 @@ function settingsPayload(data) {
   const payload = {
     completed: true,
     plannerProvider: data.get("plannerProvider"),
-    useOpenAITranscription: data.has("useOpenAITranscription"),
     useOpenAIImages: data.has("useOpenAIImages"),
     apiLogDirectory: data.get("apiLogDirectory")?.trim() ?? "",
     clearOpenAIKey: data.has("clearOpenAIKey"),
     clearAnthropicKey: data.has("clearAnthropicKey"),
   };
-  for (const field of ["openAIKey", "anthropicKey", "openAIModel", "claudeModel", "transcribeModel", "imageModel"]) {
+  for (const field of ["openAIKey", "anthropicKey", "openAIModel", "claudeModel", "imageModel"]) {
     const value = data.get(field)?.trim();
     if (value) payload[field] = value;
   }
@@ -1633,12 +1871,14 @@ async function pinArtwork(data) {
   const libraryId = state.libraryId;
   const asset = state.library.find(item => item.id === libraryId);
   const version = state.libraryVersion ?? asset?.latestVersion;
+  const selected = asset?.versions.find(item => item.version === version);
   const path = `/api/projects/${encodeURIComponent(projectId)}`;
   const previousProject = state.project?.id;
   await perform(async () => {
     const project = await api(path);
     const existing = project.assets.find(item => item.id === alias);
-    if (existing && (existing.libraryId !== libraryId || existing.libraryVersion !== version)) {
+    if (existing && !(existing.issue && existing.hash !== selected?.hash)
+        && (existing.libraryId !== libraryId || existing.libraryVersion !== version)) {
       throw new Error(`This project already uses “${alias}”. Choose a unique artwork ID.`);
     }
     return post(`${path}/library/pin`, { revision: project.revision, libraryId, version, alias });
@@ -1656,12 +1896,99 @@ async function pinArtwork(data) {
   }
 }
 
+function readLayer(section) {
+  const read = key => section.querySelector(`[data-layer-field="${key}"]`)?.value ?? "";
+  const number = key => Number(read(key));
+  const kind = read("kind");
+  const effect = read("enter.effect");
+  const items = ["bar-chart", "flow"].includes(kind) ? read("items").split("\n").map(row => row.trim()).filter(Boolean).map(row => {
+    if (kind === "flow") return { label: row, value: 0 };
+    const divider = row.lastIndexOf("|");
+    const rawValue = divider === -1 ? "" : row.slice(divider + 1).trim();
+    return { label: divider === -1 ? row : row.slice(0, divider).trim(), value: rawValue ? Number(rawValue) : null };
+  }) : [];
+  return {
+    id: read("id"), kind,
+    box: Object.fromEntries(["x", "y", "w", "h"].map(key => [key, number(`box.${key}`)])),
+    text: kind === "art" ? "" : read("text"),
+    artId: kind === "art" ? read("artId") : "",
+    artBrief: kind === "art" ? read("artBrief") : "",
+    items,
+    unit: kind === "bar-chart" ? read("unit") : "",
+    enter: { line: number("enter.line"), word: number("enter.word"), effect, duration: effect === "show" ? 0 : number("enter.duration") },
+    leave: { line: number("leave.line"), word: number("leave.word") },
+  };
+}
+
+function repaintScene(index, focusSelector = "summary") {
+  render();
+  const scene = content.querySelector(`[data-scene="${index}"]`);
+  if (!scene) return;
+  scene.open = true;
+  scene.querySelector(focusSelector)?.focus({ preventScroll: true });
+}
+
+function editLayer(action, name) {
+  const [sceneIndex, layerIndex] = name.split("/").map(Number);
+  const layers = updatePlanDraft()[sceneIndex].layers;
+  if (action === "add-layer") {
+    const used = new Set(layers.map(layer => layer.id));
+    let suffix = 1;
+    while (used.has(`layer-${suffix}`)) suffix += 1;
+    layers.push(newLayer(`layer-${suffix}`));
+  } else if (action === "remove-layer") {
+    layers.splice(layerIndex, 1);
+  } else {
+    const shift = action === "layer-back" ? -1 : 1;
+    const target = layerIndex + shift;
+    if (target >= 0 && target < layers.length) {
+      [layers[layerIndex], layers[target]] = [layers[target], layers[layerIndex]];
+    }
+  }
+  repaintScene(sceneIndex);
+}
+
+function changeSceneLayout(control) {
+  const owner = control.closest("[data-scene]");
+  const index = Number(owner.dataset.scene);
+  if (owner.dataset.layout === "layered" && control.value !== "layered"
+      && !window.confirm("Switch to a preset layout and remove this scene’s custom layers?")) {
+    control.value = "layered";
+    updatePlanDraft();
+    return;
+  }
+  const scene = updatePlanDraft()[index];
+  if (scene.layout === "layered") {
+    const layer = newLayer("layer-1");
+    if (scene.artId) {
+      layer.kind = "art";
+      layer.artId = scene.artId;
+      layer.artBrief = scene.artBrief;
+    } else {
+      layer.text = scene.caption || scene.title;
+    }
+    scene.layers = [layer];
+    scene.artId = "";
+    scene.artBrief = "";
+    scene.motion = "still";
+  } else {
+    const art = scene.layers.find(layer => layer.kind === "art");
+    if (art) {
+      scene.artId = art.artId;
+      scene.artBrief = art.artBrief;
+    }
+    scene.layers = [];
+  }
+  repaintScene(index, '[data-field="layout"]');
+}
+
 function updatePlanDraft() {
   const scenes = Array.from(content.querySelectorAll("[data-scene]"), section => {
-    return Object.fromEntries(Array.from(section.querySelectorAll("[data-field]"), field => {
+    const scene = Object.fromEntries(Array.from(section.querySelectorAll("[data-field]"), field => {
       const value = field.type === "number" ? Number(field.value) : field.value;
       return [field.dataset.field, value];
     }));
+    return { artId: "", artBrief: "", ...scene, layers: Array.from(section.querySelectorAll("[data-layer]"), readLayer) };
   });
   state.planDraft = { id: state.project.id, hash: state.project.plan.hash, scenes };
   const save = content.querySelector("[data-plan-save]");
@@ -1686,6 +2013,16 @@ function updateMixDraft(form) {
       row.querySelector("progress").value = start;
       return { id: row.dataset.effect, start, gainDb: Number(row.querySelector("[data-fx-gain]").value) };
     }),
+    musicRegions: Array.from(form.querySelectorAll("[data-music-region]"), row => {
+      const mute = row.querySelector("[data-region-mute]").checked;
+      const level = row.querySelector("[data-region-gain]");
+      level.disabled = mute;
+      return {
+        startLine: Number(row.querySelector("[data-region-start]").value),
+        endLine: Number(row.querySelector("[data-region-end]").value),
+        gainDb: mute ? null : Number(level.value),
+      };
+    }),
   };
   const dirty = JSON.stringify(settings) !== JSON.stringify(mixSettings(project.mix));
   state.mixDraft = dirty ? { id: project.id, revision: project.revision, settings } : null;
@@ -1693,17 +2030,35 @@ function updateMixDraft(form) {
   const control = selector => form.querySelector(selector);
   control("[data-mix-save]").disabled = busy || !dirty || !settings.musicMode;
   const approve = control('[data-action="approve-mix"]');
-  if (approve) approve.disabled = busy || dirty || !settings.musicMode;
-  const listen = control("[data-mix-listen]");
-  listen.hidden = dirty || !project.mix.musicMode || !hasAudibleTracks(project);
-  if (dirty) listen.querySelector("audio")?.pause();
+  const confirmed = control("#confirm-mix-review");
+  if (dirty && confirmed) confirmed.checked = false;
+  if (approve) approve.disabled = busy || dirty || !confirmed?.checked;
+  const prepare = control('[data-action="prepare-mix"]');
+  if (prepare) {
+    const choice = project.mix.musicMode === "none" || (project.mix.musicMode === "track" && project.mix.music);
+    prepare.disabled = busy || dirty || !choice || state.config.audioAvailable === false;
+  }
+  const saved = control("[data-mix-saved-review]");
+  saved.hidden = dirty;
+  if (dirty) saved.querySelector("audio")?.pause();
   control("[data-mix-unsaved]").hidden = !dirty;
-  const noDecision = control("[data-mix-no-decision]");
-  if (noDecision) noDecision.hidden = dirty;
-  const silent = control("[data-mix-silent]");
-  if (silent) silent.hidden = dirty;
-  control("[data-mix-next]").hidden = dirty || !project.mix.approved;
+  control("[data-mix-next]").hidden = dirty || !mixComplete(project);
   return settings;
+}
+
+function editMusicRegion(action, index) {
+  const settings = updateMixDraft(content.querySelector('[data-form="mix"]'));
+  const regions = settings.musicRegions;
+  if (action === "add-music-region") {
+    const last = Math.max(0, ...regions.map(region => region.endLine));
+    const next = Math.min(state.project.input.lines.length, last + 1);
+    regions.push({ startLine: next, endLine: next, gainDb: settings.musicGainDb });
+  } else {
+    regions.splice(index, 1);
+  }
+  state.mixDraft = { id: state.project.id, revision: state.project.revision, settings };
+  render();
+  content.querySelector('[data-action="add-music-region"]')?.focus({ preventScroll: true });
 }
 
 function selectProject(id) {
@@ -1726,6 +2081,21 @@ document.addEventListener("change", event => {
     content.querySelector("#library-version").focus();
   } else if (control.id === "library-project") {
     state.libraryProject = control.value;
+  } else if (control.id === "timing-word-index") {
+    const index = Number(control.value);
+    const word = state.project.transcript.words[index - 1];
+    if (!word) return;
+    state.timingWord = index;
+    content.querySelector("#timing-word-fields").innerHTML = timingWordFields(word, state.project.audio.duration);
+  } else if (control.dataset.field === "layout" && control.closest("[data-scene]").dataset.layout !== control.value) {
+    changeSceneLayout(control);
+  } else if (["kind", "enter.effect"].includes(control.dataset.layerField)) {
+    const index = Number(control.closest("[data-scene]").dataset.scene);
+    const layerIndex = [...control.closest("[data-scene]").querySelectorAll("[data-layer]")].indexOf(control.closest("[data-layer]"));
+    const layer = updatePlanDraft()[index].layers[layerIndex];
+    if (control.dataset.layerField === "kind") layer.items = [];
+    if (layer.enter.effect !== "show" && !layer.enter.duration) layer.enter.duration = 0.3;
+    repaintScene(index, `[id="${control.id}"]`);
   }
 });
 
@@ -1745,21 +2115,20 @@ document.addEventListener("input", event => {
   } else if (control.id === "library-alias") {
     state.libraryAlias = control.value;
   }
-  if (["script", "intention", "style"].includes(control.id)) {
+  if (["intention", "style"].includes(control.id)) {
     state.inputDraft = {
       id: state.project.id,
-      script: content.querySelector("#script").value,
       intention: content.querySelector("#intention").value,
       style: content.querySelector("#style").value,
     };
   }
-  if (control.dataset.field) updatePlanDraft();
+  if (control.dataset.field || control.dataset.layerField) updatePlanDraft();
   if (control.hasAttribute("data-mix-setting")) updateMixDraft(control.form);
+  if (control.id === "confirm-mix-review") {
+    const approve = content.querySelector('[data-action="approve-mix"]');
+    if (approve) approve.disabled = !control.checked || state.pending || Boolean(state.project.busy);
+  }
 });
-
-function replaceTranscriptDraft() {
-  if (state.inputDraft) state.inputDraft.script = undefined;
-}
 
 function importFile(name, data) {
   const project = state.project;
@@ -1779,25 +2148,20 @@ function importFile(name, data) {
   }
   const id = data.get("id")?.trim();
   const replacedArt = isArtwork && project.assets.some(asset => asset.id === id);
-  const replacedAudio = name === "audio" && project.audio && (project.transcript || state.inputDraft?.script);
+  const replacedAudio = name === "audio" && project.audio && project.transcript;
   const replacedMusic = name === "mix-music" && project.mix.music;
   const changingMix = name.startsWith("mix-");
-  const replacingTimings = name === "timings" && content.querySelector("#script").value.trim();
+  const replacingTimings = name === "timings" && project.transcript;
   const warning = replacedArt ? `Replace the artwork for ${id}? The new image will need approval.`
     : replacedAudio ? "Replace this recording and clear the current transcript?"
     : replacedMusic ? "Replace the project's music track?"
-    : replacingTimings ? "Import these timings and replace the transcript in the editor?"
+    : replacingTimings ? "Replace the current word timings with this file?"
     : changingMix && state.mixDraft ? "Discard unsaved composition edits and import this audio?"
     : "";
   if (warning && !window.confirm(warning)) return;
   const path = isArtwork ? `/assets/${encodeURIComponent(id)}`
     : ({ audio: "/audio", timings: "/timings", "mix-music": "/mix/music", "mix-effects": "/mix/effects" })[name];
-  perform(async () => {
-    const updated = await upload(path, file);
-    if (name === "audio" && updated.audio?.hash !== project.audio?.hash) replaceTranscriptDraft();
-    if (name === "timings") replaceTranscriptDraft();
-    return updated;
-  }, { busy: "Importing file…", success: "File imported." });
+  perform(() => upload(path, file), { busy: "Importing file…", success: "File imported." });
 }
 
 document.addEventListener("submit", event => {
@@ -1817,6 +2181,14 @@ document.addEventListener("submit", event => {
     saveSettings(payload, !state.settings.completed);
   } else if (name === "library-pin") {
     pinArtwork(data);
+  } else if (name === "art-issue") {
+    const reason = data.get("reason").trim();
+    if (!reason) {
+      setMessage("Describe the artwork issue before recording it.", "error");
+      return;
+    }
+    perform(() => mutate(`/assets/${encodeURIComponent(form.dataset.assetId)}/issue`, { kind: data.get("kind"), reason }),
+      { success: "Artwork issue recorded." });
   } else if (name === "proof-result") {
     const { proofGroup, proofId } = form.dataset;
     const passed = form.dataset.passed === "true";
@@ -1834,17 +2206,41 @@ document.addEventListener("submit", event => {
       return;
     }
     perform(() => post("/api/projects", { title }), { stage: "intake" });
+  } else if (name === "derive-timings") {
+    const modelDirectory = data.get("modelDirectory").trim();
+    state.timingModelDirectory = modelDirectory;
+    if (state.project.transcript && !window.confirm("Replace the current word timings with new timings from the recording?")) return;
+    perform(() => mutate("/timings/derive", { modelDirectory }), {
+      busy: "Deriving exact word timings…", success: "Word timings are ready to review.",
+    });
+  } else if (name === "correct-timing") {
+    const index = Number(data.get("index"));
+    if (index !== state.timingWord) {
+      setMessage("Select the word before saving its correction.", "error");
+      return;
+    }
+    const words = state.project.transcript.words.map(({ text, start, end }, position) =>
+      position === index - 1
+        ? { text: data.get("text").trim(), start: Number(data.get("start")), end: Number(data.get("end")) }
+        : { text, start, end }
+    );
+    perform(() => mutate("/timings/text", { words }), { success: "Word correction saved. Review the updated timing." });
   } else if (name === "input") {
     perform(() => mutate("/input", {
       script: data.get("script"),
       intention: data.get("intention"),
       style: data.get("style"),
+      confirmTiming: data.has("confirmTiming"),
     }), {
       success: "Recording and transcript locked.",
       stage: "plan",
     });
   } else if (name === "plan") {
     const scenes = updatePlanDraft();
+    if (scenes.some(scene => scene.layers.some(layer => layer.items.some(item => !Number.isFinite(item.value))))) {
+      setMessage("Enter a numeric value after the bar on each bar chart line.", "error");
+      return;
+    }
     perform(() => mutate("/plan", { scenes }), { success: "Scene changes saved.", resetPlan: true });
   } else if (name === "mix") {
     const settings = updateMixDraft(form);
@@ -1867,22 +2263,12 @@ document.addEventListener("submit", event => {
 const stageActions = {
   "approve-plan": ["/plan/approve", "Plan approved.", project => artworkComplete(project) ? afterArtwork(project) : "art"],
   "prepare-asset-proofs": ["/assets/checks", "Artwork proofs prepared.", undefined, "Preparing artwork proofs…"],
-  "approve-mix": ["/mix/approve", "Composition approved.", "review"],
+  "prepare-mix": ["/mix/prepare", "Verified WAV ready to review.", undefined, "Preparing and measuring the mix…"],
   "prepare-animation": ["/animation/prepare", "Animation prepared.", undefined, "Preparing the animation…"],
   qc: ["/qc", "Animation checks finished.", undefined, "Running animation checks…"],
   "accept-candidate": ["/candidate/accept", "Candidate accepted.", "export"],
   export: ["/export", ""],
 };
-
-function transcribe() {
-  const initial = content.querySelector("#script").value;
-  if (initial.trim() && !window.confirm("Generate a new transcript and replace the text in the editor?")) return;
-  perform(async () => {
-    const project = await mutate("/transcribe");
-    if (content.querySelector("#script").value === initial) replaceTranscriptDraft();
-    return project;
-  }, { busy: "Transcribing the recording…", success: "Transcript ready to review." });
-}
 
 async function copyRequest() {
   const request = content.querySelector("#art-request");
@@ -1909,6 +2295,7 @@ function editScene(action, index) {
       caption: "",
       artId: "",
       artBrief: "",
+      layers: [],
     });
   }
   render();
@@ -1934,7 +2321,7 @@ document.addEventListener("click", event => {
     openStage("intake", false);
     content.querySelector("#new-title")?.focus();
   } else if (action === "demo") {
-    perform(() => post("/api/demo", {}), { busy: "Creating example…", stage: "review" });
+    perform(() => post("/api/demo", {}), { busy: "Creating example…", stage: nextStage });
   } else if (action === "refresh-settings") {
     refreshSettings();
   } else if (action === "install-media-tools") {
@@ -1952,18 +2339,20 @@ document.addEventListener("click", event => {
   } else if (action === "unlock-input") {
     if (window.confirm("Unlocking clears the current plan, quality checks, and export from this project. Unlock the intake?")) {
       const { id, input, style } = state.project;
-      state.inputDraft = { id, script: input.script, intention: input.intention, style: input.style ?? style };
+      state.inputDraft = { id, intention: input.intention, style: input.style ?? style };
       perform(() => mutate("/input/unlock"), { success: "Intake unlocked.", resetPlan: true });
     }
-  } else if (action === "transcribe-audio") {
-    transcribe();
+  } else if (action === "seek-timing") {
+    const source = content.querySelector("#narration-source");
+    if (source) {
+      source.pause();
+      source.currentTime = Number(name);
+      source.focus({ preventScroll: true });
+      source.scrollIntoView({ block: "nearest" });
+    }
   } else if (action === "remove-audio") {
     if (window.confirm("Remove this recording and clear the current transcript?")) {
-      perform(async () => {
-        const project = await mutate("/audio/remove");
-        replaceTranscriptDraft();
-        return project;
-      }, { success: "Recording removed." });
+      perform(() => mutate("/audio/remove"), { success: "Recording removed." });
     }
   } else if (action === "generate-plan" || action === "starter-plan") {
     if (state.project.plan && !window.confirm("Replacing the current plan clears its approval and candidate. Replace the plan?")) return;
@@ -1975,13 +2364,23 @@ document.addEventListener("click", event => {
     });
   } else if (action === "add-scene" || action === "remove-scene") {
     editScene(action, Number(name));
+  } else if (["add-layer", "remove-layer", "layer-back", "layer-forward"].includes(action)) {
+    editLayer(action, name);
+  } else if (action === "add-music-region" || action === "remove-music-region") {
+    editMusicRegion(action, Number(name));
+  } else if (action === "approve-mix") {
+    if (content.querySelector("#confirm-mix-review")?.checked) {
+      perform(() => mutate("/mix/approve", { reviewed: true }), { success: "Verified composition approved.", stage: "review" });
+    }
   } else if (action === "select-art") {
     content.querySelector("#asset-id").value = name;
     content.querySelector("#art-file").focus();
-  } else if (action === "approve-art" || action === "save-art-library") {
+  } else if (action === "approve-art") {
     perform(() => mutate(`/assets/${encodeURIComponent(name)}/approve`), {
-      success: action === "save-art-library" ? "Artwork saved to the library." : "Artwork approved and saved to the library.",
+      success: "Source approved for planned-use review.",
     });
+  } else if (action === "publish-art") {
+    perform(() => mutate(`/assets/${encodeURIComponent(name)}/publish`), { success: "Artwork published to the library." });
   } else if (action === "generate-art") {
     perform(() => mutate(`/assets/${encodeURIComponent(name)}/generate`), {
       busy: `Generating ${name} with OpenAI…`,

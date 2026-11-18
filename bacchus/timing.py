@@ -24,7 +24,7 @@ def _finite_number(value):
 
 def _word_spans(words, duration):
     spans = []
-    previous_start = 0
+    previous_start = -1
     script_length = 0
     for index, word in enumerate(words, 1):
         if not isinstance(word, dict):
@@ -39,20 +39,17 @@ def _word_spans(words, duration):
         start, end = word.get("start"), word.get("end")
         if not (
             _finite_number(start) and _finite_number(end)
-            and previous_start <= start < duration
+            and 0 <= start < duration and previous_start < start
             and start < end <= duration + END_TOLERANCE
-        ):
+        ) or str(word.get("end_basis", "")).startswith("estimated"):
             raise TimingError(f"Word {index} has unordered times or extends past the recording.")
         previous_start = start
         end = min(end, duration)
         script_length += len(text) + int(index > 1)
         if script_length > MAX_TRANSCRIPT_LENGTH:
             raise TimingError("The word timings contain too much text for this project.")
-        if spans and start < spans[-1][2]:
-            start_text, start_time, end_time = spans.pop()
-            text, start, end = f"{start_text} {text}", start_time, max(end, end_time)
         if len(text) > MAX_CUE_LENGTH:
-            raise TimingError(f"Word {index} or its overlapping words are too long for one cue.")
+            raise TimingError(f"Word {index} is too long for one cue.")
         spans.append((text, start, end))
     return spans
 
@@ -61,19 +58,20 @@ def _group(spans, target, natural):
     lines = []
     text = ""
     start = end = 0
-    for word, word_start, word_end in spans:
-        can_break = natural and len(text) >= 75 and (
-            SENTENCE_END.search(text) or word_start - end >= 0.55
-        )
+    first = 1
+    for word_id, (word, word_start, word_end) in enumerate(spans, 1):
+        can_break = natural and len(text) >= 24 and (SENTENCE_END.search(text) or word_start - end >= 0.55)
         if text and (can_break or len(text) + len(word) + 1 > target):
-            lines.append({"id": len(lines) + 1, "text": text, "start": start, "end": end})
+            lines.append({"id": len(lines) + 1, "text": text, "start": start, "end": end,
+                          "firstWord": first, "lastWord": word_id - 1})
             text = ""
         if text:
             text += f" {word}"
         else:
-            text, start = word, word_start
-        end = word_end
-    lines.append({"id": len(lines) + 1, "text": text, "start": start, "end": end})
+            text, start, end, first = word, word_start, word_end, word_id
+        end = max(end, word_end)
+    lines.append({"id": len(lines) + 1, "text": text, "start": start, "end": end,
+                  "firstWord": first, "lastWord": len(spans)})
     return lines
 
 
@@ -100,6 +98,8 @@ def import_cues(raw: bytes, source_hash: str, duration: float) -> dict:
     words = data.get("words")
     if not isinstance(words, list) or not words:
         raise TimingError("Timing evidence must contain a nonempty words array.")
+    if data.get("findings") or data.get("unresolved"):
+        raise TimingError("Resolve the findings in this cue sheet before importing it.")
     spans = _word_spans(words, duration)
     lines = _group(spans, 165, True)
     if len(lines) > MAX_CUES:
@@ -110,5 +110,8 @@ def import_cues(raw: bytes, source_hash: str, duration: float) -> dict:
         "script": "\n".join(line["text"] for line in lines),
         "timing": "source-cues",
         "lines": lines,
+        "words": [{"id": index, "text": text, "start": start, "end": end}
+                  for index, (text, start, end) in enumerate(spans, 1)],
+        "provenance": data.get("provenance") or {"method": "imported word timings"},
         "model": "imported word timings",
     }

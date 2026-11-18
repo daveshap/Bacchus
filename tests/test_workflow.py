@@ -11,10 +11,14 @@ import wave
 from PIL import Image
 
 from bacchus import audio, planning, render, visual_review
+from bacchus.library import LibraryError
 from bacchus.workflow import Studio, WorkflowError
 
 
-SCRIPT = "A cup sits on the table.\nThe cup catches the light."
+SCRIPT = (
+    "A cup sits on the table beside the window as the afternoon light moves slowly across the room.\n"
+    "The cup catches the light."
+)
 
 
 def two_scenes():
@@ -51,6 +55,19 @@ def wav_tone(frequency, seconds):
         return buffer.getvalue()
 
 
+def word_timings(audio_hash):
+    words = []
+    for start, line in enumerate(SCRIPT.splitlines()):
+        tokens = line.split()
+        for index, text in enumerate(tokens):
+            words.append({
+                "text": text,
+                "start": round(start + index / len(tokens), 6),
+                "end": round(start + (index + 1) / len(tokens), 6),
+            })
+    return json.dumps({"audio": {"sha256": audio_hash}, "duration": 2, "words": words}).encode()
+
+
 @unittest.skipUnless(audio.audio_available(), "FFmpeg is required")
 class StudioWorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -76,11 +93,19 @@ class StudioWorkflowTests(unittest.TestCase):
         return self.project
 
     def lock_input(self):
-        self.change("input", script=SCRIPT, intention="Observe a detail of an everyday object.")
+        if not self.project.get("transcript"):
+            self.project = self.studio.import_timings(
+                self.project_id, self.project["revision"], word_timings(self.project["audio"]["originalHash"]),
+            )
+        self.change("input", script=SCRIPT, intention="Observe a detail of an everyday object.", confirmTiming=True)
 
     def approve_dry_mix(self):
         self.change("mix", musicMode="none", musicGainDb=-24, effects=[])
-        self.change("mix/approve")
+        self.prepare_and_approve_mix()
+
+    def prepare_and_approve_mix(self):
+        self.change("mix/prepare")
+        self.change("mix/approve", reviewed=True)
 
     def record_check(self, scope, check, passed=True):
         self.project = self.studio.record_review(
@@ -122,6 +147,11 @@ class StudioWorkflowTests(unittest.TestCase):
             self.project_id, "cup", {"revision": self.project["revision"]},
         )
 
+    def publish_art(self):
+        self.project = self.studio.publish_art(
+            self.project_id, "cup", {"revision": self.project["revision"]},
+        )
+
     def upload_mix(self, kind, name, raw):
         self.project = self.studio.upload_mix(
             self.project_id, self.project["revision"], kind, name, raw,
@@ -158,6 +188,8 @@ class StudioWorkflowTests(unittest.TestCase):
                 empty["id"], "input",
                 {"revision": empty["revision"], "script": SCRIPT, "intention": "A test."},
             )
+        with self.assertRaisesRegex(WorkflowError, "recording-aligned (word )?cue"):
+            self.change("input", script=SCRIPT, intention="", confirmTiming=True)
         original_audio_hash = self.project["audio"]["hash"]
         result = {"script": SCRIPT, "model": "gpt-transcribe", "timing": "estimated",
                   "requestId": "test", "usage": {"type": "duration", "seconds": 2}}
@@ -168,11 +200,11 @@ class StudioWorkflowTests(unittest.TestCase):
         recording_path = transcribe.call_args.args[0]
         self.assertEqual(recording_path.name, f"{original_audio_hash}.wav")
         self.assertEqual(self.project["transcript"]["script"], SCRIPT)
+        self.assertEqual(self.project["transcript"]["timing"], "text-draft")
         self.assertIsNone(self.project["input"])
         self.assertIsNone(self.project["plan"])
-        corrected = SCRIPT.replace("sits", "stands")
-        self.change("input", script=corrected, intention="Observe an everyday object.")
-        self.assertEqual(self.project["input"]["script"], corrected)
+        with self.assertRaisesRegex(WorkflowError, "recording-aligned (word )?cue"):
+            self.change("input", script=SCRIPT, intention="", confirmTiming=True)
         self.assertEqual(self.project["audio"]["hash"], original_audio_hash)
 
     def test_imported_cues_follow_original_recording(self):
@@ -185,10 +217,13 @@ class StudioWorkflowTests(unittest.TestCase):
             ],
         }).encode()
         self.project = self.studio.import_timings(self.project_id, self.project["revision"], timing_bytes)
-        self.change("input", script="Hello there.", intention="Keep the supplied timing.")
+        with self.assertRaisesRegex(WorkflowError, "confirm"):
+            self.change("input", script="Hello there.", intention="Keep the supplied timing.")
+        self.change("input", script="Hello there.", intention="Keep the supplied timing.", confirmTiming=True)
         source = self.project["input"]
         self.assertEqual(source["timing"], "source-cues")
         self.assertEqual((source["lines"][0]["start"], source["lines"][0]["end"]), (0.41, 1.78))
+        self.assertEqual([word["start"] for word in source["words"]], [0.41, 1.31])
         self.assertEqual(source["timingHash"], hashlib.sha256(timing_bytes).hexdigest())
         self.change("plan/starter")
         self.change("plan/approve")
@@ -196,8 +231,9 @@ class StudioWorkflowTests(unittest.TestCase):
         self.prepare_animation()
         self.pass_animation_review()
         self.change("input/unlock")
-        self.change("input", script="An edited cue.", intention="Use estimated timing.")
-        self.assertEqual(self.project["input"]["timing"], "estimated")
+        with self.assertRaisesRegex(WorkflowError, "Review recording-aligned word cues"):
+            self.change("input", script="An edited cue.", intention="", confirmTiming=True)
+        self.assertIsNone(self.project["input"])
         self.assertFalse(self.project["accepted"])
 
     def test_saved_text_first_project_reopens_under_current_intake_rules(self):
@@ -207,16 +243,18 @@ class StudioWorkflowTests(unittest.TestCase):
         previous = json.loads(path.read_bytes())
         previous.pop("mix")
         previous["legacy"] = True
+        previous["input"]["timing"] = "estimated"
+        previous["input"].pop("words")
         path.write_text(json.dumps(previous), encoding="utf-8")
 
         opened = self.studio.get(identifier)
-        self.assertEqual(opened["input"], sample["input"])
+        self.assertEqual(opened["input"]["script"], sample["input"]["script"])
         self.assertTrue(opened["plan"]["approved"])
         self.assertTrue(opened["requiresAudio"])
-        with self.assertRaisesRegex(WorkflowError, "Prepare the animation"):
+        with self.assertRaisesRegex(WorkflowError, "recording-aligned"):
             self.studio.preview(identifier, 1)
-        opened = self.studio.change(identifier, "animation/prepare", {"revision": opened["revision"]})
-        self.assertTrue(self.studio.preview(identifier, 1).startswith(b"\x89PNG"))
+        with self.assertRaisesRegex(WorkflowError, "recording-aligned"):
+            self.studio.change(identifier, "animation/prepare", {"revision": opened["revision"]})
         unlocked = self.studio.change(identifier, "input/unlock", {"revision": opened["revision"]})
         with self.assertRaisesRegex(WorkflowError, "Import the narration recording"):
             self.studio.change(identifier, "input", {
@@ -224,7 +262,7 @@ class StudioWorkflowTests(unittest.TestCase):
             })
 
     def test_gate_order_and_plan_invalidation(self):
-        with self.assertRaisesRegex(WorkflowError, "Lock the narration"):
+        with self.assertRaisesRegex(WorkflowError, "Lock the reviewed narration cues"):
             self.change("plan", scenes=two_scenes())
         stale_revision = self.project["revision"]
         self.lock_input()
@@ -366,10 +404,16 @@ class StudioWorkflowTests(unittest.TestCase):
 
     def test_library_pin_keeps_the_selected_version_across_projects(self):
         self.plan_with_art()
+        self.change("assets/checks")
+        self.review_checks("assets")
+        self.publish_art()
         original = self.project["assets"][0]
         self.assertEqual(original["libraryVersion"], 1)
         self.upload_art("brown")
         self.approve_art()
+        self.change("assets/checks")
+        self.review_checks("assets")
+        self.publish_art()
         updated = self.project["assets"][0]
         self.assertEqual(updated["libraryVersion"], 2)
         self.assertEqual(updated["libraryId"], original["libraryId"])
@@ -387,13 +431,57 @@ class StudioWorkflowTests(unittest.TestCase):
         path, _ = self.studio.media(second["id"], "art", pinned["hash"])
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), original["hash"])
 
+    def test_art_only_joins_library_after_passed_use_and_flagged_version_stays_quarantined(self):
+        self.plan_with_art()
+        self.assertNotIn("libraryId", self.project["assets"][0])
+        self.assertEqual(self.studio.library.list_assets(), [])
+        self.change("assets/checks")
+        check = self.project["assetChecks"][0]
+        self.record_check("assets", check, passed=False)
+        with self.assertRaisesRegex(WorkflowError, "Pass every current planned use"):
+            self.publish_art()
+        self.assertEqual(self.studio.library.list_assets(), [])
+        self.record_check("assets", check)
+        self.publish_art()
+        original = self.project["assets"][0]
+        self.assertTrue(original["libraryQualified"])
+        self.assertEqual((self.project["assetChecks"][0]["id"], self.project["assetChecks"][0]["status"]),
+                         (check["id"], "passed"))
+
+        self.project = self.studio.report_art_issue(self.project_id, "cup", {
+            "revision": self.project["revision"], "kind": "defective", "reason": "The rim is cut off.",
+        })
+        self.assertEqual(self.project["missing"][0]["issue"]["kind"], "defective")
+        self.assertIn("The rim is cut off.", self.project["artPrompt"])
+        with self.assertRaisesRegex(WorkflowError, "same flagged artwork"):
+            self.upload_art("tan")
+        second = self.studio.create("Needs a cup")
+        pin = {"revision": second["revision"], "libraryId": original["libraryId"], "version": 1, "alias": "cup"}
+        with self.assertRaisesRegex(LibraryError, "open artwork issue"):
+            self.studio.pin_library(second["id"], pin)
+        self.upload_art("brown")
+        self.assertEqual(self.project["assetIssues"][0]["replacementHash"], self.project["assets"][0]["hash"])
+        self.approve_art()
+        self.change("assets/checks")
+        self.review_checks("assets")
+        self.publish_art()
+        replacement = self.project["assets"][0]
+        self.assertEqual((replacement["libraryId"], replacement["libraryVersion"]), (original["libraryId"], 2))
+        self.assertTrue(self.studio.pin_library(second["id"], {**pin, "version": 2})["assets"][0]["approved"])
+        with self.assertRaisesRegex(LibraryError, "open artwork issue"):
+            self.studio.library.get(original["libraryId"], 1)
+
     def test_planner_reuses_approved_art_from_another_project(self):
         self.plan_with_art()
+        self.change("assets/checks")
+        self.review_checks("assets")
+        self.publish_art()
         original = self.project["assets"][0]
         second = self.studio.create("A cup in view")
         second = self.studio.upload_audio(second["id"], second["revision"], "narration.wav", wav_recording())
+        second = self.studio.import_timings(second["id"], second["revision"], word_timings(second["audio"]["originalHash"]))
         second = self.studio.change(second["id"], "input", {
-            "revision": second["revision"], "script": SCRIPT, "intention": "A ceramic cup.",
+            "revision": second["revision"], "script": SCRIPT, "intention": "A ceramic cup.", "confirmTiming": True,
         })
         scenes = two_scenes()
         scenes[1].update(artId=original["libraryId"], artBrief="")
@@ -423,20 +511,42 @@ class StudioWorkflowTests(unittest.TestCase):
         self.change("mix", **mix)
         with self.assertRaisesRegex(WorkflowError, "(?i)mix|music|composition"):
             self.change("animation/prepare")
-        self.change("mix/approve")
+        with self.assertRaisesRegex(WorkflowError, "Prepare and approve the exact soundtrack"):
+            self.change("mix/approve", reviewed=True)
+        self.change("mix/prepare")
+        with self.assertRaisesRegex(WorkflowError, "Review and confirm"):
+            self.change("mix/approve", reviewed=False)
         first_preview = self.studio.mix_preview(self.project_id)
         first_mix_bytes = first_preview.read_bytes()
+        first_mix_hash = hashlib.sha256(first_mix_bytes).hexdigest()
+        self.assertEqual(self.project["mix"]["rendered"]["sha256"], first_mix_hash)
+        self.assertEqual(self.project["mix"]["rendered"]["samples"], 96_000)
+        self.change("mix/prepare")
+        self.assertEqual(self.project["mix"]["rendered"]["sha256"], first_mix_hash)
         with wave.open(str(first_preview), "rb") as recording:
             self.assertAlmostEqual(recording.getnframes() / recording.getframerate(), 2, places=2)
+        first_preview.write_bytes(b"tampered soundtrack")
+        with self.assertRaisesRegex(WorkflowError, "fingerprint"):
+            self.change("mix/approve", reviewed=True)
+        self.prepare_and_approve_mix()
+        first_preview = self.studio.mix_preview(self.project_id)
+        first_mix_bytes = first_preview.read_bytes()
+        first_mix_hash = hashlib.sha256(first_mix_bytes).hexdigest()
+        self.assertEqual(self.project["mix"]["rendered"]["sha256"], first_mix_hash)
         self.change("animation/prepare")
         self.pass_animation_review()
         first_candidate = self.project["qc"]["candidateHash"]
         scene_proof_ids = [check["id"] for check in self.project["animationChecks"]]
+        first_preview.write_bytes(b"tampered after approval")
+        with self.assertRaisesRegex(WorkflowError, "fingerprint"):
+            self.change("export")
         mix["effects"][0]["start"] = 0.75
         self.change("mix", **mix)
         self.assertFalse(self.project["accepted"])
-        self.change("mix/approve")
+        self.assertIsNone(self.project["mix"].get("rendered"))
+        self.prepare_and_approve_mix()
         second_preview = self.studio.mix_preview(self.project_id)
+        self.assertNotEqual(self.project["mix"]["rendered"]["sha256"], first_mix_hash)
         self.assertNotEqual(first_mix_bytes, second_preview.read_bytes())
         self.change("animation/prepare")
         self.change("qc")
@@ -462,6 +572,8 @@ class StudioWorkflowTests(unittest.TestCase):
         self.assertEqual(file["candidateHash"], key)
         self.assertEqual(file["accepted"]["hash"], key)
         self.assertEqual(file["videoHash"], hashlib.sha256(video.read_bytes()).hexdigest())
+        self.assertEqual(file["candidate"]["mix"]["rendered"]["sha256"], self.project["mix"]["rendered"]["sha256"])
+        self.assertEqual(file["captionsTiming"], "source-cues")
         self.assertEqual(file["media"]["audio"], "aac")
         self.assertEqual(file["media"]["frames"], 48)
         self.assertAlmostEqual(file["media"]["duration"], 2, places=2)
@@ -474,7 +586,7 @@ class StudioWorkflowTests(unittest.TestCase):
                 proof = self.studio.review_proof(self.project_id, scope, check_id)
                 self.assertEqual(check["proofHash"], hashlib.sha256(proof.read_bytes()).hexdigest())
         captions_text = captions.read_text(encoding="utf-8")
-        self.assertIn("00:00:00,000 --> 00:00:01,091", captions_text)
+        self.assertIn("00:00:00,000 --> 00:00:01,000", captions_text)
         self.assertIn("The cup catches the light.", captions_text)
 
 

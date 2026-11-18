@@ -9,11 +9,11 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageOps
 
-from . import ENGINE_VERSION, render
+from . import ENGINE_VERSION, layer_spec, render
 from .render import RenderError
 
 
-EVIDENCE_VERSION = 1
+EVIDENCE_VERSION = 2
 SHEET_BACKGROUND = "#f5f4ef"
 SHEET_INK = "#222b26"
 SHEET_SECONDARY = "#44514a"
@@ -40,14 +40,23 @@ def _style(project):
 
 def _visual(scene, assets):
     asset_id = scene.get("artId", "")
-    version = assets.get(asset_id, {})
-    return {
+    visual = {
         "layout": scene["layout"],
         "title": scene["title"],
         "caption": scene.get("caption", ""),
-        "asset": [asset_id, version.get("hash"), version.get("libraryId"), version.get("libraryVersion")],
+        "asset": [asset_id, assets.get(asset_id, {}).get("hash")],
         "brief": scene.get("artBrief", ""),
     }
+    if scene.get("layers"):
+        visual["layers"] = [
+            {"layer": layer, "contentHash": assets.get(layer["artId"], {}).get("hash")}
+            for layer in scene["layers"]
+        ]
+    return visual
+
+
+def _layer_times(source, scene):
+    return {layer["id"]: layer_spec.schedule(source, scene, layer) for layer in scene.get("layers", [])}
 
 
 def asset_checks(project) -> list[dict]:
@@ -59,36 +68,30 @@ def asset_checks(project) -> list[dict]:
     assets = {asset["id"]: asset for asset in project["assets"]}
     source = project.get("input") or {}
     lines = [line["text"] for line in source.get("lines", [])]
-    return [
-        {
-            "id": _check_id("asset", [
-                style, scene["startLine"], scene["endLine"], _visual(scene, assets),
-                source.get("intention"), lines[scene["startLine"] - 1:scene["endLine"]],
-            ]),
-            "scene": index,
-            "assetId": scene["artId"],
-            "title": scene["title"],
-        }
-        for index, scene in enumerate(scenes, start=1)
-        if scene.get("artId")
-    ]
-
-
-def _frame_at_or_after(time):
-    # Match the encoder's exact number / FPS timestamps even at floating-point boundaries.
-    frame = math.ceil(time * render.FPS)
-    if frame > 0 and (frame - 1) / render.FPS >= time:
-        return frame - 1
-    if frame / render.FPS < time:
-        return frame + 1
-    return frame
+    checks = []
+    for index, scene in enumerate(scenes, start=1):
+        visual = _visual(scene, assets)
+        bounds = [scene["startLine"], scene["endLine"]]
+        words = lines[bounds[0] - 1:bounds[1]]
+        times = _layer_times(source, scene)
+        for use in layer_spec.scene_art(scene):
+            layer_id = use["layerId"]
+            overlap = []
+            if layer_id:
+                settled = times[layer_id][1]
+                overlap = [name for name, (start, _, end) in times.items() if start <= settled < end]
+            checks.append({
+                "id": _check_id("asset", [style, bounds, visual, layer_id, overlap, source.get("intention"), words]),
+                "scene": index, "assetId": use["artId"], "title": scene["title"], "layerId": layer_id,
+            })
+    return checks
 
 
 def _samples(composition, index, lines):
     start = composition.positions[index]
     end = composition.positions[index + 1] if index + 1 < len(composition.scenes) else composition.duration
-    first = _frame_at_or_after(start)
-    last = min(_frame_at_or_after(end), render._frame_count(composition.duration)) - 1
+    first = render.frame_at_or_after(start)
+    last = min(render.frame_at_or_after(end), render._frame_count(composition.duration)) - 1
     if first > last:
         return []
 
@@ -98,7 +101,7 @@ def _samples(composition, index, lines):
         samples.setdefault(frame, []).append(label)
 
     def within_scene(time):
-        return min(last, max(first, _frame_at_or_after(time)))
+        return min(last, max(first, render.frame_at_or_after(time)))
 
     if first:
         add(first - 1, "Before entrance")
@@ -107,6 +110,16 @@ def _samples(composition, index, lines):
     if motion:
         add(within_scene(start + motion / 2), "Motion")
         add(within_scene(start + motion), "Settled")
+    for name, (enter, settle, leave) in _layer_times(composition.source, composition.scenes[index]).items():
+        enter_frame = within_scene(enter)
+        if enter_frame > first:
+            add(enter_frame - 1, f"{name} before")
+        add(enter_frame, f"{name} enters")
+        if settle > enter:
+            add(within_scene((enter + settle) / 2), f"{name} moves")
+            add(within_scene(settle), f"{name} settles")
+        if leave < end:
+            add(within_scene(leave), f"{name} leaves")
     cue = lines[(len(lines) - 1) // 2]
     add(within_scene(cue["start"]), f"Cue {cue['id']} starts")
     add(within_scene((cue["start"] + cue["end"]) / 2), f"Cue {cue['id']}")
@@ -132,6 +145,7 @@ def animation_checks(project) -> list[dict]:
             "motion": scene["motion"],
             "start": start,
             "end": end,
+            "layerTimes": _layer_times(project["input"], scene),
         }
         for scene, start, end in zip(
             timeline.scenes, timeline.positions, [*timeline.positions[1:], timeline.duration], strict=True,
@@ -198,10 +212,18 @@ def asset_proof_png(project, folder: Path, check) -> bytes:
     asset_id = selected["assetId"]
     art = render._read_asset(asset_id, composition.assets, folder)
     # Use the exact static composition without drawing any timed motion.
-    frame = composition._draw(selected["scene"] - 1)
+    index = selected["scene"] - 1
+    prepared = composition.prepare(index)
+    frame = composition.asset_frame(index, selected["layerId"], prepared)
+    layer = next((item for item in prepared.layers if item.id == selected["layerId"]), None)
+    animated = layer is not None and layer.settled > layer.start
     reference_width, margin, header = 408, 24, 88
     sheet = Image.new(
-        "RGB", (frame.width + reference_width + margin * 3, frame.height + header + margin), SHEET_BACKGROUND,
+        "RGB", (
+            frame.width + reference_width + margin * 3,
+            frame.height + header + margin + (338 if animated else 0),
+        ),
+        SHEET_BACKGROUND,
     )
     draw = ImageDraw.Draw(sheet)
     _text(draw, (margin, 18), selected["title"], 27, width=sheet.width - 2 * margin)
@@ -212,6 +234,15 @@ def asset_proof_png(project, folder: Path, check) -> bytes:
         _reference_panel(art, (reference_width, frame.height)),
         (frame.width + margin * 2, header),
     )
+    if animated:
+        y = header + frame.height + 26
+        _text(draw, (margin, y), f"Isolated entrance: {layer.id}", 20)
+        for step, (phase, label) in enumerate(((0, "Before"), (0.5, "During"), (1, "Settled"))):
+            sample = prepared.frame.copy()
+            layer.paste(sample, phase)
+            x = margin + 471 * step
+            sheet.paste(sample.resize((448, 252), Image.Resampling.LANCZOS), (x, y + 32))
+            _text(draw, (x, y + 288), label, 18, muted=True)
     return _png(sheet)
 
 
@@ -226,9 +257,10 @@ def animation_proof_png(project, folder: Path, check) -> bytes:
     if not selected["samples"]:
         raise RenderError(f"Scene {selected['scene']}. This scene is too short to appear in the exported video.")
     composition = render._Composition(project, folder)
-    width, height = 768, 432
+    detailed = len(selected["samples"]) > 10
+    width, height = (544, 306) if detailed else (768, 432)
     margin, header, caption = 20, 64, 39
-    columns = min(2, len(selected["samples"]))
+    columns = min(3 if detailed else 2, len(selected["samples"]))
     rows = math.ceil(len(selected["samples"]) / columns)
     sheet = Image.new(
         "RGB", (columns * width + (columns + 1) * margin, header + rows * (height + caption + margin)),
@@ -243,8 +275,8 @@ def animation_proof_png(project, folder: Path, check) -> bytes:
         y = header + row * (height + caption + margin)
         index, elapsed = composition.at(sample["time"])
         if index not in bases:
-            bases[index] = composition._draw(index)
-        frame = composition.apply_motion(bases[index], index, elapsed)
+            bases[index] = composition.prepare(index)
+        frame = composition.draw_prepared(index, elapsed, bases[index])
         sheet.paste(frame.resize((width, height), Image.Resampling.LANCZOS), (x, y))
         _text(
             draw, (x, y + height + 7), f"{_timecode(sample['time'])}  {sample['label']}", 20,

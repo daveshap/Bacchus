@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from . import ENGINE_VERSION, api_log, audio, gates, planning, providers, render, score, timing, visual_review
+from . import ENGINE_VERSION, api_log, audio, gates, local_timing, planning, providers, render, score, timing, visual_review
 from .library import Library, LibraryError
 
 
@@ -35,6 +35,7 @@ ART_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 PROJECT_ID = re.compile(r"[0-9a-f]{32}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 PACK_PIN = {"name": planning.PACK["name"], "version": planning.PACK["version"], "hash": planning.PACK_HASH}
+PREVIOUS_PACK_HASH = "4d632b120c258a10e2da5f3ee7d9a3263f7b6415c12b1d8b81ec8022d3a6cba8"
 
 
 class WorkflowError(Exception):
@@ -126,7 +127,10 @@ def validate_scenes(project, raw_scenes):
     briefs = {}
     scenes = []
     for index, raw in enumerate(raw_scenes, start=1):
-        fields(raw, planning.SCENE_FIELDS)
+        keys = set(planning.SCENE_FIELDS)
+        if isinstance(raw, dict) and "layers" not in raw:
+            keys.discard("layers")
+        fields(raw, keys)
         start, end = raw["startLine"], raw["endLine"]
         if type(start) is not int or type(end) is not int or start != expected or not start <= end <= max_line:
             raise WorkflowError(f"Scene {index} must start at line {expected} and end within lines {expected}–{max_line}.")
@@ -137,7 +141,17 @@ def validate_scenes(project, raw_scenes):
         caption = text_value(raw["caption"], f"Scene {index} caption", 170)
         asset_id = text_value(raw["artId"], f"Scene {index} artwork ID", 64)
         brief = text_value(raw["artBrief"], f"Scene {index} artwork brief", 380)
-        if asset_id:
+        if not asset_id and (brief or raw["layout"] == "illustration"):
+            raise WorkflowError(f"Scene {index} needs an artwork ID for that layout or brief.")
+        scene = {**raw, "title": title, "caption": caption, "artId": asset_id, "artBrief": brief}
+        try:
+            planning.validate_layers(project, scene)
+        except planning.PlannerError as error:
+            raise WorkflowError(f"Scene {index}: {error}") from error
+        if not scene.get("layers"):
+            scene.pop("layers", None)
+        for use in planning.scene_art(scene):
+            asset_id, brief = use["artId"], use["artBrief"]
             art_id(asset_id)
             if asset_id not in assets and not brief:
                 raise WorkflowError(f"Scene {index} needs an art brief for {asset_id}.")
@@ -145,12 +159,20 @@ def validate_scenes(project, raw_scenes):
                 raise WorkflowError(f"Use one art brief for every occurrence of {asset_id}.")
             if brief:
                 briefs[asset_id] = brief
-        elif brief or raw["layout"] == "illustration":
-            raise WorkflowError(f"Scene {index} needs an artwork ID for that layout or brief.")
-        scenes.append({**raw, "title": title, "caption": caption, "artId": asset_id, "artBrief": brief})
+        scenes.append(scene)
     if expected != max_line + 1:
         raise WorkflowError(f"The plan still needs to cover lines {expected}–{max_line}.")
     return scenes
+
+
+def require_source_cues(project):
+    source = project["input"]
+    if not source:
+        raise WorkflowError("Lock the reviewed narration cues before planning.", 409)
+    silent_demo = project.get("demo") and not project["audio"] and source.get("timing") == "demo"
+    if not silent_demo and (source.get("timing") != "source-cues" or not source.get("words")):
+        raise WorkflowError("Unlock intake and approve recording-aligned word cues to continue.", 409)
+    return source
 
 
 def make_input(project, script, intention):
@@ -159,34 +181,26 @@ def make_input(project, script, intention):
     segments = [line.strip() for line in script.split("\n") if line.strip()]
     if len(segments) > planning.MAX_LINES or any(len(line) > 500 for line in segments):
         raise WorkflowError(f"Use at most {planning.MAX_LINES} nonempty narration lines and 500 characters per line.")
-    weights = [max(1.6, len(line.split()) * 0.42) for line in segments]
-    total = sum(weights)
     audio = project["audio"]
-    duration = audio["duration"] if audio else round(total, 3)
-    if duration > MAX_DURATION:
-        raise WorkflowError(f"This pack supports excerpts up to {MAX_DURATION} seconds.")
     transcript = project.get("transcript")
-    if transcript and transcript["timing"] == "source-cues" and script == transcript["script"]:
-        source = {"script": script, "intention": intention, "lines": transcript["lines"],
-                  "duration": duration, "timing": "source-cues", "timingHash": transcript["timingHash"]}
+    if audio:
+        if (
+            not transcript or transcript["timing"] != "source-cues" or script != transcript["script"]
+            or not transcript.get("words") or transcript.get("audioHash") != audio["hash"]
+            or transcript.get("originalHash") != audio.get("originalHash")
+        ):
+            raise WorkflowError("Review recording-aligned word cues before locking this narration.", 409)
+        source = {"script": script, "intention": intention, "lines": transcript["lines"], "words": transcript["words"],
+                  "duration": audio["duration"], "timing": "source-cues", "timingHash": transcript["timingHash"]}
         return {**source, "hash": digest(encoded([source, audio["hash"], audio["originalHash"]]))}
-    end = 0.0
-    cumulative = 0.0
-    lines = []
-    for index, (line, weight) in enumerate(zip(segments, weights, strict=True), start=1):
-        start = end
-        cumulative += weight
-        end = duration if index == len(segments) else round(cumulative * duration / total, 3)
-        if end - start < 0.2:
-            raise WorkflowError("The recording is too short for the number of narration segments.")
-        lines.append({"id": index, "text": line, "start": start, "end": end})
-    source = {"script": script, "intention": intention, "lines": lines, "duration": duration}
-    original = audio.get("originalHash") if audio else None
-    keys = [source, audio["hash"] if audio else None]
-    if original:
-        source["timing"] = "estimated"
-        keys.append(original)
-    return {**source, "hash": digest(encoded(keys))}
+    if not project.get("demo") or audio:
+        raise WorkflowError("Import narration and approve its word cues first.", 409)
+    # The silent sample uses authored three-second picture beats and no speech.
+    lines = [{"id": index + 1, "text": line, "start": index * 3, "end": (index + 1) * 3}
+             for index, line in enumerate(segments)]
+    source = {"script": script, "intention": intention, "lines": lines, "words": [],
+              "duration": len(lines) * 3, "timing": "demo"}
+    return {**source, "hash": digest(encoded([source, None]))}
 
 
 def pack_matches(project):
@@ -199,27 +213,38 @@ def missing_art(project):
         return []
     assets = assets_by_id(project)
     missing = {}
-    for scene in project["plan"]["scenes"]:
-        asset_id = scene["artId"]
-        if asset_id and asset_id not in assets:
-            missing[asset_id] = {"id": asset_id, "brief": scene["artBrief"]}
+    for index, scene in enumerate(project["plan"]["scenes"], 1):
+        for use in planning.scene_art(scene):
+            asset_id = use["artId"]
+            asset = assets.get(asset_id)
+            if asset and not asset.get("issue"):
+                continue
+            item = missing.setdefault(asset_id, {"id": asset_id, "brief": use["artBrief"], "uses": []})
+            item["uses"].append(f"Scene {index} · {scene['title']}" + (f" · {use['layerId']}" if use["layerId"] else ""))
+            if asset and asset.get("issue"):
+                item["issue"] = asset["issue"]
     return list(missing.values())
 
 
 def art_prompt(missing, style):
     if not missing:
         return ""
-    items = "\n\n".join(f"{item['id']}\n{item['brief']}" for item in missing)
+    items = []
+    for item in missing:
+        line = f"{item['id']}\n{item['brief']}\nPlanned uses: {', '.join(item['uses'])}."
+        if item.get("issue"):
+            line += f"\nRequired correction: {item['issue']['reason']}"
+        items.append(line)
     return (
         f"Create one separate image for each item below for the same animation. Visual style: {STYLES[style]}. "
         "Use a coherent visual style across the set. Keep requested isolated subjects on transparent "
         "backgrounds. Keep the artwork free of lettering. Return each image with its corresponding ID.\n\n"
-        + items
+        + "\n\n".join(items)
     )
 
 
 def new_mix(decision=None):
-    return {"musicMode": decision, "music": None, "effects": [], "approved": decision is not None}
+    return {"musicMode": decision, "music": None, "effects": [], "musicRegions": [], "approved": False}
 
 
 def number(value, label, low, high):
@@ -239,30 +264,44 @@ def mix_audio(mix):
 
 
 def mix_record(project, folder, *, require_approval, verify=True):
-    source, mix = project["input"], project["mix"]
-    if not source:
-        raise WorkflowError("Lock the narration before composing audio.", 409)
+    source, mix = require_source_cues(project), project["mix"]
     if mix["musicMode"] not in ("none", "track") or (mix["musicMode"] == "track" and not mix["music"]):
         raise WorkflowError("Choose no music or add a soundtrack.", 409)
     if require_approval and not mix["approved"]:
         raise WorkflowError("Approve the sound composition before running quality checks.", 409)
-    if verify:
+    if verify and not require_approval:
         for track in mix_audio(mix):
             if file_digest(folder / "audio" / f"{track['hash']}.wav") != track["hash"]:
                 raise WorkflowError(f"Sound file {track['name']} is missing or no longer matches.", 409)
         if any(effect["start"] >= source["duration"] for effect in mix["effects"]):
             raise WorkflowError("Each sound effect must begin within the narration.", 409)
-    return {
+    record = {
         "musicMode": mix["musicMode"],
         "music": mix["music"] if mix["musicMode"] == "track" else None,
         "effects": mix["effects"],
+        "musicRegions": mix.get("musicRegions", []) if mix["musicMode"] == "track" else [],
     }
+    if require_approval:
+        frozen = mix.get("rendered")
+        if not frozen or frozen.get("recipeHash") != mix_key(project, record):
+            raise WorkflowError("Prepare and approve the exact soundtrack to continue.", 409)
+        if verify:
+            try:
+                render.verify_mix(folder, frozen, source["duration"])
+            except render.RenderError as error:
+                raise WorkflowError(str(error), 409) from error
+        record["rendered"] = frozen
+    return record
+
+
+def mix_key(project, recipe):
+    return digest(encoded([ENGINE_VERSION, project["input"]["hash"], recipe]))
 
 
 def candidate(project, folder, verify=True, require_mix=True):
     pack_matches(project)
-    source, plan = project["input"], project["plan"]
-    if not source or not plan or not plan["approved"]:
+    source, plan = require_source_cues(project), project["plan"]
+    if not plan or not plan["approved"]:
         raise WorkflowError("Approve the scene plan first.", 409)
     assets = assets_by_id(project)
     used = {}
@@ -280,13 +319,12 @@ def candidate(project, folder, verify=True, require_mix=True):
                 raise WorkflowError("The original narration recording is missing or no longer matches.", 409)
         if source.get("timingHash") and file_digest(folder / "records" / "timing" / f"{source['timingHash']}.json") != source["timingHash"]:
             raise WorkflowError("The locked cue evidence is missing or no longer matches.", 409)
-    for scene in plan["scenes"]:
-        asset_id = scene["artId"]
-        if not asset_id or asset_id in used:
-            continue
+    for asset_id in dict.fromkeys(use["artId"] for scene in plan["scenes"] for use in planning.scene_art(scene)):
         asset = assets.get(asset_id)
         if not asset or not asset["approved"]:
             raise WorkflowError(f"Upload and approve the artwork for {asset_id}.", 409)
+        if asset.get("issue"):
+            raise WorkflowError(f"Resolve the open artwork issue for {asset_id} before continuing.", 409)
         if verify and file_digest(folder / "assets" / f"{asset['hash']}.png") != asset["hash"]:
             raise WorkflowError(f"The approved artwork for {asset_id} is missing or no longer matches.", 409)
         used[asset_id] = asset["hash"]
@@ -398,6 +436,25 @@ class Studio:
                 if not project["busy"]:
                     reset_candidate(project)
             project.pop("legacy", None)
+            folder = self._folder(project_id)
+            if project.get("pack", {}).get("hash") == PREVIOUS_PACK_HASH:
+                project["pack"] = PACK_PIN
+                if not project["busy"] and (project["export"] or {}).get("status") != "complete":
+                    reset_candidate(project)
+                    if project.get("demo") and not project["audio"] and project["input"]:
+                        source = project["input"]
+                        project["input"] = make_input(project, source["script"], source["intention"])
+                transcript = project.get("transcript")
+                recording = project["audio"]
+                if transcript and transcript.get("timingHash") and recording and recording.get("originalHash"):
+                    key = transcript["timingHash"]
+                    try:
+                        raw = (folder / "records" / "timing" / f"{key}.json").read_bytes()
+                        if digest(raw) == key:
+                            records = timing.import_cues(raw, recording["originalHash"], recording["duration"])
+                            project["transcript"] = {**transcript, **records}
+                    except (OSError, timing.TimingError):
+                        pass
             if "review" not in project:
                 if not project["busy"] and (project["export"] or {}).get("status") != "complete":
                     reset_candidate(project)
@@ -428,20 +485,30 @@ class Studio:
         view = deepcopy(project)
         project_id = view["id"]
         base = f"/api/projects/{project_id}"
+        self._apply_library_issues(view)
         for asset in view["assets"]:
             asset["url"] = f"{base}/media/art/{asset['hash']}"
         if view["audio"]:
             view["audio"]["url"] = f"{base}/media/audio/{view['audio']['hash']}"
         mix = view["mix"]
+        if mix.get("rendered"):
+            mix["rendered"]["url"] = f"{base}/mix/preview"
         for track in ([mix["music"]] if mix["music"] else []) + mix["effects"]:
             track["url"] = f"{base}/media/audio/{track['hash']}"
-        view["missing"] = missing_art(project)
+        view["missing"] = missing_art(view)
         view["artPrompt"] = art_prompt(view["missing"], project["style"])
         view["accepted"] = bool(project["accepted"])
+        view["needsExactTiming"] = bool(project["input"] and not project["demo"]
+                                       and (project["input"].get("timing") != "source-cues" or not project["input"].get("words")))
         folder = self._folder(project_id)
+        view["assetChecks"] = gates.view(view, folder, "assets")
         view.pop("review")
-        view["assetChecks"] = gates.view(project, folder, "assets")
-        view["assetReviewReady"] = bool(project["plan"] and project["plan"]["approved"]) and all(
+        for asset in view["assets"]:
+            uses = [check for check in view["assetChecks"] if check["assetId"] == asset["id"]]
+            asset["publishEligible"] = bool(uses) and not asset.get("issue") and all(
+                check["status"] == "passed" for check in uses
+            )
+        view["assetReviewReady"] = (not view["missing"] and bool(project["plan"] and project["plan"]["approved"])) and all(
             check["status"] == "passed" for check in view["assetChecks"]
         )
         view["animationPrepared"] = bool(project["review"]["prepared"]) and view["assetReviewReady"]
@@ -487,7 +554,10 @@ class Studio:
                 if not PROJECT_ID.fullmatch(path.parent.name):
                     continue
                 try:
-                    if self._read(path.parent.name)["busy"] in ("planning", "transcribing", "generating artwork", "reviewing proof"):
+                    if self._read(path.parent.name)["busy"] in (
+                        "planning", "transcribing", "generating artwork", "reviewing proof",
+                        "recognizing word cues", "preparing soundtrack",
+                    ):
                         return True
                 except WorkflowError:
                     continue
@@ -539,9 +609,18 @@ class Studio:
         if project["busy"]:
             raise WorkflowError(f"This project is currently {project['busy']}.", 409)
         pack_matches(project)
+        self._apply_library_issues(project)
         return project
 
+    def _apply_library_issues(self, project):
+        for asset in project["assets"]:
+            if asset.get("libraryId") and not asset.get("issue"):
+                issue = self.library.issue(asset["libraryId"], asset["libraryVersion"])
+                if issue:
+                    asset["issue"] = issue
+
     def _approve_plan(self, project):
+        require_source_cues(project)
         plan = project["plan"]
         if not plan:
             raise WorkflowError("Save a scene plan first.", 409)
@@ -553,8 +632,14 @@ class Studio:
         params = {"input": ("script", "intention"), "plan": ("scenes",)}.get(action, ())
         if action == "input" and isinstance(data, dict) and "style" in data:
             params += ("style",)
+        if action == "input" and isinstance(data, dict) and "confirmTiming" in data:
+            params += ("confirmTiming",)
         if action == "mix":
             params = ("musicMode", "musicGainDb", "effects")
+            if isinstance(data, dict) and "musicRegions" in data:
+                params += ("musicRegions",)
+        if action == "mix/approve":
+            params = ("reviewed",)
         if action == "mix/preset":
             params = ("preset",)
         fields(data, ("revision", *params))
@@ -562,6 +647,8 @@ class Studio:
             return self._generate(project_id, data["revision"])
         if action == "transcribe":
             return self._transcribe(project_id, data["revision"])
+        if action == "mix/prepare":
+            return self._prepare_mix(project_id, data["revision"])
         if action == "export":
             return self._queue_export(project_id, data["revision"])
         with self.lock:
@@ -572,30 +659,46 @@ class Studio:
                     raise WorkflowError("Unlock the narration before replacing it.", 409)
                 if not project["audio"] and not project["demo"]:
                     raise WorkflowError("Import the narration recording before locking intake.", 409)
+                if project["audio"] and data.get("confirmTiming") is not True:
+                    raise WorkflowError("Review and confirm the recording-aligned cue sheet first.", 409)
+                if project["audio"]:
+                    recording = self._timing_recording(project)
+                    if file_digest(folder / "audio" / f"{recording['hash']}.wav") != recording["hash"]:
+                        raise WorkflowError("The narration WAV is missing or has changed.", 409)
+                    timing_hash = (project.get("transcript") or {}).get("timingHash")
+                    if not timing_hash or file_digest(folder / "records" / "timing" / f"{timing_hash}.json") != timing_hash:
+                        raise WorkflowError("The recording-aligned cue evidence is missing or has changed.", 409)
                 style = data.get("style", project["style"])
                 if not isinstance(style, str) or style not in STYLES:
                     raise WorkflowError("Choose a supported visual style.")
                 project["style"] = style
                 project["input"] = make_input(project, data["script"], data["intention"])
+                if project["audio"]:
+                    project["approvals"].append({"kind": "narration-cues", "hash": timing_hash, "at": now()})
             elif action == "input/unlock":
                 project.update(input=None, plan=None)
                 project["mix"]["approved"] = False
+                project["mix"].pop("rendered", None)
+                project["mix"]["musicRegions"] = []
                 reset_candidate(project)
             elif action == "plan":
+                require_source_cues(project)
                 set_plan(project, data["scenes"], "manual")
             elif action == "plan/starter":
-                if not project["input"]:
-                    raise WorkflowError("Lock the narration before planning.", 409)
+                require_source_cues(project)
                 set_plan(project, planning.starter_plan(project["input"]["lines"]), "starter")
             elif action == "plan/approve":
                 self._approve_plan(project)
             elif action == "mix":
                 self._edit_mix(project, data)
             elif action == "mix/approve":
-                record = mix_record(project, folder, require_approval=False)
-                if not project["mix"]["approved"]:
-                    project["mix"]["approved"] = True
-                    project["approvals"].append({"kind": "mix", "hash": digest(encoded(record)), "at": now()})
+                if data["reviewed"] is not True:
+                    raise WorkflowError("Review and confirm the prepared soundtrack before approving it.", 409)
+                already = project["mix"]["approved"]
+                project["mix"]["approved"] = True
+                record = mix_record(project, folder, require_approval=True)
+                if not already:
+                    project["approvals"].append({"kind": "mix", "hash": record["rendered"]["sha256"], "at": now()})
             elif action == "mix/preset":
                 self._preset_mix(project, folder, data["preset"])
             elif action == "assets/checks":
@@ -666,6 +769,7 @@ class Studio:
     def _update_mix(self, project, mix):
         if mix != project["mix"]:
             mix["approved"] = False
+            mix.pop("rendered", None)
             project["mix"] = mix
             reset_candidate(project)
 
@@ -696,6 +800,10 @@ class Studio:
             raise WorkflowError("The sound effects changed. Refresh and try again.", 409)
         mix["effects"] = [{**effect, **updates[effect["id"]]} for effect in mix["effects"]]
         mix["musicMode"] = mode
+        try:
+            mix["musicRegions"] = render.validate_music_regions(project, data.get("musicRegions", mix.get("musicRegions", [])))
+        except render.RenderError as error:
+            raise WorkflowError(str(error)) from error
         self._update_mix(project, mix)
 
     def _preset_mix(self, project, folder, preset):
@@ -713,7 +821,8 @@ class Studio:
             for scene in accents:
                 start = project["input"]["lines"][scene["startLine"] - 1]["start"]
                 effects.append({**track, "id": uuid.uuid4().hex, "start": start})
-        self._update_mix(project, {"musicMode": "track", "music": music, "effects": effects, "approved": False})
+        self._update_mix(project, {"musicMode": "track", "music": music, "effects": effects,
+                                   "musicRegions": [], "approved": False})
 
     def upload_mix(self, project_id, revision, kind, name, raw):
         name = file_name(name)
@@ -760,15 +869,57 @@ class Studio:
             project = self._read(project_id)
             folder = self._folder(project_id)
             source = project["input"]
-            record = mix_record(project, folder, require_approval=False)
-            if not project["audio"] and not mix_audio(project["mix"]):
-                raise WorkflowError("This cut has no audio to preview.", 409)
-            key = digest(encoded([source["hash"], record, ENGINE_VERSION]))
-            path = folder / "mix-preview" / f"{key}.wav"
-        with self.mix_lock:
-            if not path.is_file():
-                render.export_mix(project, folder, path)
-        return path
+            result = project["mix"].get("rendered")
+            if not source or not result or not DIGEST.fullmatch(result.get("sha256", "")):
+                raise WorkflowError("Prepare and measure the soundtrack before listening.", 409)
+            path = folder / "mixes" / f"{result['sha256']}.wav"
+            try:
+                render.verify_mix(folder, result, source["duration"])
+            except render.RenderError as error:
+                raise WorkflowError(str(error), 409) from error
+            return path
+
+    def _prepare_mix(self, project_id, revision):
+        with self.lock:
+            project = self._edit(project_id, revision)
+            folder = self._folder(project_id)
+            recipe = mix_record(project, folder, require_approval=False)
+            if project["audio"] and file_digest(folder / "audio" / f"{project['audio']['hash']}.wav") != project["audio"]["hash"]:
+                raise WorkflowError("The narration changed before soundtrack preparation.", 409)
+            key = mix_key(project, recipe)
+            previous = project["mix"].get("rendered")
+            if previous and previous.get("recipeHash") == key:
+                try:
+                    render.verify_mix(folder, previous, project["input"]["duration"])
+                    return self._view(project)
+                except render.RenderError:
+                    pass
+            project["busy"] = "preparing soundtrack"
+            self._save(project)
+        directory = folder / "mixes"
+        temporary = directory / f".{uuid.uuid4().hex}.wav"
+        try:
+            directory.mkdir(exist_ok=True)
+            result = render.export_mix(project, folder, temporary)
+            if mix_record(project, folder, require_approval=False) != recipe or (
+                project["audio"] and file_digest(folder / "audio" / f"{project['audio']['hash']}.wav") != project["audio"]["hash"]
+            ):
+                raise WorkflowError("An audio source changed during preparation.", 409)
+            output = directory / f"{result['sha256']}.wav"
+            if not output.exists() or file_digest(output) != result["sha256"]:
+                temporary.replace(output)
+            result["recipeHash"] = key
+            render.verify_mix(folder, result, project["input"]["duration"])
+            project["mix"].update(rendered=result, approved=False)
+            reset_candidate(project)
+        except render.RenderError as error:
+            raise WorkflowError(str(error), 422) from error
+        finally:
+            temporary.unlink(missing_ok=True)
+            with self.lock:
+                project["busy"] = None
+                self._save(project)
+        return self._view(project)
 
     def _transcribe(self, project_id, revision):
         with self.lock:
@@ -793,10 +944,10 @@ class Studio:
             with api_log.scope(project_id, "transcription"):
                 result = audio.transcribe(path)
             script = text_value(result["script"], "Transcript", 100_000, True)
-            make_input(project, script, "")
-            project["transcript"] = {"script": script, "model": result["model"],
-                                     "timing": result["timing"], "audioHash": recording_hash,
-                                     "originalHash": project["audio"].get("originalHash")}
+            if (project.get("transcript") or {}).get("timing") != "source-cues":
+                project["transcript"] = {"script": script, "model": result["model"],
+                                         "timing": "text-draft", "audioHash": recording_hash,
+                                         "originalHash": project["audio"].get("originalHash")}
             run.update(status="complete", requestId=result.get("requestId"), usage=result.get("usage"))
         except (audio.AudioError, WorkflowError) as failure:
             error = str(failure)
@@ -812,18 +963,75 @@ class Studio:
     def import_timings(self, project_id, revision, raw):
         with self.lock:
             project = self._edit(project_id, revision)
-            recording = project["audio"]
-            if project["input"] or not recording or not recording.get("originalHash"):
-                raise WorkflowError("Import the original narration and leave intake unlocked before importing timings.", 409)
-            try:
-                transcript = timing.import_cues(raw, recording["originalHash"], recording["duration"])
-            except timing.TimingError as error:
-                raise WorkflowError(str(error)) from error
-            content_hash = digest(raw)
-            write_file(self._folder(project_id) / "records" / "timing" / f"{content_hash}.json", raw)
-            project["transcript"] = {**transcript, "originalHash": recording["originalHash"],
-                                     "audioHash": recording["hash"], "timingHash": content_hash}
-            make_input(project, transcript["script"], "")
+            self._record_timing(project, raw)
+            self._save(project)
+            return self._view(project)
+
+    def _timing_recording(self, project):
+        recording = project["audio"]
+        if project["input"] or not recording or not recording.get("originalHash"):
+            raise WorkflowError("Import the original narration and leave intake unlocked before working on cues.", 409)
+        folder = self._folder(project["id"])
+        original = folder / "source-audio" / (recording["originalHash"] + recording["sourceExtension"])
+        if file_digest(original) != recording["originalHash"]:
+            raise WorkflowError("The original narration file is missing or has changed.", 409)
+        return recording
+
+    def _record_timing(self, project, raw):
+        recording = self._timing_recording(project)
+        try:
+            transcript = timing.import_cues(raw, recording["originalHash"], recording["duration"])
+        except timing.TimingError as error:
+            raise WorkflowError(str(error), 422) from error
+        content_hash = digest(raw)
+        write_file(self._folder(project["id"]) / "records" / "timing" / f"{content_hash}.json", raw)
+        project["transcript"] = {**transcript, "originalHash": recording["originalHash"],
+                                 "audioHash": recording["hash"], "timingHash": content_hash}
+
+    def derive_timings(self, project_id, data):
+        fields(data, ("revision", "modelDirectory"))
+        with self.lock:
+            project = self._edit(project_id, data["revision"])
+            recording = self._timing_recording(project)
+            path = self._folder(project_id) / "audio" / f"{recording['hash']}.wav"
+            if file_digest(path) != recording["hash"]:
+                raise WorkflowError("The narration WAV is missing or has changed.", 409)
+            project["busy"] = "recognizing word cues"
+            self._save(project)
+        try:
+            result = local_timing.derive(path, data["modelDirectory"])
+            if file_digest(path) != recording["hash"]:
+                raise WorkflowError("The narration WAV changed during cue recognition.", 409)
+            raw = encoded({"audio": {"sha256": recording["originalHash"]},
+                           "duration": recording["duration"], **result})
+            self._record_timing(project, raw)
+        except timing.TimingError as error:
+            raise WorkflowError(str(error), 422) from error
+        finally:
+            with self.lock:
+                project["busy"] = None
+                self._save(project)
+        return self._view(project)
+
+    def edit_timings(self, project_id, data):
+        fields(data, ("revision", "words"))
+        with self.lock:
+            project = self._edit(project_id, data["revision"])
+            recording = self._timing_recording(project)
+            transcript = project.get("transcript") or {}
+            words = data["words"]
+            if not transcript.get("words") or not isinstance(words, list) or len(words) != len(transcript["words"]):
+                raise WorkflowError("Supply one correction row per current word, or import a new complete cue sheet.", 409)
+            for word in words:
+                if not isinstance(word, dict) or set(word) not in ({"text", "start", "end"}, {"id", "text", "start", "end"}):
+                    raise WorkflowError("Each correction must include word text, start and end.")
+            if [dict(word, id=index) for index, word in enumerate(words, 1)] == transcript["words"]:
+                return self._view(project)
+            raw = encoded({
+                "audio": {"sha256": recording["originalHash"]}, "duration": recording["duration"], "words": words,
+                "provenance": {"method": "operator-corrected cues", "parentTimingHash": transcript["timingHash"]},
+            })
+            self._record_timing(project, raw)
             self._save(project)
             return self._view(project)
 
@@ -890,12 +1098,16 @@ class Studio:
             raise WorkflowError(f"This project already has {MAX_PROJECT_ASSETS} artwork IDs.")
         write_file(self._folder(project["id"]) / "assets" / f"{content_hash}.png", normalized)
         if existing and existing["hash"] == content_hash:
+            if existing.get("issue"):
+                raise WorkflowError("This is the same flagged artwork. Upload a corrected version.", 409)
             existing["name"] = name
             return
         if existing:
             project["assets"].remove(existing)
+            self._resolve_art_issue(project, existing, content_hash)
         project["assets"].append({"id": asset_id, "name": name, "hash": content_hash, "approved": False, "source": source})
-        if project["plan"] and any(scene["artId"] == asset_id for scene in project["plan"]["scenes"]):
+        if project["plan"] and any(use["artId"] == asset_id for scene in project["plan"]["scenes"]
+                                   for use in planning.scene_art(scene)):
             reset_candidate(project)
 
     def approve_art(self, project_id, asset_id, data):
@@ -905,24 +1117,76 @@ class Studio:
             asset = assets_by_id(project).get(asset_id)
             if not asset:
                 raise WorkflowError("Upload artwork for this ID first.", 409)
+            if asset.get("issue"):
+                raise WorkflowError("Replace this artwork or revise the scene requirement to resolve its issue.", 409)
             path = self._folder(project_id) / "assets" / f"{asset['hash']}.png"
             if file_digest(path) != asset["hash"]:
                 raise WorkflowError("The uploaded artwork no longer matches its fingerprint.", 409)
-            if not asset.get("libraryId"):
-                scenes = project["plan"]["scenes"] if project["plan"] else []
-                brief = next((scene["artBrief"] for scene in scenes if scene["artId"] == asset_id and scene["artBrief"]), "")
-                version = self.library.publish(
-                    project_id=project_id, alias=asset_id, name=asset["name"], brief=brief,
-                    style=project["style"], source=asset.get("source", "project"),
-                    content_hash=asset["hash"], path=path,
-                )
-                asset.update(libraryId=version["id"], libraryVersion=version["version"], brief=brief)
             if not asset["approved"]:
                 asset["approved"] = True
-                project["approvals"].append({"kind": "artwork", "id": asset_id, "hash": asset["hash"],
-                                             "libraryId": asset["libraryId"], "libraryVersion": asset["libraryVersion"], "at": now()})
+                project["approvals"].append({"kind": "artwork-candidate", "id": asset_id, "hash": asset["hash"], "at": now()})
             self._save(project)
             return self._view(project)
+
+    def publish_art(self, project_id, asset_id, data):
+        fields(data, ("revision",))
+        with self.lock:
+            project = self._edit(project_id, data["revision"])
+            folder = self._folder(project_id)
+            candidate(project, folder, require_mix=False)
+            asset = assets_by_id(project).get(asset_id)
+            checks = [check for check in gates.checks(project, "assets") if check["assetId"] == asset_id]
+            if not asset or not checks:
+                raise WorkflowError("Artwork must pass a planned use before joining the library.", 409)
+            proof_hashes = {}
+            for check in checks:
+                record = project["review"]["assets"].get(check["id"], {})
+                if record.get("status") != "passed" or not gates.has_proof(folder, "assets", check, record):
+                    raise WorkflowError("Pass every current planned use of this artwork before publishing.", 409)
+                proof_hashes[check["id"]] = record["proofHash"]
+            if asset.get("libraryId"):
+                self.library.qualify(asset["libraryId"], asset["libraryVersion"], project_id, proof_hashes)
+            else:
+                uses = (use for scene in project["plan"]["scenes"] for use in planning.scene_art(scene))
+                brief = next((use["artBrief"] for use in uses if use["artId"] == asset_id and use["artBrief"]), "")
+                version = self.library.publish(
+                    project_id=project_id, alias=asset_id, name=asset["name"], brief=brief, style=project["style"],
+                    source=asset.get("source", "project"), content_hash=asset["hash"],
+                    path=folder / "assets" / f"{asset['hash']}.png", proofs=proof_hashes,
+                )
+                # Publication preserves the already reviewed bytes. The pinned origin is recorded separately.
+                asset.update(libraryId=version["id"], libraryVersion=version["version"], brief=brief)
+            asset["libraryQualified"] = True
+            self._record_library_pin(project, asset)
+            self._save(project)
+            return self._view(project)
+
+    def report_art_issue(self, project_id, asset_id, data):
+        fields(data, ("revision", "kind", "reason"))
+        if data["kind"] not in ("defective", "incomplete"):
+            raise WorkflowError("Choose defective or incomplete artwork.")
+        reason = text_value(data["reason"], "Artwork issue", 1000, True)
+        with self.lock:
+            project = self._edit(project_id, data["revision"])
+            asset = assets_by_id(project).get(asset_id)
+            if not asset:
+                raise WorkflowError("Artwork not found in this project.", 404)
+            if asset.get("issue"):
+                raise WorkflowError("This version already has an open issue. Replace it with corrected artwork.", 409)
+            issue = {"kind": data["kind"], "reason": reason, "at": now()}
+            if asset.get("libraryId"):
+                self.library.flag(asset["libraryId"], asset["libraryVersion"], issue)
+            asset.update(issue=issue, approved=False)
+            project.setdefault("assetIssues", []).append({**issue, "id": asset_id, "hash": asset["hash"]})
+            reset_candidate(project)
+            self._save(project)
+            return self._view(project)
+
+    @staticmethod
+    def _resolve_art_issue(project, asset, replacement_hash):
+        for issue in project.get("assetIssues", []):
+            if issue["id"] == asset["id"] and issue["hash"] == asset["hash"] and not issue.get("resolvedAt"):
+                issue.update(resolvedAt=now(), replacementHash=replacement_hash)
 
     def _reusable_art(self, project):
         """Offer a bounded catalog and bind any selection to these exact revisions."""
@@ -937,12 +1201,15 @@ class Studio:
         for entry in self.library.list_assets():
             if entry["id"] in excludes or entry["id"] in pinned_entries:
                 continue
+            if entry["style"] != project["style"]:
+                continue
             terms = asset_terms(f"{entry['alias']} {Path(entry['name']).stem} {entry['brief']}")
             matches = len(terms & wanted)
             if matches:
-                latest = next(version for version in entry["versions"] if version["version"] == entry["latestVersion"])
-                ranked.append((matches, entry["style"] == project["style"], {**latest, "alias": entry["alias"]}))
-        ranked.sort(key=lambda item: (item[0], item[1], item[2]["createdAt"]), reverse=True)
+                latest = next((version for version in entry["versions"] if version["qualified"] and not version["issue"]), None)
+                if latest:
+                    ranked.append((matches, latest["createdAt"], {**latest, "alias": entry["alias"]}))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
         limit = min(MAX_LIBRARY_CHOICES, available)
         seen_hashes = {asset["hash"] for asset in excludes.values() if asset["approved"]}
         reusable = []
@@ -959,6 +1226,7 @@ class Studio:
         return {
             "id": alias, "name": version["name"], "brief": version["brief"], "hash": version["hash"],
             "approved": True, "source": "library", "libraryId": version["id"], "libraryVersion": version["version"],
+            "libraryQualified": version.get("qualified", False),
         }
 
     def _copy_library_art(self, project, version):
@@ -991,8 +1259,12 @@ class Studio:
             if existing:
                 if existing.get("libraryId") == asset["libraryId"] and existing.get("libraryVersion") == asset["libraryVersion"]:
                     return self._view(project)
-                raise WorkflowError("That artwork ID is already used. Choose another project artwork ID.", 409)
-            if len(project["assets"]) >= MAX_PROJECT_ASSETS:
+                if not existing.get("issue") or existing["hash"] == asset["hash"]:
+                    raise WorkflowError("That artwork ID is already used. Choose another ID or a corrected version.", 409)
+                project["assets"].remove(existing)
+                self._resolve_art_issue(project, existing, asset["hash"])
+                reset_candidate(project)
+            elif len(project["assets"]) >= MAX_PROJECT_ASSETS:
                 raise WorkflowError(f"This project already has {MAX_PROJECT_ASSETS} artwork IDs.")
             self._copy_library_art(project, version)
             project["assets"].append(asset)
@@ -1003,7 +1275,7 @@ class Studio:
     def _apply_planned_art(self, project, scenes, reusable):
         if not reusable or not isinstance(scenes, list):
             return
-        ids = {scene["artId"] for scene in scenes if isinstance(scene, dict) and isinstance(scene.get("artId"), str)}
+        ids = {use["artId"] for scene in scenes if isinstance(scene, dict) for use in planning.scene_art(scene)}
         selected = [asset for asset in reusable if asset["id"] in ids]
         if not selected:
             return
@@ -1018,8 +1290,7 @@ class Studio:
     def _generate(self, project_id, revision):
         with self.lock:
             project = self._edit(project_id, revision)
-            if not project["input"]:
-                raise WorkflowError("Lock the narration before planning.", 409)
+            require_source_cues(project)
             if not planning.planner_available():
                 raise WorkflowError("Add an API key for the selected scene planner in Settings.", 409)
             if len(project["plannerRuns"]) >= planning.MAX_PLANNER_CALLS:
@@ -1030,7 +1301,8 @@ class Studio:
             run = {
                 "model": payload["model"], "requestHash": digest(encoded(payload)),
                 "inputHash": project["input"]["hash"], "packHash": planning.PACK_HASH,
-                "maxOutputTokens": planning.OUTPUT_TOKENS, "startedAt": now(), "status": "running", "provider": provider,
+                "maxOutputTokens": payload.get("max_output_tokens", payload.get("max_tokens", planning.OUTPUT_TOKENS)),
+                "startedAt": now(), "status": "running", "provider": provider,
                 "libraryCatalog": [{"id": asset["id"], "version": asset["version"], "hash": asset["hash"]} for asset in reusable],
             }
             request_path = self._folder(project_id) / "records" / "planner" / f"{run['requestHash']}.json"
@@ -1092,8 +1364,6 @@ class Studio:
                         for message in gates.run(project, folder, "animation", write_file))
         if project["input"].get("timing") == "source-cues":
             findings.append({"level": "info", "message": "Scene cues and captions use recording-matched word timings."})
-        elif project["audio"]:
-            findings.append({"level": "warning", "message": "Line timings are estimated across your recording. Review sync before exporting."})
         elif not mix_audio(project["mix"]):
             findings.append({"level": "warning", "message": "This project has no recording. The video will be silent."})
         if candidate_hash != (project["qc"] or {}).get("candidateHash") or any(item["level"] == "error" for item in findings):
@@ -1199,6 +1469,7 @@ class Studio:
     def preview(self, project_id, time):
         with self.lock:
             project = self._read(project_id)
+            self._apply_library_issues(project)
             folder = self._folder(project_id)
             self._require_prepared(project, folder, verify=False)
         return render.preview(project, folder, time)
@@ -1241,7 +1512,8 @@ class Studio:
         result = {}
         try:
             output_dir.mkdir(exist_ok=True)
-            details = render.export_video(snapshot, folder, temporary)
+            details = render.export_video(snapshot, folder, temporary, approved_mix=record["mix"]["rendered"])
+            self._apply_library_issues(snapshot)
             if candidate(snapshot, folder) != record:
                 raise WorkflowError("An input changed while the candidate was rendering.", 409)
             self._require_review(snapshot, folder, "assets")

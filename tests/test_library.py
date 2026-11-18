@@ -21,7 +21,7 @@ class LibraryTests(unittest.TestCase):
         digest = hashlib.sha256(self.source.read_bytes()).hexdigest()
         return self.library.publish(
             project_id=project_id, alias=alias, name=name, brief="Ceramic cup from the side",
-            style="warm-editorial", source="upload", content_hash=digest, path=self.source,
+            style="warm-editorial", source="upload", content_hash=digest, path=self.source, proofs={"a" * 64: "b" * 64},
         )
 
     def test_projects_share_catalog_but_same_alias_has_separate_identity(self):

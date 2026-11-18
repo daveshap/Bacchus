@@ -16,11 +16,12 @@ from threading import Timer
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from . import media_tools
+from . import layer_spec, media_tools, mixing
 
 WIDTH, HEIGHT, FPS = 1280, 720, 24
-SAMPLE_RATE = 48_000
-CHANNELS = 2
+SAMPLE_RATE = mixing.SAMPLE_RATE
+CHANNELS = mixing.CHANNELS
+MAX_MUSIC_REGIONS = mixing.MAX_MUSIC_REGIONS
 MOTION_DURATION = {"still": 0, "fade": 0.48, "push-in": 1.15}
 
 
@@ -54,6 +55,7 @@ FONT_ROOTS = (
 FONT_FILES = {
     "title": ("georgiab.ttf", "Georgia Bold.ttf", "DejaVuSerif-Bold.ttf", "LiberationSerif-Bold.ttf"),
     "signal": ("segoeuib.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"),
+    "warm-heading": ("seguisb.ttf", "segoeuib.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"),
     "body": ("segoeui.ttf", "Arial.ttf", "DejaVuSans.ttf", "NotoSans-Regular.ttf", "LiberationSans-Regular.ttf"),
 }
 
@@ -189,9 +191,169 @@ def _draw_scene(scene, assets, folder, palette):
     return frame
 
 
+def _draw_block(image, text, box, color, role="body", maximum=33, minimum=18, *, center=False):
+    x, y, width, height = box
+    font, lines, step = _text_block(text, role, maximum, minimum, width, height)
+    draw = ImageDraw.Draw(image)
+    x = x + width / 2 if center else x
+    y += (height - len(lines) * step) / 2
+    for line in lines:
+        draw.text((x, y), line, fill=color, font=font, anchor="ma" if center else "la")
+        y += step
+
+
+def _layered_background(scene, palette):
+    frame = Image.new("RGB", (WIDTH, HEIGHT), palette.paper)
+    draw = ImageDraw.Draw(frame)
+    draw.rectangle((47, 43, WIDTH - 47, HEIGHT - 43), outline=palette.rule, width=2)
+    draw.line((91, 140, WIDTH - 91, 140), fill=palette.rule, width=2)
+    draw.rounded_rectangle((92, 74, 128, 79), radius=2, fill=palette.accent)
+    heading = "warm-heading" if palette is PALETTES["warm-editorial"] else palette.title_font
+    _draw_block(frame, scene["title"], (149, 65, 1039, 67), palette.ink, heading, 44, 23)
+    caption = scene.get("caption", "")
+    if caption:
+        draw.line((91, 599, WIDTH - 91, 599), fill=palette.rule, width=2)
+        _draw_block(frame, caption, (94, 606, 1092, 56), palette.muted, "body", 23, 17)
+    return frame
+
+
+def _draw_chart(tile, layer, palette):
+    draw = ImageDraw.Draw(tile)
+    width, height = tile.size
+    items = layer["items"]
+    header = 38 if layer["text"] else 6
+    row_height = (height - header - 18) // len(items)
+    if width < 240 or row_height < 25:
+        raise RenderError("The chart needs more room for its bars, labels and values.")
+    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=13, fill=palette.matte, outline=palette.rule)
+    if layer["text"]:
+        _draw_block(tile, layer["text"], (14, 3, width - 28, 34), palette.ink, maximum=23, minimum=16)
+    label_width, value_width = round(width * .27), round(width * .22)
+    bar_left, bar_right = label_width + 24, width - value_width - 22
+    values = [item["value"] for item in items]
+    low, high = min(0, *values), max(0, *values)
+    span = high - low or 1
+
+    def position(value):
+        return round(bar_left + (value - low) / span * (bar_right - bar_left))
+
+    baseline = position(0)
+    draw.line((baseline, header, baseline, height - 18), fill=palette.muted, width=1)
+    colors = (
+        ("#5f8377", "#a95d44", "#658095", "#a88039")
+        if palette is PALETTES["warm-editorial"] else (palette.accent, palette.muted)
+    )
+    for index, item in enumerate(items):
+        top = header + row_height * index
+        _draw_block(tile, item["label"], (12, top, label_width, row_height), palette.ink, maximum=20, minimum=13)
+        value = item["value"]
+        label = str(int(value)) if value == int(value) else str(value)
+        if layer["unit"]:
+            label += f" {layer['unit']}"
+        _draw_block(tile, label, (bar_right + 11, top, value_width, row_height), palette.ink, maximum=20, minimum=13)
+        if value:
+            x0, x1 = sorted((baseline, position(value)))
+            inset = max(4, row_height // 4)
+            draw.rounded_rectangle(
+                (x0, top + inset, max(x0 + 1, x1), top + row_height - inset),
+                radius=4, fill=colors[index % len(colors)],
+            )
+
+
+def _draw_flow(tile, layer, palette):
+    draw = ImageDraw.Draw(tile)
+    width, height = tile.size
+    header = 42 if layer["text"] else 4
+    if layer["text"]:
+        _draw_block(tile, layer["text"], (4, 2, width - 8, 36), palette.ink, maximum=25, minimum=16)
+    count = len(layer["items"])
+    space = 22
+    horizontal = width >= (height - header) * 1.7
+    if horizontal:
+        node_width = (width - 4 - (count - 1) * space) // count
+        node_height = min(110, height - header - 4)
+        y = header + (height - header - node_height) // 2
+        boxes = [(2 + i * (node_width + space), y, node_width, node_height) for i in range(count)]
+    else:
+        node_width = width - 6
+        node_height = (height - header - 4 - (count - 1) * space) // count
+        boxes = [(3, header + i * (node_height + space), node_width, node_height) for i in range(count)]
+    if node_width < 53 or node_height < 31:
+        raise RenderError("The flow diagram needs more room for its steps and arrows.")
+    for index, ((x, y, w, h), item) in enumerate(zip(boxes, layer["items"], strict=True)):
+        draw.rounded_rectangle(
+            (x, y, x + w - 1, y + h - 1), radius=12, fill=palette.matte, outline=palette.rule, width=2,
+        )
+        _draw_block(tile, item["label"], (x + 8, y + 3, w - 16, h - 6), palette.ink, maximum=23, minimum=14, center=True)
+        if index == count - 1:
+            continue
+        if horizontal:
+            cx, cy = x + w + space - 4, y + h // 2
+            draw.line((x + w + 3, cy, cx, cy), fill=palette.accent, width=2)
+            draw.polygon(((cx, cy), (cx - 6, cy - 4), (cx - 6, cy + 4)), fill=palette.accent)
+        else:
+            cx, cy = x + w // 2, y + h + space - 4
+            draw.line((cx, y + h + 3, cx, cy), fill=palette.accent, width=2)
+            draw.polygon(((cx, cy), (cx - 4, cy - 6), (cx + 4, cy - 6)), fill=palette.accent)
+
+
+CONTENT = (92, 154, WIDTH - 92, 584)
+
+
+@dataclass
+class _PaintedLayer:
+    id: str
+    image: Image.Image
+    position: tuple[int, int]
+    start: float
+    settled: float
+    end: float
+    effect: str
+
+    def phase(self, elapsed):
+        if not self.start <= elapsed < self.end:
+            return None
+        if elapsed >= self.settled:
+            return 1
+        return (elapsed - self.start) / (self.settled - self.start)
+
+    def paste(self, frame, phase):
+        if phase is None or phase <= 0:
+            return
+        image = self.image
+        x, y = self.position
+        if phase >= 1:
+            frame.paste(image, (x, y), image)
+        elif self.effect == "fade":
+            frame.paste(image, (x, y), image.getchannel("A").point(lambda alpha: round(alpha * phase)))
+        elif self.effect == "wipe":
+            shown = max(1, round(image.width * phase))
+            visible = image.crop((0, 0, shown, image.height))
+            frame.paste(visible, (x, y), visible)
+        elif self.effect == "rise":
+            offset = round(min(52, image.height // 4) * (1 - phase) ** 2)
+            visible = image.crop((0, 0, image.width, image.height - offset))
+            frame.paste(visible, (x, y + offset), visible)
+
+
+@dataclass
+class _PreparedScene:
+    frame: Image.Image
+    layers: tuple[_PaintedLayer, ...] = ()
+
+
+def frame_at_or_after(time):
+    """First integer output frame whose renderer timestamp is at or after time."""
+    frame = math.ceil(time * FPS)
+    if frame > 0 and (frame - 1) / FPS >= time:
+        return frame - 1
+    return frame + int(frame / FPS < time)
+
+
 class _Composition:
     def __init__(self, project, folder):
-        self.duration = project["input"]["duration"]
+        self.source = project["input"]
+        self.duration = self.source["duration"]
         self.folder = folder
         self.scenes = project["plan"]["scenes"]
         style = project.get("style", "warm-editorial")
@@ -200,16 +362,85 @@ class _Composition:
         self.palette = PALETTES[style]
         # Include the recording's lead-in in the opening scene.
         self.positions = [0.0] + [
-            project["input"]["lines"][scene["startLine"] - 1]["start"]
+            self.source["lines"][scene["startLine"] - 1]["start"]
             for scene in self.scenes[1:]
         ]
         self.assets = {asset["id"]: asset for asset in project["assets"]}
 
     def _draw(self, index):
+        prepared = self.prepare(index)
+        if prepared.layers:
+            return self.draw_prepared(index, 0, prepared)
+        return prepared.frame
+
+    def prepare(self, index):
         try:
-            return _draw_scene(self.scenes[index], self.assets, self.folder, self.palette)
-        except RenderError as error:
+            scene = self.scenes[index]
+            if scene["layout"] == "layered":
+                return self._prepare_layers(scene, self.positions[index])
+            return _PreparedScene(_draw_scene(scene, self.assets, self.folder, self.palette))
+        except (RenderError, layer_spec.LayerError) as error:
             raise RenderError(f"Scene {index + 1}. {error}") from error
+
+    def _prepare_layers(self, scene, scene_start):
+        layers = []
+        x0, y0, x1, y1 = CONTENT
+        for layer in layer_spec.validate_layers({"input": self.source}, scene):
+            kind, box = layer["kind"], layer["box"]
+            x = round(x0 + box["x"] * (x1 - x0) / 100)
+            y = round(y0 + box["y"] * (y1 - y0) / 100)
+            width = round(box["w"] * (x1 - x0) / 100)
+            height = round(box["h"] * (y1 - y0) / 100)
+            tile = Image.new("RGBA", (width, height))
+            start, settled, end = layer_spec.schedule(self.source, scene, layer)
+            try:
+                if frame_at_or_after(settled) / FPS >= end:
+                    raise RenderError("The layer leaves before any fully visible output frame.")
+                if kind == "text":
+                    inset = min(12, width // 5, height // 5)
+                    _draw_block(tile, layer["text"], (inset, inset, width - 2 * inset, height - 2 * inset), self.palette.ink)
+                elif kind == "art":
+                    image = _read_asset(layer["artId"], self.assets, self.folder)
+                    fitted = ImageOps.contain(image, tile.size, Image.Resampling.LANCZOS)
+                    tile.alpha_composite(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+                elif kind == "bar-chart":
+                    _draw_chart(tile, layer, self.palette)
+                elif kind == "flow":
+                    _draw_flow(tile, layer, self.palette)
+            except RenderError as error:
+                raise RenderError(f"Layer {layer['id']!r}. {error}") from error
+            layers.append(_PaintedLayer(
+                layer["id"], tile, (x, y), start - scene_start, settled - scene_start, end - scene_start,
+                layer["enter"]["effect"],
+            ))
+        return _PreparedScene(_layered_background(scene, self.palette), tuple(layers))
+
+    def visual_state(self, index, elapsed, prepared):
+        if prepared.layers:
+            return tuple(layer.phase(elapsed) for layer in prepared.layers)
+        return min(elapsed, self.motion_length(index))
+
+    def draw_prepared(self, index, elapsed, prepared):
+        if not prepared.layers:
+            return self.apply_motion(prepared.frame, index, elapsed)
+        frame = prepared.frame.copy()
+        state = self.visual_state(index, elapsed, prepared)
+        for layer, phase in zip(prepared.layers, state, strict=True):
+            layer.paste(frame, phase)
+        return frame
+
+    def asset_frame(self, index, layer_id, prepared=None):
+        prepared = prepared if prepared is not None else self.prepare(index)
+        if not prepared.layers:
+            return prepared.frame
+        selected = next((layer for layer in prepared.layers if layer.id == layer_id), None)
+        if not selected:
+            raise RenderError("The planned artwork layer no longer exists.")
+        frame = prepared.frame.copy()
+        for layer in prepared.layers:
+            if layer.phase(selected.settled) is not None:
+                layer.paste(frame, 1)
+        return frame
 
     def at(self, time):
         if not math.isfinite(time):
@@ -250,7 +481,7 @@ class _Composition:
 def preview(project, folder: Path, time: float) -> bytes:
     composition = _Composition(project, folder)
     index, elapsed = composition.at(time)
-    frame = composition.apply_motion(composition._draw(index), index, elapsed)
+    frame = composition.draw_prepared(index, elapsed, composition.prepare(index))
     with BytesIO() as buffer:
         frame.save(buffer, format="PNG")
         return buffer.getvalue()
@@ -273,91 +504,18 @@ def render_available() -> bool:
     return media_tools.available()
 
 
-def _verified_audio(folder, entry, label):
-    path = _media_path(folder, "audio", entry["hash"], ".wav")
+def validate_music_regions(project, regions):
     try:
-        with path.open("rb") as handle:
-            digest = hashlib.file_digest(handle, "sha256").hexdigest()
-    except OSError as error:
-        raise RenderError(f"{label} could not be read.") from error
-    if digest != entry["hash"]:
-        raise RenderError(f"{label} changed after intake.")
-    return path
+        return mixing.validate_music_regions(project, regions)
+    except mixing.MixError as error:
+        raise RenderError(str(error)) from error
 
 
-def _number(value, label, minimum, maximum):
-    if type(value) not in (int, float) or not minimum <= value <= maximum:
-        raise RenderError(f"{label} must be between {minimum} and {maximum}.")
-    return value
-
-
-def _sound_options(project, folder, frame_count, first_input):
-    """Return the FFmpeg inputs and shared voice-first filter graph."""
-    samples = frame_count * (SAMPLE_RATE // FPS)
-    window = f"apad=whole_len={samples},atrim=end_sample={samples}"
-    audio_format = f"aformat=sample_fmts=fltp:sample_rates={SAMPLE_RATE}:channel_layouts=stereo"
-    options, filters, outputs = [], [], []
-    input_count = 0
-
-    def source(entry, label, gain, *, loop=False):
-        nonlocal input_count
-        path = _verified_audio(folder, entry, label)
-        if loop:
-            options.extend(("-stream_loop", "-1"))
-        options.extend(("-f", "wav", "-i", str(path)))
-        channel = f"[{first_input + input_count}:a:0]"
-        input_count += 1
-        return f"{channel}{audio_format},asetpts=PTS-STARTPTS,volume={gain:.3f}dB"
-
-    mix = project.get("mix") or {}
-    voice = project.get("audio")
-    music = mix.get("music") if mix.get("musicMode") == "track" else None
-    if mix.get("musicMode") == "track" and not music:
-        raise RenderError("The selected music track is missing.")
-
-    if voice:
-        narration = source(voice, "Narration", -3.0)
-        split = ",asplit=2[voice][sidechain]" if music else "[voice]"
-        filters.append(f"{narration},{window}{split}")
-        outputs.append("[voice]")
-
-    if music:
-        gain = _number(music["gainDb"], "Music gain", -48, 0)
-        backing = source(music, "Music", gain, loop=True)
-        fade = min(int(SAMPLE_RATE * 0.33), samples // 4)
-        fades = f",afade=t=in:ns={fade},afade=t=out:ss={samples - fade}:ns={fade}"
-        if voice:
-            filters.append(f"{backing},{window}{fades}[music]")
-            filters.append(
-                "[music][sidechain]sidechaincompress=threshold=0.035:ratio=6:"
-                "attack=12:release=240:link=maximum:detection=rms[backing]"
-            )
-        else:
-            filters.append(f"{backing},{window}{fades}[backing]")
-        outputs.append("[backing]")
-
-    for index, effect in enumerate(mix.get("effects", []), start=1):
-        label = f"Sound effect {index}"
-        gain = _number(effect["gainDb"], f"{label} gain", -48, 0)
-        start = _number(effect["start"], f"{label} start", 0, project["input"]["duration"])
-        delay = round(start * SAMPLE_RATE)
-        output = f"[effect{index}]"
-        clip = source(effect, label, gain)
-        filters.append(f"{clip},adelay={delay}S:all=1,atrim=end_sample={samples}{output}")
-        outputs.append(output)
-
-    if not outputs:
-        return []
-
-    if len(outputs) > 1:
-        graph = f"{''.join(outputs)}amix=inputs={len(outputs)}:duration=longest:normalize=0,"
-    else:
-        graph = outputs[0]
-    filters.append(
-        f"{graph}{window},alimiter=limit=0.8912509:attack=5:"
-        f"release=50:level=false:latency=true,{window},asetpts=N/SR/TB[mix]"
-    )
-    return [*options, "-filter_complex", ";".join(filters)]
+def verify_mix(folder, metadata, narration_duration):
+    try:
+        return mixing.verify_mix(folder, metadata, _frame_count(narration_duration), FPS)
+    except mixing.MixError as error:
+        raise RenderError(str(error)) from error
 
 
 def _video_frames(composition, frame_count):
@@ -366,31 +524,34 @@ def _video_frames(composition, frame_count):
     for number in range(frame_count):
         index, elapsed = composition.at(number / FPS)
         if index != last_index:
-            base = composition._draw(index)
-            motion_length = composition.motion_length(index)
+            prepared = composition.prepare(index)
             last_index = index
             last_phase = None
-        phase = min(elapsed, motion_length)
+        phase = composition.visual_state(index, elapsed, prepared)
         if phase != last_phase:
-            data = composition.apply_motion(base, index, phase).tobytes()
+            data = composition.draw_prepared(index, elapsed, prepared).tobytes()
             last_phase = phase
         yield data
 
 
-def _encode(project, folder, composition, frame_count, scratch):
+def _encode(project, folder, composition, frame_count, scratch, approved_mix=None):
     output = scratch / "video.mp4"
     log = scratch / "ffmpeg.log"
     duration = frame_count / FPS
-    audio_options = _sound_options(project, folder, frame_count, first_input=1)
-    audio_mapping = ["-map", "[mix]", "-c:a", "aac", "-b:a", "192k", "-ar", str(SAMPLE_RATE),
-                     "-ac", str(CHANNELS)] if audio_options else []
+    mix = project.get("mix") or {}
+    if approved_mix is None and (project.get("audio") or mix.get("musicMode") == "track" or mix.get("effects")):
+        raise RenderError("Prepare and approve the soundtrack before rendering.")
+    audio_options = []
+    if approved_mix is not None:
+        audio_path = verify_mix(folder, approved_mix, composition.duration)
+        audio_options = ["-f", "wav", "-i", str(audio_path), "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
     command = [
         media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", f"{WIDTH}x{HEIGHT}", "-framerate", str(FPS), "-i", "pipe:0",
-        *audio_options, "-map", "0:v:0", *audio_mapping,
+        *audio_options, "-map", "0:v:0",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-t", f"{duration:.9f}", "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         str(output),
     ]
     with log.open("w+b") as errors:
@@ -463,49 +624,25 @@ def _frame_count(duration):
     return math.ceil(duration * FPS)
 
 
-def export_video(project, folder: Path, destination: Path) -> dict:
+def export_video(project, folder: Path, destination: Path, *, approved_mix=None) -> dict:
     if not render_available():
         raise RenderError("Video export needs FFmpeg and FFprobe on PATH.")
     composition = _Composition(project, folder)
     frame_count = _frame_count(composition.duration)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".bacchus-render-", dir=destination.parent) as work:
-        output, has_audio = _encode(project, folder, composition, frame_count, Path(work))
+        output, has_audio = _encode(project, folder, composition, frame_count, Path(work), approved_mix)
         media = _inspect(output, frame_count, has_audio)
         output.replace(destination)
     return media
 
 
 def export_mix(project, folder: Path, destination: Path) -> dict:
-    """Render the approved video mix's PCM source for listen-through."""
-    if not render_available():
-        raise RenderError("Mix preview needs FFmpeg and FFprobe on PATH.")
-    frame_count = _frame_count(project["input"]["duration"])
-    options = _sound_options(project, folder, frame_count, first_input=0)
-    if not options:
-        raise RenderError("Add narration, music, or sound effects to listen to a mix.")
-    duration = frame_count / FPS
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix=".bacchus-mix-", dir=destination.parent) as work:
-        output = Path(work) / "mix.wav"
-        command = [
-            media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
-            *options, "-map", "[mix]", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-            "-c:a", "pcm_s16le", str(output),
-        ]
-        try:
-            subprocess.run(command, check=True, timeout=max(45, duration), capture_output=True,
-                           **media_tools.process_options())
-            probe = _probe(output)
-            streams = probe["streams"]
-            stream_duration = float(probe["format"]["duration"])
-            valid = len(streams) == 1 and (
-                streams[0]["codec_type"], streams[0]["codec_name"],
-                streams[0]["sample_rate"], streams[0]["channels"],
-            ) == ("audio", "pcm_s16le", str(SAMPLE_RATE), CHANNELS) and abs(stream_duration - duration) < 0.001
-        except (OSError, subprocess.SubprocessError, TypeError, KeyError, ValueError) as error:
-            raise RenderError("FFmpeg could not produce a verified mix preview.") from error
-        if not valid:
-            raise RenderError("The mix preview did not match the selected sound settings.")
-        output.replace(destination)
-    return {"duration": stream_duration, "sampleRate": SAMPLE_RATE, "channels": CHANNELS}
+    """Prepare the PCM soundtrack that the operator previews and approves."""
+    try:
+        frame_count = _frame_count(project["input"]["duration"])
+        return mixing.prepare_mix(project, folder, destination, frame_count, FPS)
+    except mixing.MixError as error:
+        raise RenderError(str(error)) from error
+    except OSError as error:
+        raise RenderError("The prepared soundtrack could not be saved.") from error

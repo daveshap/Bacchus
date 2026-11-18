@@ -66,7 +66,7 @@ def available():
 def _supports_bacchus(encoder, modified):
     requirements = {
         "-encoders": ("libx264", "aac", "pcm_s16le"),
-        "-filters": ("sidechaincompress", "alimiter"),
+        "-filters": ("sidechaincompress", "alimiter", "aloop", "ebur128"),
     }
     try:
         for flag, needed in requirements.items():

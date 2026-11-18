@@ -1,7 +1,7 @@
 {
   "id": "editorial",
   "name": "Warm editorial",
-  "version": "0.1.0",
-  "layouts": ["title", "editorial", "illustration"],
+  "version": "0.2.0",
+  "layouts": ["title", "editorial", "illustration", "layered"],
   "motions": ["still", "fade", "push-in"]
 }

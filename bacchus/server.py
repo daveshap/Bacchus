@@ -8,7 +8,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import RESOURCES, audio, media_tools, planning, providers, render, visual_review
+from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, visual_review
 from .library import LibraryError
 from .runtime import APP_VERSION
 from .settings import SettingsError
@@ -93,6 +93,7 @@ class Handler(BaseHTTPRequestHandler):
                 "audioAvailable": audio.audio_available(), "transcriberAvailable": audio.transcriber_available(),
                 "imageAvailable": providers.image_available(), "plannerProvider": planning.planner_provider(),
                 "visualReviewerAvailable": visual_review.available(),
+                "localTimingAvailable": local_timing.available(),
                 "styles": [{"id": style, "name": label} for style, label in STYLES.items()],
                 "maxEffects": MAX_EFFECTS, "maxFxDuration": MAX_FX_DURATION,
                 "maxArtGenerations": MAX_ART_GENERATIONS, "maxTranscriptionCalls": MAX_TRANSCRIPTIONS,
@@ -182,6 +183,10 @@ class Handler(BaseHTTPRequestHandler):
             ))
         elif tail == ["timings"]:
             self._json(studio.import_timings(project_id, self._revision(query), self._raw(4 * 1024 * 1024)))
+        elif tail == ["timings", "derive"]:
+            self._json(studio.derive_timings(project_id, self._body()))
+        elif tail == ["timings", "text"]:
+            self._json(studio.edit_timings(project_id, self._body(4 * 1024 * 1024)))
         elif tail == ["audio", "remove"]:
             self._json(studio.remove_audio(project_id, self._body()))
         elif tail in (["mix", "music"], ["mix", "effects"]):
@@ -198,6 +203,10 @@ class Handler(BaseHTTPRequestHandler):
             ))
         elif len(tail) == 3 and tail[0] == "assets" and tail[2] == "approve":
             self._json(studio.approve_art(project_id, tail[1], self._body()))
+        elif len(tail) == 3 and tail[0] == "assets" and tail[2] == "publish":
+            self._json(studio.publish_art(project_id, tail[1], self._body()))
+        elif len(tail) == 3 and tail[0] == "assets" and tail[2] == "issue":
+            self._json(studio.report_art_issue(project_id, tail[1], self._body()))
         elif len(tail) == 3 and tail[0] == "assets" and tail[2] == "generate":
             self._json(studio.generate_art(project_id, tail[1], self._body()))
         elif len(tail) == 4 and tail[1] == "checks" and tail[3] == "result":
@@ -253,11 +262,11 @@ class Handler(BaseHTTPRequestHandler):
             raise WorkflowError("Request data was incomplete.")
         return raw
 
-    def _body(self):
+    def _body(self, limit=JSON_LIMIT):
         if self.headers.get_content_type() != "application/json":
             raise WorkflowError("Expected a JSON request.", 415)
         try:
-            return json.loads(self._raw(JSON_LIMIT))
+            return json.loads(self._raw(limit))
         except (ValueError, RecursionError, UnicodeError) as error:
             raise WorkflowError("The request body must be valid JSON.") from error
 

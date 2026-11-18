@@ -151,6 +151,10 @@ code { overflow-wrap: anywhere; }
 .scene-editor > summary { cursor: pointer; font-weight: 620; }
 .scene-editor > summary::marker { color: var(--accent); }
 .scene-editor .stack { margin-top: 14px; }
+.scene-layer { min-width: 0; margin: 0; padding: 13px; border: 1px solid var(--line-strong); border-radius: 7px; }
+.scene-layer legend { padding-inline: 5px; color: var(--accent); }
+.layer-word-list { display: flex; flex-wrap: wrap; gap: 3px 10px; max-height: 140px; overflow: auto; padding: 0; list-style: none; }
+.layer-word-list small { color: var(--muted); }
 .scene-fields { grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); }
 .scene-meta { display: block; margin-top: 2px; color: var(--muted); font-size: .82rem; font-weight: 400; }
 .planner-receipt { margin-top: 16px; font-size: .88rem; }

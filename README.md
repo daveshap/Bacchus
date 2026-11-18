@@ -4,7 +4,7 @@ Bacchus turns recorded narration and a creative brief into a reviewed MP4. AI ca
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.3.3 Windows installer](releases/0.3.3/Bacchus-0.3.3-windows-x64.msi) and its [SHA-256 checksum](releases/0.3.3/Bacchus-0.3.3-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.3.3` tag records the source and installer for this release.
+Download the [Bacchus 0.4.0 Windows installer](releases/0.4.0/Bacchus-0.4.0-windows-x64.msi) and its [SHA-256 checksum](releases/0.4.0/Bacchus-0.4.0-windows-x64.sha256). This unsigned preview includes Python and the app's dependencies. The `v0.4.0` tag records the source and installer for this release.
 
 1. Run the MSI, then open **Bacchus** from the Start menu. Bacchus opens its local workspace in your default browser.
 2. In **Setup**, choose **Install media tools** if the readiness checks are incomplete. This downloads a verified FFmpeg build into Bacchus's user data.
@@ -20,11 +20,10 @@ To back up Bacchus, quit the app, then copy its data folder and any separately c
 
 ## Configure AI
 
-Bacchus uses Anthropic's Claude Sonnet 5.5 (`claude-sonnet-5-5`) by default to plan scenes, choose motion and write artwork briefs. Enter an Anthropic API key in **Settings** or set `ANTHROPIC_API_KEY` before launch to enable planning. Paste spoken text or import matching word timings, then use approved library artwork or upload images for the plan. Bacchus renders the approved plan locally. You can select another Claude model with structured outputs in **Settings** or through `BACCHUS_CLAUDE_MODEL`. [Claude Sonnet 5.5](https://platform.claude.com/docs/en/models/sonnet-5-5/overview) · [Claude structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
+Bacchus uses Anthropic's Claude Sonnet 5.5 (`claude-sonnet-5-5`) by default to plan scenes, choose motion and write artwork briefs. Enter an Anthropic API key in **Settings** or set `ANTHROPIC_API_KEY` before launch to enable planning. Bacchus renders the approved plan locally. You can select another Claude model with structured outputs in **Settings** or through `BACCHUS_CLAUDE_MODEL`. [Claude Sonnet 5.5](https://platform.claude.com/docs/en/models/sonnet-5-5/overview) · [Claude structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
 
 To use an optional OpenAI feature, add an OpenAI API key in **Settings** or set `OPENAI_API_KEY`. Then enable the specific feature you want.
 
-- **Transcription.** Enable OpenAI transcription in **Settings** or set `BACCHUS_USE_OPENAI_TRANSCRIPTION=1`. When requested, Bacchus sends a compact copy of the recording for speech-to-text. [File transcription](https://developers.openai.com/api/docs/guides/speech-to-text)
 - **Image generation.** Enable OpenAI image generation in **Settings** or set `BACCHUS_USE_OPENAI_IMAGES=1`. When requested, Bacchus sends the selected artwork brief and style to generate an image. [Image generation API](https://developers.openai.com/api/reference/resources/images/methods/generate)
 - **Scene planning.** Choose OpenAI as your planning provider in **Settings** or set `BACCHUS_PLANNER_PROVIDER=openai`. [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 
@@ -38,22 +37,24 @@ Logs can contain prompts, transcripts, artwork, and audio. Bacchus omits authent
 
 ## Make a cut
 
-1. Import an MP3, FLAC, or WAV. Paste an existing transcript, import recording-matched word timings, or transcribe it with the optional OpenAI feature. Pick a visual style, set the creative brief, and lock intake.
-2. Generate a plan or start from the local editable draft. Review the scenes, motion, and artwork requirements, then approve the saved plan.
-3. Pin library artwork, upload prepared images, or make illustrations with optional OpenAI image generation. Approve the image versions. Run **Artwork checks** and pass every planned use against the source image and its static placement in the actual scene.
-4. Choose a built-in score, import music and place effects, or select no music. Listen to the export mix and approve it. Once the artwork and sound mix are approved, prepare the animation.
+1. Import an MP3, FLAC, or WAV. Import a recording-matched cue sheet or derive word timings with the local Parakeet model. Check its words against the audio, correct any cues, then set the style and creative brief and lock intake.
+2. Generate a plan or start from the local editable draft. A layered scene can reveal text, artwork, a bar chart, or a flow diagram on independently selected narration words. Review the whole plan and artwork requirements before approving it.
+3. Pin library artwork, upload prepared images, or make illustrations with optional OpenAI image generation. Approve the source versions for checking, then pass each planned use. Publish reusable assets after they pass. Record defective or incomplete artwork as an issue and replace the version or revise the planned use.
+4. Choose a built-in score, import music and place effects, or select no music. Set music levels or silence by narration cue range. Prepare and measure the soundtrack, listen to the prepared WAV, and approve that exact file. Once the artwork and soundtrack are approved, prepare the animation.
 5. Run **Animation checks** to produce contact sheets from the prepared cut with frame samples around entrances, motion, cues, exits, and joins. Scrub the cut and listen to the mix for sync. Resolve any failed checks, pass each scene, and accept the candidate.
 6. Press **Render video** to export an H.264 MP4, SRT captions, and a receipt with both review stages.
 
-The offline example starts with an approved visual plan. For your own recording, manual transcript entry, the local starter plan, image import and built-in soundtracks also work offline. The app supports recordings up to 30 minutes and three visual treatments over the same title, editorial, and illustration layouts. Export is 720p at 24 fps. OpenAI file transcription and manually entered transcript text use estimated timing. Import a `timing.json` with matching `audio.sha256`, `duration`, and `words` to use source-linked cues. Editing the imported transcript text switches it to estimated timing.
+The offline example starts with an approved visual plan. The local starter plan, image import and built-in soundtracks work offline. The app supports recordings up to 30 minutes, with three visual treatments and title, editorial, illustration, and layered layouts. Export is 720p at 24 fps.
+
+The recording is the timing authority. Import a `timing.json` with its `audio.sha256`, `duration`, and `words` with `text`, `start`, and `end`. For audio-only intake, extract the Parakeet TDT model separately and select the folder containing `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx` and `tokens.txt`. The local recognizer derives individual timestamps from the waveform. Review its draft against the audio before locking it. Older project exports remain downloadable. Resume a project with recording-bound cues by reopening its intake. [Parakeet TDT model instructions](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html#sherpa-onnx-nemo-parakeet-tdt-0-6b-v2-int8-english)
 
 Bacchus keeps original recordings, normalized media, plans, review proofs, decisions, and exports in its data folder. Proofs bind to the artwork version and the scene inputs they show. Changes to the cut invalidate its acceptance. Checks that still show the current inputs can carry forward. The built-in motions apply to the whole scene. The artwork checks use still images.
 
 ## Reuse artwork
 
-Approving an uploaded or generated image saves it to the shared **Art library**. Existing approved images have a **Save to library** action. Approving a replacement under the same original project artwork ID creates a new revision when its image changes. Open the library to inspect earlier revisions and pin any one of them to a project under its own scene ID. A project keeps a copy of that exact image and records its library revision in the render receipt.
+After an uploaded or generated version passes its planned uses, publish it to the shared **Art library**. Publishing a corrected version under the same original project artwork ID creates a new revision when its image changes. Open the library to inspect earlier revisions and pin an eligible version to a project under its own scene ID. A project keeps a copy of that exact image and records its library revision in the render receipt. Flagging a published version as defective or incomplete prevents future reuse of that version and preserves its history.
 
-The planner receives a shortlist of up to 20 library images matched to the brief and narration by title, filename, and art description. If it selects a match, Bacchus pins that version when it saves the plan. Review those selections along with the scene plan.
+The planner receives a shortlist of up to 20 checked library images from the selected style, ranked by title, filename, and art description. If it selects a match, Bacchus pins that version when it saves the plan. Review those selections along with the scene plan. Requalify versions saved by older releases by passing their current uses and publishing that evidence.
 
 By default the art library lives in `library/` inside the Bacchus data folder. The launcher's `--library <folder>` option can point to a separate storage or backup location. Keep `entries/` and `blobs/` together. The library's JSON files store version histories, and the blobs are PNGs named by their content hash. A separate Git checkout can track those two directories and ignore `.library.lock` and temporary `.tmp` files.
 

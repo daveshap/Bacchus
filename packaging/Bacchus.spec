@@ -3,6 +3,7 @@ from pathlib import Path
 import runpy
 import sys
 import sysconfig
+from PyInstaller.utils.hooks import collect_dynamic_libs
 
 
 packaging = Path(SPECPATH).resolve()
@@ -27,6 +28,9 @@ data = [
 ]
 data.extend(notices("Pillow", "Pillow"))
 data.extend(notices("PyInstaller", "PyInstaller"))
+data.extend(notices("numpy", "NumPy"))
+data.extend(notices("sherpa-onnx", "Sherpa-ONNX"))
+data.extend(notices("sherpa-onnx-core", "Sherpa-ONNX Core"))
 stdlib = Path(sysconfig.get_path("stdlib"))
 for directory in (Path(sys.base_prefix), stdlib, stdlib.parent):
     python_license = next((directory / name for name in ("LICENSE.txt", "LICENSE") if (directory / name).is_file()), None)
@@ -38,6 +42,7 @@ analysis = Analysis(
     [str(project / "bacchus" / "__main__.py")],
     pathex=[str(project)],
     datas=data,
+    binaries=collect_dynamic_libs("sherpa_onnx"),
 )
 archive = PYZ(analysis.pure)
 executable = EXE(

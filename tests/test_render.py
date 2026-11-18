@@ -106,14 +106,25 @@ class RendererTests(unittest.TestCase):
             }
             wav_path = folder / "mix.wav"
             mix = render.export_mix(source, folder, wav_path)
-            self.assertEqual(mix, {"duration": 3.0, "sampleRate": 48_000, "channels": 2})
+            self.assertEqual((mix["duration"], mix["sampleRate"], mix["channels"], mix["samples"]),
+                             (3.0, 48_000, 2, 144_000))
+            self.assertEqual(mix["sha256"], hashlib.sha256(wav_path.read_bytes()).hexdigest())
+            self.assertLess(mix["levels"]["truePeakDbtp"], 0)
+            self.assertEqual(mix["narration"]["samples"], 48_000)
             with wave.open(str(wav_path), "rb") as wav:
                 self.assertEqual((wav.getframerate(), wav.getnchannels(), wav.getnframes()), (48_000, 2, 144_000))
                 pcm = left_channel(wav.readframes(wav.getnframes()))
             self.check_composition(pcm)
 
             mp4_path = folder / "video.mp4"
-            media = render.export_video(source, folder, mp4_path)
+            with self.assertRaisesRegex(render.RenderError, "approve the soundtrack"):
+                render.export_video(source, folder, mp4_path)
+            (folder / "mixes").mkdir()
+            prepared = folder / "mixes" / f"{mix['sha256']}.wav"
+            wav_path.replace(prepared)
+            for stem in (folder / "audio").iterdir():
+                stem.unlink()
+            media = render.export_video(source, folder, mp4_path, approved_mix=mix)
             self.assertEqual((media["audio"], media["audioSampleRate"], media["audioChannels"]),
                              ("aac", 48_000, 2))
             decoded = subprocess.run(
@@ -121,6 +132,37 @@ class RendererTests(unittest.TestCase):
                 capture_output=True, check=True, timeout=15,
             )
             self.check_composition(left_channel(decoded.stdout))
+
+            prepared.write_bytes(b"changed after approval")
+            with self.assertRaisesRegex(render.RenderError, "fingerprint"):
+                render.export_video(source, folder, mp4_path, approved_mix=mix)
+
+    @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
+    def test_music_regions_mute_backing_without_cutting_narration(self):
+        with TemporaryDirectory(prefix="bacchus-music-regions-") as temporary:
+            folder = Path(temporary)
+            (folder / "audio").mkdir()
+            source = project()
+            source["input"] = {"duration": 3.011, "lines": [{"start": 0.0}, {"start": 1.0}, {"start": 2.0}]}
+            regions = [{"startLine": 2, "endLine": 2, "gainDb": None}]
+            source["audio"] = tone(folder, "voice", 400, 3.011)
+            source["mix"] = {
+                "musicMode": "track", "music": {**tone(folder, "score", 650, 0.4), "gainDb": -10},
+                "musicRegions": regions, "effects": [],
+            }
+            self.assertEqual(render.validate_music_regions(source, regions), regions)
+            with self.assertRaisesRegex(render.RenderError, "overlap"):
+                render.validate_music_regions(source, [*regions, {"startLine": 1, "endLine": 2, "gainDb": -25}])
+            result = render.export_mix(source, folder, folder / "mix.wav")
+            self.assertEqual(result["narration"]["samples"], 48_176)
+            self.assertEqual(result["samples"], 146_000)
+            with wave.open(str(folder / "mix.wav"), "rb") as wav:
+                pcm = left_channel(wav.readframes(wav.getnframes()))
+            self.assertGreater(frequency_level(pcm, 650, 0.5, 0.7), 100)
+            self.assertLess(frequency_level(pcm, 650, 1.3, 1.5), 10)
+            self.assertGreater(frequency_level(pcm, 650, 2.3, 2.5), 100)
+            self.assertGreater(frequency_level(pcm, 400, 1.3, 1.5), 8_000)
+            self.assertGreater(frequency_level(pcm, 400, 3.0, 3.01), 7_000)
 
     def check_composition(self, samples):
         background = frequency_level(samples, 650, 0.5, 0.65)

@@ -130,11 +130,17 @@ class Library:
             raise LibraryError("Library artwork no longer matches its recorded fingerprint.", 409)
         return path
 
-    def publish(self, *, project_id, alias, name, brief, style, source, content_hash, path: Path) -> dict:
+    def publish(self, *, project_id, alias, name, brief, style, source, content_hash, path: Path, proofs) -> dict:
         if not isinstance(project_id, str) or not project_id or not isinstance(alias, str) or not SCENE_ALIAS.fullmatch(alias):
             raise LibraryError("Publishing requires a project and a valid artwork alias.")
         if not all(isinstance(value, str) for value in (name, brief, style, source)) or not name.strip():
             raise LibraryError("Publishing requires an artwork name and text metadata.")
+        if (
+            not isinstance(proofs, dict) or not proofs
+            or not all(isinstance(key, str) and CONTENT_HASH.fullmatch(key) and isinstance(value, str)
+                       and CONTENT_HASH.fullmatch(value) for key, value in proofs.items())
+        ):
+            raise LibraryError("Publishing requires evidence from passed artwork-use checks.", 409)
         path = Path(path)
         try:
             data = path.read_bytes()
@@ -158,6 +164,8 @@ class Library:
             if record and record.get("origin") != origin:
                 raise LibraryError("The library artwork identity does not match its origin.", 409)
             asset = record["asset"] if record else {"id": asset_id, "latestVersion": 0, "versions": []}
+            qualifications = (record or {}).get("qualifications", {})
+            issues = (record or {}).get("issues", {})
             target = self._blob_path(content_hash)
             if target.exists():
                 self.blob(content_hash)
@@ -165,25 +173,53 @@ class Library:
                 _atomic_write(target, data)
             for existing in asset["versions"]:
                 if existing["hash"] == content_hash:
-                    return existing
-            version = {
-                "id": asset_id,
-                "version": asset["latestVersion"] + 1,
-                "hash": content_hash,
-                "name": name.strip(),
-                "brief": brief,
-                "style": style,
-                "source": source if source in SOURCES else "project",
-                "createdAt": datetime.now(UTC).isoformat(timespec="seconds"),
-            }
-            asset.update(
-                name=version["name"], brief=brief, style=style, latestVersion=version["version"],
-                versions=[version, *asset["versions"]],
-            )
-            record = {"schema": 1, "origin": origin, "asset": asset}
-            raw = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-            _atomic_write(self._entry_path(asset_id), raw)
-            return version
+                    version = existing
+                    break
+            else:
+                version = {
+                    "id": asset_id, "version": asset["latestVersion"] + 1, "hash": content_hash,
+                    "name": name.strip(), "brief": brief, "style": style,
+                    "source": source if source in SOURCES else "project",
+                    "createdAt": datetime.now(UTC).isoformat(timespec="seconds"),
+                }
+                asset.update(name=version["name"], brief=brief, style=style, latestVersion=version["version"],
+                             versions=[version, *asset["versions"]])
+            key = str(version["version"])
+            if key in issues:
+                raise LibraryError("This exact artwork version has an unresolved defect. Use a corrected file.", 409)
+            qualifications[key] = {"projectId": project_id, "proofs": proofs}
+            self._write_record(asset_id, {"schema": 1, "origin": origin, "asset": asset,
+                                          "qualifications": qualifications, "issues": issues})
+            return self._view_version({"qualifications": qualifications, "issues": issues}, version)
+
+    def _write_record(self, asset_id, record):
+        raw = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        _atomic_write(self._entry_path(asset_id), raw)
+
+    def qualify(self, asset_id, version, project_id, proofs):
+        with self._exclusive():
+            record = self._read(asset_id)
+            self._selected(record, version)
+            record.setdefault("qualifications", {})[str(version)] = {"projectId": project_id, "proofs": proofs}
+            self._write_record(asset_id, record)
+
+    def flag(self, asset_id, version, issue):
+        with self._exclusive():
+            record = self._read(asset_id)
+            self._selected(record, version, allow_issue=True)
+            record.setdefault("issues", {}).setdefault(str(version), issue)
+            self._write_record(asset_id, record)
+
+    def issue(self, asset_id, version):
+        with self._exclusive():
+            record = self._read(asset_id, optional=True)
+            return record.get("issues", {}).get(str(version)) if record else None
+
+    @staticmethod
+    def _view_version(record, version):
+        key = str(version["version"])
+        return {**version, "qualified": key in record.get("qualifications", {}),
+                "issue": record.get("issues", {}).get(key)}
 
     def list_assets(self) -> list[dict]:
         """Return artwork alphabetically, with revisions newest first."""
@@ -193,15 +229,22 @@ class Library:
                 for path in self._safe_path("entries").glob("*.json")
                 if ASSET_ID.fullmatch(path.stem)
             ]
-            entries = [{**record["asset"], "alias": record["origin"]["alias"]} for record in records]
+            entries = [{**record["asset"], "alias": record["origin"]["alias"],
+                        "versions": [self._view_version(record, item) for item in record["asset"]["versions"]]}
+                       for record in records]
         return sorted(entries, key=lambda entry: (entry["name"].casefold(), entry["id"]))
 
     def get(self, asset_id, version: int) -> dict:
+        with self._exclusive():
+            return self._selected(self._read(asset_id), version)
+
+    def _selected(self, record, version, *, allow_issue=False):
         if type(version) is not int or version < 1:
             raise LibraryError("Artwork version was not found in the library.", 404)
-        with self._exclusive():
-            asset = self._read(asset_id)["asset"]
-            for entry in asset["versions"]:
-                if entry["version"] == version:
-                    return entry
+        for entry in record["asset"]["versions"]:
+            if entry["version"] == version:
+                selected = self._view_version(record, entry)
+                if selected["issue"] and not allow_issue:
+                    raise LibraryError("This library version has an open artwork issue. Choose a corrected version.", 409)
+                return selected
         raise LibraryError("Artwork version was not found in the library.", 404)
