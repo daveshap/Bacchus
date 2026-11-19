@@ -43,6 +43,23 @@ class AutoProjectTests(unittest.TestCase):
         self.assertEqual(reopened["autoRun"]["status"], "interrupted")
         self.assertEqual(reopened["export"]["status"], "failed")
 
+    def test_reopening_an_idle_project_closes_stale_auto_art_runs_once(self):
+        project = self.studio.create("Old artwork receipts")
+        record = self.studio._read(project["id"])
+        pending = {"id": "cup", "mode": "auto", "status": "running", "requestId": "first-image"}
+        completed = {"id": "cup", "mode": "auto", "status": "complete", "artHash": "a" * 64}
+        record["artRuns"] = [pending, completed]
+        record["autoRun"] = {"status": "failed", "error": "Artwork could not be decoded."}
+        self.studio._save(record)
+        recovered = Studio(self.studio.root)._read(project["id"])
+        first, second = recovered["artRuns"]
+        self.assertTrue(first["finishedAt"])
+        self.assertEqual(first, {**pending, "status": "interrupted", "finishedAt": first["finishedAt"]})
+        self.assertEqual(second, completed)
+        self.assertEqual(recovered["autoRun"], record["autoRun"])
+        self.assertIsNone(recovered["busy"])
+        self.assertEqual(Studio(self.studio.root)._read(project["id"]), recovered)
+
     def test_catalog_accounts_for_missing_and_mismatched_files(self):
         source = self.root / "source"
         source.mkdir()

@@ -15,6 +15,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from . import ENGINE_VERSION, api_log, audio, budget, captions, chart_evidence, delivery, gates, local_timing, planning, providers, render, score, styles, timing, timing_models, visual_review
 from . import auto_review
+from .layer_spec import MAX_CANVAS_CODE_CHARS
 from .library import Library, LibraryError
 from .settings import timing_model_directory, video_encoder_mode
 from .storage_paths import StoragePathError, writable_path
@@ -186,7 +187,7 @@ def validate_scenes(project, raw_scenes):
             raise WorkflowError(f"Scene {index} needs an artwork ID for that layout or brief.")
         scene = {**raw, "title": title, "caption": caption, "artId": asset_id, "artBrief": brief}
         if "canvasCode" in raw:
-            code = text_value(raw["canvasCode"], f"Scene {index} Canvas script", 24_000)
+            code = text_value(raw["canvasCode"], f"Scene {index} Canvas script", MAX_CANVAS_CODE_CHARS)
             if code:
                 scene["canvasCode"] = code
             else:
@@ -567,6 +568,12 @@ class Studio:
             if project.get("id") == path.parent.name:
                 delivery.remove_abandoned_staging(self.root, path.parent)
             changed = bool(self._catalog_legacy_deliveries(project) or project["busy"])
+            # Earlier Auto runs could stop after receiving an image while leaving
+            # the artwork record running, even after the project itself was idle.
+            for run in project.get("artRuns") or ():
+                if isinstance(run, dict) and run.get("mode") == "auto" and run.get("status") == "running":
+                    run.update(status="interrupted", finishedAt=now())
+                    changed = True
             if project["busy"]:
                 stage = project["busy"]
                 project["busy"] = None
@@ -1495,54 +1502,66 @@ class Studio:
                 raise WorkflowError("This artwork ID has no pending brief.", 409)
             if not providers.image_available():
                 raise WorkflowError("Enable OpenAI image generation and add an OpenAI key in Settings to generate here.", 409)
-            if len(project["artRuns"]) >= MAX_ART_GENERATIONS:
-                raise WorkflowError("This project reached its artwork generation limit.", 409)
-            style = project.get("styleSnapshot") or {}
-            answers = style.get("answers", {})
-            options = {}
-            if style:
-                options = {
-                    "guide": style["guide"], "visual_notes": answers["visualNotes"] + "\n" + answers["colorNotes"],
-                    "palette": style["palette"], "references": self._style_reference_bytes(project),
-                }
-            payload = providers.image_request(style.get("name", STYLES[project["style"]]), asset_id, brief, **options)
-            run = {"model": payload["model"], "id": asset_id, "status": "running", "startedAt": now(),
-                   "requestHash": digest(encoded(payload)), "planHash": project["plan"]["hash"]}
-            project["artRuns"].append(run)
-            run_index = len(project["artRuns"]) - 1
+            payload, run_index = self._start_art_run(project, asset_id, brief, auto=False)
+        return self._run_art_request(project_id, payload, run_index)
+
+    def _start_art_run(self, project, asset_id, brief, *, auto):
+        if len(project["artRuns"]) >= MAX_ART_GENERATIONS:
+            raise WorkflowError("This project reached its artwork generation limit.", 409)
+        style = project.get("styleSnapshot") or {}
+        options = {}
+        if style:
+            answers = style["answers"]
+            options = {
+                "guide": style["guide"], "visual_notes": answers["visualNotes"] + "\n" + answers["colorNotes"],
+                "palette": style["palette"], "references": self._style_reference_bytes(project),
+            }
+        payload = providers.image_request(style.get("name", STYLES[project["style"]]), asset_id, brief, **options)
+        run = {"model": payload["model"], "id": asset_id, "status": "running", "startedAt": now(),
+               "requestHash": digest(encoded(payload)), "planHash": project["plan"]["hash"]}
+        if auto:
+            run["mode"] = "auto"
+        else:
             project["busy"] = "generating artwork"
-            self._save(project)
-        error = None
-        normalized = None
+        project["artRuns"].append(run)
+        self._save(project)
+        return payload, len(project["artRuns"]) - 1
+
+    def _run_art_request(self, project_id, payload, run_index):
         receipt = {}
+        failure = None
         try:
             with api_log.scope(project_id, "artwork generation"):
                 raw, receipt = providers.request_image(payload)
             normalized = normalized_art(raw)
-        except (providers.ProviderError, WorkflowError) as failure:
-            error = str(failure)
-        except Exception:
-            error = "Bacchus could not complete the image generation request."
-            raise
-        finally:
-            with self.lock:
-                current = self._read(project_id)
-                current_run = current["artRuns"][run_index]
-                if error is None and normalized is not None:
-                    try:
-                        self._add_art(current, asset_id, f"{asset_id}.png", normalized, "generated")
-                        current_run.update(receipt, status="complete", artHash=digest(normalized))
-                    except WorkflowError as failure:
-                        error = str(failure)
-                if error is not None:
-                    current_run.update(status="failed", error=error)
-                current_run["finishedAt"] = now()
+        except Exception as error:
+            failure = error
+
+        with self.lock:
+            current = self._read(project_id)
+            if failure is None:
+                asset_id = current["artRuns"][run_index]["id"]
+                try:
+                    self._add_art(current, asset_id, f"{asset_id}.png", normalized, "generated")
+                except Exception as error:
+                    failure = error
+                    current = self._read(project_id)
+            run = current["artRuns"][run_index]
+            run.update(receipt, finishedAt=now())
+            if failure is None:
+                run.update(status="complete", artHash=digest(normalized))
+            else:
+                run.update(status="failed", error=str(failure))
+            manual = run.get("mode") != "auto"
+            if manual:
                 current["busy"] = None
-                self._save(current)
-                view = self._view(current) if error is None else None
-        if error:
-            raise WorkflowError(error, 422)
-        return view
+            self._save(current)
+            if failure is not None:
+                if manual and isinstance(failure, (providers.ProviderError, WorkflowError)):
+                    raise WorkflowError(str(failure), 422) from failure
+                raise failure
+            if manual:
+                return self._view(current)
 
     def upload_art(self, project_id, revision, asset_id, name, raw):
         art_id(asset_id)
@@ -2473,46 +2492,8 @@ class Studio:
             raise WorkflowError(f"Supply corrected artwork for {item['id']} or enable image generation.", 409)
         with self.lock:
             current = self._read(project_id)
-            if len(current["artRuns"]) >= MAX_ART_GENERATIONS:
-                raise WorkflowError("This project reached its artwork generation limit.", 409)
-            style = current.get("styleSnapshot") or {}
-            answers = style.get("answers", {})
-            options = {}
-            if style:
-                options = {
-                    "guide": style["guide"],
-                    "visual_notes": answers["visualNotes"] + "\n" + answers["colorNotes"],
-                    "palette": style["palette"],
-                    "references": self._style_reference_bytes(current),
-                }
-            payload = providers.image_request(
-                style.get("name", STYLES[current["style"]]), item["id"], item["brief"], **options,
-            )
-            run_entry = {
-                "model": payload["model"], "id": item["id"], "status": "running",
-                "startedAt": now(), "requestHash": digest(encoded(payload)),
-                "planHash": current["plan"]["hash"], "mode": "auto",
-            }
-            current["artRuns"].append(run_entry)
-            run_idx = len(current["artRuns"]) - 1
-            self._save(current)
-        with api_log.scope(project_id, "artwork generation"):
-            try:
-                raw_img, img_receipt = providers.request_image(payload)
-            except Exception as exc:
-                with self.lock:
-                    current = self._read(project_id)
-                    current["artRuns"][run_idx].update(status="failed", error=str(exc), finishedAt=now())
-                    self._save(current)
-                raise
-        normalized = normalized_art(raw_img)
-        with self.lock:
-            current = self._read(project_id)
-            self._add_art(current, item["id"], f"{item['id']}.png", normalized, "generated")
-            current["artRuns"][run_idx].update(
-                img_receipt, status="complete", artHash=digest(normalized), finishedAt=now(),
-            )
-            self._save(current)
+            payload, run_index = self._start_art_run(current, item["id"], item["brief"], auto=True)
+        self._run_art_request(project_id, payload, run_index)
 
     def _auto_stages(self, project_id, folder):
         # Stage 1: Recording-aligned word timing

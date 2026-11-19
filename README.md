@@ -1,133 +1,117 @@
 # Bacchus
 
-Bacchus turns an MP3, FLAC, or WAV into a 4K60 MP4 with animated graphics, voiceover, music and sound effects selected by the project's style. It also delivers timed SRT captions and a receipt. Version 0.8 uses the BFG Canvas runtime for composition, Chromium for frame capture and FFmpeg for mastering and delivery.
+Bacchus turns a narration recording into a **4K60 MP4** with animated graphics, voiceover, music and sound effects. Each project also produces timed SRT captions and a JSON render receipt. The studio runs on your computer and opens in your browser.
 
-**Windows x64** · [Download the 0.8.1 installer](https://github.com/daveshap/Bacchus/raw/refs/heads/main/releases/0.8.1/Bacchus-0.8.1-windows-x64.msi) · [SHA-256 checksum](releases/0.8.1/Bacchus-0.8.1-windows-x64.sha256)
+**Windows x64** · [Download the 0.8.2 installer](https://github.com/daveshap/Bacchus/raw/refs/heads/main/releases/0.8.2/Bacchus-0.8.2-windows-x64.msi) · [SHA-256 checksum](releases/0.8.2/Bacchus-0.8.2-windows-x64.sha256)
 
-## Produce one video
+## Install and open the studio
 
-In **New project**, choose a style, optionally enter a brief, and attach the recording. **Auto mode** is selected for new projects. Creating an Auto project with a recording starts the run. To import an existing cue sheet or adjust settings first, create the project without attaching audio, add the recording in **Intake**, then select **Run Auto**. Chrome, Edge or Chromium, FFmpeg/ffprobe, a verified timing model or recording-matched cues, and a configured review provider are required. Artwork generation uses the optional image provider when the library cannot supply the planned asset.
+1. Download the unsigned MSI. To verify it, run `Get-FileHash -Algorithm SHA256 .\Bacchus-0.8.2-windows-x64.msi` in the download folder and compare the result with the checksum above. If upgrading, select **Quit Bacchus** in the running studio first.
+2. Run the installer and open **Bacchus** from the Start menu. The MSI includes Python, the studio, the BFG drawing engine and the Canvas fonts. Installation and everyday use require no Git, source checkout, Node.js or separate Python installation.
+3. On **Set up Bacchus**, keep the suggested project workspace or browse to a folder of your own. If you choose a different folder, select **Save workspace**, quit and reopen Bacchus before starting a project there.
+4. Check **Readiness** and set up the components for your workflow using the table below. Select **Finish setup** to save provider settings, or **Continue offline** to enter the studio without a provider. For a new offline project, clear **Auto mode** when you create it.
 
-Auto starts fresh AI checker requests for intake, the plan, planned artwork uses, soundtrack measurements, animation proofs, QC findings and the encoded delivery. Checkers receive the brief and evidence relevant to each decision. Visual checks receive proof images or frames decoded from the MP4. Audio checks use measured levels, cue positions and stream verification. Decisions and evidence fingerprints stay with the project. An API or infrastructure failure stops the run immediately. A repairable rejection gets one corrective attempt and independent re-review. A second failure stops production. Repair the evidence shown in **Intake** before resuming a blocked item.
+| Component | When you need it | How to set it up |
+| --- | --- | --- |
+| Edge, Chrome or Chromium | Canvas previews, proofs and final renders. The studio interface can open in your usual browser. | Install a supported browser on the rendering computer. For a nonstandard location, set `BACCHUS_CHROME` to the absolute path of its executable before launching Bacchus. |
+| FFmpeg and ffprobe | Audio import, mixing, previews, encoding and verification | On Windows, choose **Install media tools** in Settings if Readiness reports them missing. Bacchus verifies the download. A compatible system installation also works. GPU encoding is optional. |
+| Word timing evidence | Projects based on a real recording | Choose **Install timing model** to download English Parakeet, or **Use an existing model folder** to verify a supported copy. The download is about 460 MiB and needs about 1.1 GiB free during installation. You can also import a recording-matched timing file in Intake. |
+| An AI provider | Auto production or optional AI assistance in Manual | In **Settings → Scene planning**, choose Anthropic or OpenAI, enter its API key and configure a model that supports structured responses and image evidence. The local Manual starter plan works offline. |
+| OpenAI image generation | Creating artwork when the project needs new images | Add an OpenAI key and enable **Generate artwork with OpenAI**. Existing library artwork and local image uploads also work. |
 
-Open **Auto token and spending limits** at kickoff or in **Intake** to set per-project ceilings. Blank fields leave the corresponding limit open. Zero prevents paid requests. The ledger spans Auto runs and restarts. With a cap, Bacchus reserves the provider's estimated text input plus headroom and the requested maximum output before each call, including independent reviews. Enter the maximum effective input/output USD rates for each text model when using a USD cap. Image requests use your per-image token and USD ceilings for the applicable caps. Incomplete calls retain their reservation. USD figures are estimates using the rates you enter. The provider's billing records determine the final charge.
+**Try it offline.** After setting up the browser and media tools, choose **New project → Create example**. *The City After Dark* is a silent, four-scene Manual project with an approved plan and no artwork requests. In **Composition**, choose **Prepare verified mix**, tick **I checked the silent deliverable**, then select **Approve composition**. In **Preview & QC**, inspect all four scenes and their transitions. The silent-video warning is expected. Accept the candidate once the checks pass and each scene is approved, then render the MP4 in **Export**. The example requires no recording, timing model or provider key.
 
-Disable **Auto mode** to use **Manual gates**. You control the brief, artwork, soundtrack and approvals while the same renderer and technical verification produce the delivery. Projects saved before Auto was introduced open in Manual mode. The offline example also uses Manual mode.
+## Produce one video in Auto
 
-## Install Bacchus on Windows x64
+1. Choose **New project**, enter a project name and select a style. Optionally enter a creative brief and choose how to score the video. Keep **Auto mode** selected.
+2. Open **Auto token and spending limits** if you want a ceiling for this project. Blank limits are open. Zero blocks paid requests. For a USD limit, supply your maximum input and output rates for each text model used. Image calls use the applicable per-image USD or token ceiling.
+3. Attach an MP3, FLAC or WAV and select **Create project**. Adding the recording here starts production. To import your own word timings or adjust settings first, create the project without a recording, add it in **Intake**, import the cues, then select **Run Auto**.
+4. Follow progress in **Intake**. The selected provider independently checks intake, plan, artwork uses, soundtrack measurements, scene proofs, QC and the encoded delivery. Reviewers receive the evidence for their gate, including proof images or decoded MP4 frames where relevant. A passed review can be reused for identical evidence.
+5. When delivery completes, select **Download MP4**, **Download captions** or **Download receipt**. Bacchus also keeps these files in the project workspace.
 
-The unsigned MSI includes the studio, its fonts, the BFG drawing engine, Python and its libraries. Install it and open **Bacchus** from the Start menu. Git and a source checkout are optional developer tools. Video rendering uses an installed Edge, Chrome or Chromium browser.
+**If Auto stops**, read the error in **Intake** and expand **Independent reviews** to see any recorded findings. Hard failures, including API errors, stop the run immediately. For repairable findings, Auto attempts one correction and checks the evidence again. After another failure it stops. Open the relevant stage in the sidebar or adjust Settings, then run Auto again. The usage ledger and retry history survive restarts. An interrupted provider call can retain its budget reservation. Dollar figures use the rates you entered and the provider determines the actual charge.
 
-1. To verify the download, compare the MSI's SHA-256 with the checksum file using `Get-FileHash -Algorithm SHA256 .\Bacchus-0.8.1-windows-x64.msi` in PowerShell. The app opens **Set up Bacchus** in your default browser on first launch. Keep the suggested workspace to start immediately, or choose another folder and reopen Bacchus before creating projects there.
-2. Under **Readiness**, choose **Install media tools** if the app reports that its media tools are unavailable. Bacchus downloads and verifies FFmpeg and ffprobe in its own data folder.
-3. For local word cues, choose **Install timing model**. The English Parakeet download is about 460 MiB and needs about 1.1 GiB of free space during installation. To reuse a supported model, expand **Use an existing model folder**, enter its path, and select **Verify and use folder**. You can also import a recording-matched cue sheet in Intake.
-4. Select **Finish setup** to save provider settings, or **Continue offline**. The offline workflow uses the media tools and either a verified local model or a recording-matched cue sheet. In the studio, **Create example** opens a sample with an approved plan so you can try preview, review, and export without a recording or API key.
-5. Select **Quit Bacchus** in the sidebar before running a newer installer or uninstalling Bacchus from **Settings → Apps** in Windows.
+## Walk a project through Manual
 
-If the browser shows **Local studio disconnected** or **Studio unavailable**, reopen Bacchus from the Start menu.
+Clear **Auto mode** in **New project** to approve each stage yourself. For a first narrated cut, a short recording and a brief describing the audience and the main point are enough to get started.
 
-The checked-in installer targets Windows x64. The [native release workflow](.github/workflows/release.yml) defines macOS and Linux bundles as GitHub Actions artifacts. See [Build and test](#build-and-test) to run from source or build locally.
+| Stage | What to do |
+| --- | --- |
+| **Intake** | Upload the MP3, FLAC or WAV, up to 60 minutes and 384 MiB. Derive word timings locally or import the matching JSON. Check the words and their positions against the audio. Enter your brief, tick the timing acknowledgment, then choose **Lock recording and timings**. |
+| **Scene plan** | Choose **Start with a basic plan** or **Generate with AI**. Edit and save the scenes, cue ranges, artwork requests and motion. A chart needs labeled values and units in the narration or brief. Add approved figures to the brief one per line, for example `Bus riders: 40 percent`. Choose **Approve saved plan**. |
+| **Artwork** | For each requested asset, pin eligible art from the project's style library, upload a single-frame PNG, JPEG or WebP, or generate an image. Choose **Approve source image** and **Prepare artwork proofs** when offered. Inspect each use alongside its narration, then **Approve this use** or record what needs correction. |
+| **Composition** | Choose an original local score, a generic track, uploaded music or silence. Set levels and cue sound effects. Choose **Prepare verified mix**, listen to the mastered WAV, tick the listening acknowledgment and select **Approve composition**. |
+| **Preview & QC** | Choose **Prepare animation**, then **Run animation checks**. Inspect the contact sheets and play motion previews around cues and transitions. Resolve failed checks, select **Approve scene and transitions** for each scene, review caption findings, then **Accept candidate**. |
+| **Export** | Select **Render video**. Bacchus encodes the accepted cut, decodes and verifies it, and makes the MP4, SRT and receipt available together. Editing the cut can require fresh approval for the affected evidence. |
 
-## Storage
+### Import word timings
 
-Bacchus stores projects, studio settings, managed models, style guides, reference images and artwork libraries in the active workspace. The default is `%LOCALAPPDATA%\Bacchus` on Windows, `~/Library/Application Support/Bacchus` on macOS, or `$XDG_DATA_HOME/bacchus` on Linux (default `~/.local/share/bacchus`). The Windows MSI installs program files separately in `%LOCALAPPDATA%\Programs\Bacchus`.
+In **Intake → Import word timings**, use the SHA-256 of the original uploaded file, the recording duration in seconds, and an ordered array of measured word spans. The example below shows the shape for a two-second recording. Replace the hash, duration, words and times with those for your file.
 
-In **Settings → Project workspace**, browse to a folder or enter its full path, select **Save workspace**, then quit and reopen Bacchus from the Start menu. The app remembers that location. Existing projects and styles stay together in their original workspace. To move them, quit Bacchus and copy the entire workspace to the chosen destination. The optional `--data <folder>` launch argument overrides the saved choice for one session.
+```json
+{
+  "audio": { "sha256": "<64 hexadecimal characters from the original recording>" },
+  "duration": 2.0,
+  "words": [
+    { "text": "Hello", "start": 0.15, "end": 0.55 },
+    { "text": "there.", "start": 0.65, "end": 1.08 }
+  ]
+}
+```
 
-Git checkouts, including linked worktrees, and the installed program directory are protected from project and log writes. API logs and audio/Chromium scratch use system temporary storage by default. Render and mix staging use the workspace drive so completed deliveries can be published together.
+On Windows, obtain the hash with `Get-FileHash -Algorithm SHA256 .\narration.mp3`. Word starts must increase, every word needs an end time, and the duration must match within 0.25 seconds. Resolve any findings in the cue sheet before import. Intake supports correcting individual words and times. To insert or remove words, import a replacement sheet.
 
-## Styles and project kickoff
+Local recognition uses the sherpa-onnx INT8 conversion of NVIDIA Parakeet TDT 0.6B v2. Bacchus verifies the supported encoder, decoder, joiner and tokens files before using an existing model directory. [Model instructions](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html#sherpa-onnx-nemo-parakeet-tdt-0-6b-v2-int8-english) · [Model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) · [Model license](https://creativecommons.org/licenses/by/4.0/)
 
-Choose a saved style in **New project**. Bacchus shows the name of its artwork library and how many reusable assets it contains. Professional Corporate and Hand-drawn Explainer come with Markdown guides. Warm Editorial, Studio Ink, and Night Signal are also available.
+## Styles, artwork and storage
 
-Open **Styles** to name a style and library, answer the music, effects, and visual questions, set palette colors, and attach up to four PNG or JPEG reference images per revision (8 MiB each). Write or import a Markdown guide, or choose **Draft guide with Claude** to draft one from the answers and references. Review and save the guide. Bacchus keeps the questionnaire answers as entered. Creating and editing styles works offline.
+Choose a built-in style or use **Styles → New style** to save a guide, palette, music and effects preferences, and up to four PNG or JPEG visual references of up to 8 MiB each. New projects pin that style revision. In a project's **Artwork** panel, choose **Publish to art library** after the planned uses pass, or **Record artwork issue** to block reuse of a defective version. In **Art library**, select an eligible revision and choose **Use in project**. **Import studio folder or catalog** accepts local images or a catalog and reports missing files and checksum mismatches.
 
-New projects pin the active saved revision of the selected style. Existing projects keep the guide, colors, and reference images they started with. The style guides scene planning and illustration requests. At kickoff, follow the style's music choice or select an original score, a generic track, a custom score style, an uploaded track, or no music. You can change that choice in **Composition**.
+**Export style and library** creates a ZIP with the guide revisions, reference images, artwork versions, manifest and issue records. **Styles → Import style and library → Import ZIP** creates a separate editable style. The ZIP and its expanded contents must each fit within 512 MiB, with up to 256 guide revisions. For a legacy Bacchus library, launch with `--library <folder>` to copy its contents into the workspace's style libraries. To move projects and preserve their existing style and library references, quit Bacchus and copy the **whole workspace**. For damaged library metadata, **Move damaged entry aside** preserves the record under the library's quarantine folder for repair.
 
-## Configure AI
+| Location | Contents |
+| --- | --- |
+| Active workspace | Projects, input recordings, plans, artwork, style guides, proof images, mix and render staging, final deliveries, studio settings, managed models and tools. |
+| Default workspace | Windows uses `%LOCALAPPDATA%\Bacchus`. macOS uses `~/Library/Application Support/Bacchus`. Linux uses `$XDG_DATA_HOME/bacchus`, defaulting to `~/.local/share/bacchus`. |
+| Program and temporary files | Windows installs the application under `%LOCALAPPDATA%\Programs\Bacchus`. Audio conversion and Chromium profiles use system temp. Provider request logs default to a per-user location under system temp. |
 
-Bacchus uses Anthropic's Claude Sonnet 5.5 (`claude-sonnet-5-5`) by default to plan scenes, choose motion and write artwork briefs. Enter an Anthropic API key in **Settings** or set `ANTHROPIC_API_KEY` before launch to enable planning. Bacchus renders the approved plan locally. You can select another Claude model with structured outputs in **Settings** or through `BACCHUS_CLAUDE_MODEL`. [Claude Sonnet 5.5](https://platform.claude.com/docs/en/models/sonnet-5-5/overview) · [Claude structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
+In **Settings → Project workspace**, browse to a folder or enter its absolute path, select **Save workspace**, then quit and reopen Bacchus. Existing projects stay in the previous folder. The app remembers the new choice for ordinary launches. `--data <folder>` overrides it for one launch. Bacchus blocks project and log writes in Git checkouts, linked worktrees and its installed program directory.
 
-To use an optional OpenAI feature, add an OpenAI API key in **Settings** or set `OPENAI_API_KEY`. Then enable the specific feature you want.
+## Providers and logs
 
-- **Image generation.** Enable **Generate artwork with OpenAI** in **Settings** or set `BACCHUS_USE_OPENAI_IMAGES=1`. Bacchus requests high-quality artwork using the selected brief and style. [Image generation API](https://developers.openai.com/api/reference/resources/images/methods/generate)
-- **Scene planning.** Choose OpenAI as your planning provider in **Settings** or set `BACCHUS_PLANNER_PROVIDER=openai`. [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+Anthropic is the default scene-planning provider. To use OpenAI for planning and Auto reviews, select it in **Settings**. Optional artwork generation needs its own OpenAI setting. **Draft guide with Claude** and **Ask Claude to review proof** use Anthropic. In Manual, the person reviewing the proof records the decision. Keys entered in Settings last for the running session. Alternatively, supply `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` before launch. For unattended configuration, `BACCHUS_PLANNER_PROVIDER=openai` selects OpenAI planning and `BACCHUS_USE_OPENAI_IMAGES=1` enables image generation.
 
-Starting Auto authorizes its planning, optional artwork generation and independent review calls. Planning sends the transcript, brief, cue timings, style guide, visual references and relevant library descriptions to the selected provider. Long narrations are planned in chapters. **Draft guide with Claude** sends style answers, guide text and references. In Manual mode, **Ask Claude to review proof** sends the proof and scene context for a second opinion. You record the proof decision. Keys entered in **Settings** last until Bacchus exits. Nonsecret preferences persist in the data folder.
+Starting Auto authorizes its provider calls. Depending on the stage, the provider receives transcripts, briefs, timing data, style references, artwork, proof frames or media measurements. **Settings → API log folder** shows where Bacchus writes request and response bodies and status metadata. Logs can contain project content. Bacchus redacts configured credentials. Choose a private absolute folder in Settings or set `BACCHUS_API_LOG_DIR` to retain logs beyond the system temp folder's lifetime.
 
-### API logs
+## Delivery and troubleshooting
 
-**Settings** shows the active API log folder. Choose an absolute path there or set `BACCHUS_API_LOG_DIR` before launch. Otherwise Bacchus writes to a per-user folder under the system's temporary directory. Each outbound provider call gets its own folder with metadata, a request body, and the response body when one is available. Metadata includes the project, stage, HTTP status, provider request ID when supplied, and whether the response hit the transport size limit. Interrupted calls can leave a pending record.
+- **Output format.** Bacchus renders 3840×2160 at 60 fps in H.264, BT.709 SDR, with 48 kHz stereo AAC on narrated deliveries. The master targets −14 LUFS integrated. The receipt records the encoder, renderer, candidate and file hashes. Captions are a separate UTF-8 SRT. For narrated projects, Bacchus builds them from the approved word timings. **Caption review** flags cues over 20 characters per second, cues shorter than a second, and other exceptions. Review these passages, speaker changes and meaningful sounds before publishing an accessibility track.
+- **Missing renderer or media tools.** Check **Settings → Readiness** for the browser, FFmpeg and ffprobe. **Video encoding** can test supported hardware encoders and fall back to libx264. Choose **CPU only** to use the software encoder directly.
+- **A delivery changed or a render failed.** Use **Check delivery files** in Export. **Render a fresh copy** repairs a missing or altered delivery. **Retry export** retries a failed render. The most recent intact delivery stays available during a rerender.
+- **Disconnected studio.** Reopen Bacchus from the Start menu. Use **Quit Bacchus** in the sidebar before upgrading, moving a workspace or uninstalling through Windows **Settings → Apps**.
 
-Logs can contain prompts, transcripts, artwork, and audio. Bacchus omits authentication headers and redacts configured keys from logged payloads. Keep the folder private. The system may clear temporary files, so choose a persistent folder for logs you want to keep.
+## Run from source, test and build
 
-## Make a cut in Manual mode
+The downloadable installer targets Windows x64. Developers can run from source on Windows, macOS or Linux. The native build workflow defines macOS ARM64/x64 and Linux x64 bundles. [Build workflow](.github/workflows/release.yml)
 
-1. Choose a style and import an MP3, FLAC, or WAV. Import a recording-matched cue sheet or derive word timings with the local Parakeet model. Check its words against the audio, correct any cues, then set the creative brief and lock intake.
-2. Generate a plan or start from the local editable draft. A layered scene can reveal text, artwork, a bar chart, or a flow diagram on independently selected narration words. Before approval, each chart needs matching labeled values and units in the scene narration or project brief. Put any additional approved data in the brief as `Label: value unit`, one item per line.
-3. Pin library artwork, upload prepared images, or make illustrations with optional OpenAI image generation. Approve the source versions for checking, then use the narration shown alongside each proof to check what the artwork depicts. Publish reusable assets after their planned uses pass. Record defective or incomplete artwork as an issue and replace the version or revise the planned use.
-4. Prepare the soundtrack. An original score is synthesized locally in sections from the approved scene plan and narration pauses. You can also use a generic track, upload music, or select no music. Set music levels or silence by cue range and place sound effects. Listen to the mastered WAV and approve it before preparing the animation.
-5. Select **Run animation checks** to produce contact sheets from the prepared cut with frame samples around entrances, motion, cues, exits, and joins. Use the 60 fps motion preview to play a short scene or transition with the approved mix. Inspect the still proofs for detail, resolve failed checks, pass each scene, and select **Accept candidate**.
-6. Press **Render video** to export an H.264 MP4, SRT captions, and a receipt with both review stages.
+Use **Python 3.13** and an installed Chromium-based browser. The pinned application dependencies are Pillow, NumPy and sherpa-onnx. Packaging adds PyInstaller. For media tests and rendering, supply **FFmpeg 5.1+** and matching **ffprobe** on `PATH`. Use a full build with libx264, AAC, PCM audio, MP3 encoding for the test fixtures, the H.264 metadata bitstream filter, and the audio mixing, loudness and scaling filters. The runtime checks the capabilities it needs. [Application requirements](requirements.txt) · [Packaging requirements](packaging/requirements.txt) · [Media capability checks](bacchus/media_tools.py)
 
-The local starter plan, image import, and original and generic scores work offline. Narration uploads can be up to 60 minutes and 384 MiB. Bacchus renders 3840×2160 at 60 fps, with BT.709 SDR video and 48 kHz stereo AAC. The soundtrack targets −14 LUFS integrated. Both the prepared WAV and encoded audio are measured against the mastering settings. Prior deliveries stay available after upgrade. A new export uses newly prepared soundtrack and animation proofs.
+From the source root, create a virtual environment with `python -m venv .venv`. Activate it with `.\.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` on macOS/Linux. Install the dependencies and launch Bacchus.
 
-The recording is the timing authority. Under **Import word timings** in Intake, choose a `timing.json` with `audio.sha256` for the original uploaded bytes, the recording `duration` in seconds, and `words` with `text`, `start`, and `end` times in seconds. For audio-only intake, install Parakeet from Setup, Settings, or Intake. Bacchus uses the verified model in its own data folder or a folder you explicitly select. A selected Parakeet TDT v2 INT8 folder must contain `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, and `tokens.txt` matching a supported fingerprint set. The recognizer derives word spans from the waveform without a provider key. Review and correct the draft before selecting **Lock recording and timings**. To add or remove words, import a complete replacement cue sheet. [Parakeet TDT model instructions](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html#sherpa-onnx-nemo-parakeet-tdt-0-6b-v2-int8-english)
-
-The ONNX files are the sherpa-onnx INT8 conversion of NVIDIA Parakeet TDT 0.6B v2, licensed under CC BY 4.0. [NVIDIA model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) · [CC BY 4.0 license](https://creativecommons.org/licenses/by/4.0/)
-
-Bacchus keeps original recordings, normalized media, plans, review proofs, decisions, and exports in its data folder. Proofs bind to the artwork version and the scene inputs they show. Changes to the cut invalidate its acceptance. Checks that still show the current inputs can carry forward.
-
-**Video encoding** in Settings defaults to **Automatic GPU (CPU fallback)**. Bacchus tests candidates at the delivery format. It tries NVIDIA NVENC, Intel Quick Sync, and AMD AMF on Windows, NVENC and VAAPI on Linux, and VideoToolbox on macOS. Windows can also test a compatible system FFmpeg alongside the managed build. Bacchus falls back to libx264 when hardware encoding is unavailable or fails. Choose **CPU only** to skip hardware tests. The receipt identifies the actual encoder, renderer and compiled Canvas film. Switching the renderer requires fresh approval.
-
-Bacchus decodes the rendered video and any audio before it marks the delivery complete. It fingerprints the MP4, captions, and receipt and checks the files before reuse or download. **Download MP4** names the downloaded video after the project. In Export, **Check delivery files** refreshes the delivery status. Use **Render a fresh copy** for missing or changed files, **Retry export** after a failed render, or **Rerender video** to make a new verified delivery using the current encoder setting. These actions use the accepted candidate. The most recent intact delivery stays available during a rerender. After an interrupted render, Bacchus clears abandoned render staging folders on startup. For older deliveries, Bacchus checks the MP4 against the original receipt and records initial captions and receipt fingerprints on upgrade.
-
-### Review captions
-
-**Caption review** in **Preview & QC** shows the caption count and any passages that need a closer look. Bacchus builds the UTF-8 SRT directly from approved word timings. Caption breaks are independent of scene and planning cues. The English defaults aim for one or two lines of up to 42 characters, one to six seconds on screen with a seven-second ceiling, and about 17 characters per second. The review calls out cues above 20 characters per second, cues under one second, and other timing or layout exceptions.
-
-Caption review is advisory. Check the flagged passages against the recording, and review speaker changes and meaningful sounds before publishing an accessibility caption track. New narrated deliveries record the caption method and review findings in the receipt. Choose **Rerender video** to generate a new delivery with the updated captions from an already accepted cut.
-
-## Reuse artwork
-
-After an uploaded or generated version passes its planned uses, publish it to the project's **Art library**. Each style has a separate library. Publishing a corrected version under the same original project artwork ID creates a new revision when its image changes. Open the library to inspect earlier revisions and pin an eligible version to a project using that style. A project keeps a copy of that exact image and records its library revision in the render receipt. Flagging a published version as defective or incomplete prevents future reuse of that version and preserves its history.
-
-Use **Art library → Import folder** to import a local image collection or a studio catalog. Catalog imports check declared image checksums and report missing and damaged files. For each chapter the planner can see up to 80 relevant eligible versions from the selected style. Bacchus pins the selected revisions when it saves the plan.
-
-Style guides and reference images live in `styles/` and artwork versions in `style-libraries/` inside the Bacchus data folder. On upgrade, Bacchus copies versions from its old shared library into the original styles. Use `--library <folder>` to copy from a previously configured external Bacchus library. The legacy files stay available at their original locations. Keep each style's `entries/` and `blobs/` together for backup. The library's JSON files store version histories, and the blobs are PNGs named by content hash.
-
-The library shows damaged metadata alongside usable artwork. Use **Move damaged entry aside** to retain the original record under that library’s `quarantine/` folder for repair. If you have an intact backup of the entry, restore it under `entries/` with Bacchus closed. Existing projects can open and use their own copies of previously pinned images. Bacchus checks each image’s fingerprint when you reuse it from the library.
-
-### Back up and share a style
-
-On **Styles**, select a saved style and choose **Export style and library**. The same action is available in **Art library**. The ZIP contains the current `style.md`, older guide revisions, reference images, artwork versions, and a `manifest.json` with style settings, fingerprints, and artwork issue records. Move damaged entries aside before exporting the healthy library. Use the data-folder backup above to keep complete projects and any quarantined records.
-
-On **Styles**, expand **Import style and library**, choose the file, and select **Import ZIP**. Bacchus checks the archive and creates a separate, editable style and library on the receiving installation. The limit is 512 MiB for both the ZIP file and its expanded contents, with up to 256 saved guide revisions. The imported style is available for new projects. Each project reviews and approves its own planned artwork uses.
-
-## Build and test
-
-The app entry point, interface, and planner resources are in `bacchus/`. Installer, bundle, and release verification tools are in `packaging/`. Exact release installers and checksums live in `releases/`.
-
-Use Python 3.13 to match CI. Install FFmpeg 5.1 or newer and its matching `ffprobe` on `PATH` for local media tests and bundle verification. Use a build with `libx264`, `aac`, and `pcm_s16le` encoders and the `sidechaincompress`, `alimiter`, `aloop`, and `ebur128` filters. [FFmpeg downloads](https://ffmpeg.org/download.html)
-
-On Ubuntu 22.04, use a newer FFmpeg build for the render smoke test. Ubuntu supplies FFmpeg 4.4.2 and Bacchus's full-decode check uses `-fps_mode`, available in FFmpeg 5.1. [Ubuntu 22.04 package](https://packages.ubuntu.com/en/jammy-updates/amd64/ffmpeg) · [FFmpeg 5.1 options](https://ffmpeg.org/doxygen/5.1/ffmpeg__opt_8c_source.html)
-
-Create a virtual environment with `python -m venv .venv`. Activate it with `.\.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` on macOS and Linux. Install dependencies and launch from the repository root.
-
-```text
+```sh
 python -m pip install -r requirements.txt
 python -m bacchus
 ```
 
-To test and build the desktop bundle on the target platform, use the same environment.
+Use a workspace outside the source checkout. Run the tests and build the desktop bundle on the target OS.
 
-```text
+```sh
 python -m pip install -r packaging/requirements.txt
 python -m unittest discover -s tests -v
 python packaging/build.py
 ```
 
-On Windows, smoke-test the frozen executable and assemble the MSI.
+On Windows, verify the frozen app and build the MSI.
 
 ```powershell
 python packaging/smoke_bundle.py dist/Bacchus/Bacchus.exe --render
@@ -135,4 +119,6 @@ $version = python -m bacchus --version
 python packaging/build_msi.py --bundle dist/Bacchus --version $version --output "release/Bacchus-$version-windows-x64.msi"
 ```
 
-The [native release workflow](.github/workflows/release.yml) also checks installation and removal on Windows. Bacchus ships under the [MIT License](LICENSE). See the [harness research](docs/harness-research.md) and [source workflow comparison](docs/source-workflows.md) for design context.
+The packaged smoke test uses a temporary user profile and exercises workspace selection, a captioned export and delivery recovery. The release workflow also defines a Windows install/uninstall check. Versioned installers and checksums are kept in [the download archive](releases/).
+
+Bacchus is [MIT licensed](LICENSE). The bundled font notices and BFG drawing-runtime provenance are in [the engine resources](bacchus/resources/engine/). For the implementation behind the production stages, see the [workflow notes](docs/source-workflows.md).

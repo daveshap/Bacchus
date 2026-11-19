@@ -101,6 +101,34 @@ class AutoPipelineTests(unittest.TestCase):
         self.assertIsNone(project["busy"])
         self.assertIsNone(project["export"])
 
+    def test_invalid_generated_image_closes_the_art_run_before_auto_stops(self):
+        with patch.object(auto_review, "check", side_effect=lambda stage, *_: decision(stage)), \
+                patch.object(planning, "planner_available", return_value=True), \
+                patch.object(planning, "request_plan", return_value=(two_scenes(), {"model": "fixture"})), \
+                patch.object(providers, "image_available", return_value=True), \
+                patch.object(providers, "request_image", return_value=(b"unreadable image", {"requestId": "img-1"})) as image:
+            project = self.start()
+        image.assert_called_once()
+        self.assertEqual(project["autoRun"]["status"], "failed")
+        self.assertIsNone(project["busy"])
+        self.assertIsNone(project["export"])
+        [run] = json.loads((self.folder / "project.json").read_bytes())["artRuns"]
+        self.assertEqual((run["mode"], run["status"], run["requestId"]), ("auto", "failed", "img-1"))
+        self.assertTrue(run["finishedAt"])
+        self.assertEqual(run["error"], project["autoRun"]["error"])
+        self.assertIn("could not be decoded", run["error"])
+        self.assertFalse(project["assets"])
+
+        with patch.object(providers, "image_available", return_value=True), \
+                patch.object(providers, "request_image", return_value=(b"unreadable image", {})), \
+                self.assertRaisesRegex(WorkflowError, "could not be decoded") as failure:
+            self.studio.generate_art(self.pid, "cup", {"revision": project["revision"]})
+        self.assertEqual(failure.exception.status, 422)
+        saved = json.loads((self.folder / "project.json").read_bytes())
+        self.assertIsNone(saved["busy"])
+        self.assertEqual(saved["artRuns"][-1]["status"], "failed")
+        self.assertNotIn("mode", saved["artRuns"][-1])
+
     def test_one_failed_repair_survives_restart(self):
         self.saved_plan()
         revised = two_scenes()

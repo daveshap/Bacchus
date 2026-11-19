@@ -3,7 +3,7 @@
 from bisect import bisect_left
 from functools import lru_cache
 from io import BytesIO
-from math import ceil, exp, isfinite, pi, sin, tau
+from math import ceil, isfinite, pi, tau
 import wave
 
 import numpy as np

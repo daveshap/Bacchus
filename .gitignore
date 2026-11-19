@@ -6,3 +6,12 @@ build/
 dist/
 release/
 .env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+Desktop.ini
+bacchus.log
+.instance.lock
+request.body
+response.body

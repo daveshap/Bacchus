@@ -97,7 +97,6 @@ h3 { margin-bottom: 5px; font-size: .97rem; line-height: 1.35; font-weight: 650;
 .panel-header p, .hint { font-size: .87rem; }
 .cluster { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
 .actions { margin-top: 20px; }
-.actions.flush { margin-top: 0; }
 .stack { display: grid; gap: 16px; }
 .stack > .panel { margin-top: 0; }
 .columns { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(240px, .9fr); align-items: start; gap: 18px; }
@@ -263,7 +262,6 @@ code { overflow-wrap: anywhere; }
 .library-thumb img { display: block; width: 100%; height: 46px; object-fit: cover; }
 .library-preview { display: grid; min-height: 130px; margin: 0; place-items: center; overflow: hidden; background: var(--rail); border: 1px solid var(--line); border-radius: 8px; }
 .library-preview img { display: block; width: 100%; height: min(34vh, 270px); object-fit: contain; }
-.library-extras { display: flex; flex-wrap: wrap; gap: 7px; }
 
 @media (max-width: 1020px) {
   .columns { grid-template-columns: minmax(0, 1fr); }

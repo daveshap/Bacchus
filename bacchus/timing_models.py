@@ -19,7 +19,6 @@ from .storage_paths import StoragePathError, writable_path
 
 
 MODEL_NAME = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
-MODEL_LABEL = "Parakeet TDT 0.6B v2 (English)"
 MODEL_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
 # The official release received an updated ONNX export. Accept both known versions for manually selected folders.
 MANAGED_SIZES = (652282309, 7257753, 1739080, 9384)

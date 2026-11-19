@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import atexit
 import base64
-from collections import deque
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import selectors
 import shutil
 import socket
 import struct
