@@ -36,6 +36,11 @@ def request(url, path, data=None, *, content_type="image/png"):
         return response.read()
 
 
+def export_deadline(project):
+    # Allow the Canvas encode, fallback and full-file verification to finish on CPU runners.
+    return time.monotonic() + 240 + 36 * project["input"]["duration"]
+
+
 def endpoint(root, process):
     deadline = time.monotonic() + 35
     while time.monotonic() < deadline:
@@ -112,6 +117,13 @@ def check_styles(url):
     project = json.loads(request(url, "/api/projects", {
         "title": "Smoke style project", "styleId": style_id, "styleRevision": saved["revision"],
     }))
+    if project.get("autoMode") is not True:
+        raise RuntimeError("A new project did not default to Auto mode.")
+    project = json.loads(request(url, f"/api/projects/{project['id']}/mode", {
+        "revision": project["revision"], "autoMode": False,
+    }))
+    if project["autoMode"]:
+        raise RuntimeError("The project could not switch to manual review.")
     pinned = project["styleSnapshot"]
     if (pinned["id"], pinned["revision"], pinned["guide"], pinned["answers"]) != (style_id, 1, guide, answers):
         raise RuntimeError("The project did not retain its selected revision and guide preferences.")
@@ -163,7 +175,7 @@ def check_style_mix_and_captions(url, project):
     project = verify_checks(url, route, project, "animation", "animationChecks")
     project = action("candidate/accept")
     action("export")
-    deadline = time.monotonic() + 90
+    deadline = export_deadline(project)
     while time.monotonic() < deadline:
         output = json.loads(request(url, route))["export"]
         if output["status"] == "failed":
@@ -258,7 +270,7 @@ def run_export(url, root, project, custom_style_id):
     project = verify_checks(url, route, project, "animation", "animationChecks")
     for name in ("candidate/accept", "export"):
         project = action(name)
-    deadline = time.monotonic() + 90
+    deadline = export_deadline(project)
     while time.monotonic() < deadline:
         project = json.loads(request(url, route))
         export = project["export"]
@@ -269,6 +281,12 @@ def run_export(url, root, project, custom_style_id):
                 raise RuntimeError("Export downloaded but lacked an MP4 file header.")
             receipt = json.loads(request(url, export["receiptUrl"]))
             media = export["media"]
+            hash_at_review = receipt["qc"].get("buildHash")
+            picture_check = media.get("visualVerification") or {}
+            if (media.get("renderer") != "canvas" or not hash_at_review
+                    or receipt["candidate"].get("buildHash") != hash_at_review
+                    or picture_check.get("buildHash") != hash_at_review or not picture_check.get("frames")):
+                raise RuntimeError("The packaged renderer did not verify encoded frames against the reviewed Canvas film.")
             if (media != receipt["media"] or media.get("encoderMode") != "auto" or not media.get("encoder")
                 or media.get("hardwareEncoding") != (media["encoder"] != "libx264")
                 or (not media["hardwareEncoding"] and not media.get("encoderFallback"))):
@@ -320,7 +338,7 @@ def check_export_recovery(url, root, project):
     expect_conflict(url, previous["url"])
     request(url, "/api/settings", {"videoEncoder": "cpu"})
     request(url, f"{route}/export", {"revision": project["revision"], "rerender": True})
-    deadline = time.monotonic() + 90
+    deadline = export_deadline(project)
     while time.monotonic() < deadline:
         repaired = json.loads(request(url, route))["export"]
         if repaired["status"] == "failed":
@@ -392,6 +410,7 @@ def main():
         for variable in PROVIDER_SETTINGS:
             env.pop(variable, None)
         env.pop("BACCHUS_VIDEO_ENCODER", None)
+        env.pop("BACCHUS_RENDER_BACKEND", None)
         env.pop("BACCHUS_TIMING_MODEL_DIR", None)
         process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:

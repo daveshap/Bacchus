@@ -1,0 +1,4 @@
+The JavaScript files in this directory are copied verbatim from the engine directory
+of BFG_Animations, revision c936a5b. Bacchus supplies the timing and scene adapter
+beside this directory. The shared renderer is used for proofs, playback and export.
+The map outlines in maps.js are derived from public-domain Natural Earth data.

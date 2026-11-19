@@ -99,7 +99,12 @@ class StudioWorkflowTests(unittest.TestCase):
             )
         self.change("input", script=SCRIPT, intention="Observe a detail of an everyday object.", confirmTiming=True)
 
+    def clear_style_effects(self):
+        for effect in self.project["mix"]["effects"]:
+            self.project = self.studio.remove_effect(self.project_id, effect["id"], {"revision": self.project["revision"]})
+
     def approve_dry_mix(self):
+        self.clear_style_effects()
         self.change("mix", musicMode="none", musicGainDb=-24, effects=[])
         self.prepare_and_approve_mix()
 
@@ -578,6 +583,7 @@ class StudioWorkflowTests(unittest.TestCase):
     @unittest.skipUnless(render.render_available(), "FFmpeg and FFprobe are required")
     def test_music_and_effects_change_the_export_candidate(self):
         self.plan_with_art()
+        self.clear_style_effects()
         self.change("assets/checks")
         self.review_checks("assets")
         with self.assertRaisesRegex(WorkflowError, "(?i)mix|music|composition"):

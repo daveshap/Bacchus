@@ -12,7 +12,8 @@ from .providers import ProviderError, post_json
 from .settings import DEFAULT_CLAUDE_MODEL, provider_value
 
 
-MAX_IMAGE_BYTES = 6 * 1024 * 1024
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+API_SAFE_IMAGE_BYTES = 4_750_000
 MAX_BRIEF_CHARS = 12_000
 MAX_OUTPUT_TOKENS = 6_000
 MAX_EVIDENCE_CHARS = 500
@@ -56,8 +57,8 @@ def model():
 
 
 def _validate_png(evidence):
-    if not isinstance(evidence, bytes) or not 0 < len(evidence) <= MAX_IMAGE_BYTES:
-        raise VisualReviewError("Choose one proof PNG no larger than 6 MiB.")
+    if not isinstance(evidence, bytes) or not 0 < len(evidence) <= MAX_IMAGE_BYTES * 4:
+        raise VisualReviewError("Choose one readable proof PNG.")
     try:
         with Image.open(BytesIO(evidence), formats=["PNG"]) as image:
             if image.width > 8_000 or image.height > 8_000 or getattr(image, "is_animated", False):
@@ -67,6 +68,23 @@ def _validate_png(evidence):
         raise
     except (Image.DecompressionBombError, OSError, SyntaxError, ValueError) as error:
         raise VisualReviewError("The supplied proof is not a readable PNG.") from error
+
+
+def _fit_api_png(evidence: bytes) -> bytes:
+    """Keep proof bytes exact when already within Anthropic's 5 MB cap; downscale oversized legacy proofs."""
+    if len(evidence) <= API_SAFE_IMAGE_BYTES:
+        return evidence
+    with Image.open(BytesIO(evidence), formats=["PNG"]) as source:
+        current = source.convert("RGB")
+    for _ in range(6):
+        current = current.resize((max(640, int(current.width * 0.78)), max(360, int(current.height * 0.78))),
+                                 Image.Resampling.LANCZOS)
+        with BytesIO() as buf:
+            current.save(buf, format="PNG", optimize=True)
+            data = buf.getvalue()
+        if len(data) <= API_SAFE_IMAGE_BYTES:
+            return data
+    raise VisualReviewError("Choose one proof PNG no larger than 5 MiB.")
 
 
 def _schema(checklist):
@@ -132,12 +150,13 @@ def review(scope, brief, evidence):
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", model_id):
         raise VisualReviewError("Enter a valid Claude model ID in Settings.")
     _validate_png(evidence)
+    upload_bytes = _fit_api_png(evidence)
     checklist = CHECKLISTS[scope]
     output = {"format": {"type": "json_schema", "schema": _schema(checklist)}}
     if model_id == DEFAULT_CLAUDE_MODEL:
         output["effort"] = "high"
     context = {"scope": scope, "approvedSceneContext": brief.strip(), "checklist": checklist}
-    proof = {"type": "base64", "media_type": "image/png", "data": base64.b64encode(evidence).decode("ascii")}
+    proof = {"type": "base64", "media_type": "image/png", "data": base64.b64encode(upload_bytes).decode("ascii")}
     payload = {
         "model": model_id,
         "max_tokens": MAX_OUTPUT_TOKENS,

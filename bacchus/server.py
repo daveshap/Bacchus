@@ -11,7 +11,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import RESOURCES, audio, local_timing, media_tools, planning, providers, render, score, style_archive, styles, timing_models, visual_review
+from . import RESOURCES, audio, layer_spec, local_timing, media_tools, planning, providers, render, score, style_archive, styles, timing_models, visual_review
 from .library import LibraryError
 from .runtime import APP_VERSION
 from .settings import SettingsError, directory_preference, provider_secrets, timing_model_directory
@@ -27,11 +27,16 @@ STATIC_FILES = {
     "/static/styles.css": ("styles.css", "text/css; charset=utf-8"),
     "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
-JSON_LIMIT = 512 * 1024
+JSON_LIMIT = 4 * 1024 * 1024
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "
     "img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; "
     "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+)
+PREVIEW_CSP = (
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+    "font-src data:; img-src 'self' blob: data:; media-src 'self' blob:; "
+    "frame-ancestors 'self'; base-uri 'none'"
 )
 
 
@@ -90,7 +95,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             self._json({
                 "plannerAvailable": planning.planner_available(), "renderAvailable": render.render_available(),
+                "renderBackend": render.render_backend(), "browserAvailable": render.browser_available(),
+                "browserLabel": render.browser_label(),
                 "layouts": planning.LAYOUTS, "motions": planning.MOTIONS, "pack": PACK_PIN,
+                "layerKinds": list(layer_spec.KINDS), "layerEffects": list(layer_spec.EFFECTS),
+                "bfgSubjects": layer_spec.BFG_SUBJECTS,
+                "maxLayers": layer_spec.MAX_LAYERS,
                 "maxLines": planning.MAX_LINES, "maxScenes": planning.MAX_SCENES, "maxDuration": MAX_DURATION,
                 "maxArtBytes": MAX_ART_BYTES, "maxAudioBytes": MAX_AUDIO_BYTES,
                 "maxPlannerCalls": planning.MAX_PLANNER_CALLS,
@@ -165,7 +175,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Out of range")
             except ValueError as error:
                 raise WorkflowError("Preview time must be a valid number of seconds.") from error
-            self._bytes(studio.preview(project_id, time), "image/png")
+            width = None
+            if "width" in query:
+                try:
+                    width = int(query["width"][0])
+                    if not 320 <= width <= 3840:
+                        raise ValueError("Out of range")
+                except ValueError as error:
+                    raise WorkflowError("Preview width must be between 320 and 3840 pixels.") from error
+            self._bytes(studio.preview(project_id, time, width=width), "image/png")
+        elif tail == ["film-preview"]:
+            self._bytes(studio.film_preview_html(project_id), "text/html; charset=utf-8", csp=PREVIEW_CSP)
         elif tail == ["mix", "preview"]:
             self._file(studio.mix_preview(project_id), "audio/wav", "audio")
         elif len(tail) == 2 and tail[0] == "motion-preview":
@@ -231,6 +251,21 @@ class Handler(BaseHTTPRequestHandler):
             studio.styles.get(data["styleId"])
             self._json(studio.library_for(data["styleId"]).quarantine(data["entryId"]))
             return
+        if path == "/api/library/import-folder":
+            data = self._body()
+            fields(data, ("styleId", "directory"))
+            self._json(studio.import_library_folder(data["styleId"], data["directory"]))
+            return
+        if path == "/api/library/import":
+            style_id = query.get("styleId", ["warm-editorial"])[0]
+            name = query.get("name", ["artwork.png"])[0]
+            alias = query.get("alias", [""])[0]
+            brief = query.get("brief", [""])[0]
+            self._json(
+                studio.import_library_file(style_id, name, self._raw(MAX_ART_BYTES), alias=alias, brief=brief),
+                201,
+            )
+            return
         if path == "/api/style-references":
             reference = studio.styles.store_reference(query.get("name", ["reference.png"])[0],
                                                       self._raw(styles.MAX_REFERENCE_BYTES))
@@ -282,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(data, dict):
                 if "styleId" in data or "styleRevision" in data:
                     expected += ("styleId", "styleRevision")
-                expected += tuple(key for key in ("musicChoice", "musicStyle") if key in data)
+                expected += tuple(key for key in ("musicChoice", "musicStyle", "autoMode", "autoLimits", "autoBrief") if key in data)
             fields(data, expected)
             if "styleId" in data:
                 if type(data["styleRevision"]) is not int or data["styleRevision"] < 1:
@@ -290,6 +325,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(studio.create(
                 data["title"], style_id=data.get("styleId", "warm-editorial"), style_revision=data.get("styleRevision"),
                 music_choice=data.get("musicChoice", "style"), music_style=data.get("musicStyle"),
+                auto_mode=data.get("autoMode", True), auto_limits=data.get("autoLimits"),
+                auto_brief=data.get("autoBrief", ""),
             ), 201)
             return
         if path == "/api/demo":
@@ -297,7 +334,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(studio.create("The City After Dark", demo=True), 201)
             return
         project_id, tail = self._project_route(path)
-        if tail == ["library", "pin"]:
+        if tail == ["mode"]:
+            self._json(studio.set_mode(project_id, self._body()))
+        elif tail == ["auto", "run"]:
+            self._json(studio.start_auto_pipeline(project_id, self._body()), 202)
+        elif tail == ["auto", "settings"]:
+            self._json(studio.set_auto_settings(project_id, self._body()))
+        elif tail == ["library", "pin"]:
             self._json(studio.pin_library(project_id, self._body()))
         elif tail == ["motion-preview"]:
             self._json(studio.motion_preview(project_id, self._body()))
@@ -350,7 +393,10 @@ class Handler(BaseHTTPRequestHandler):
             "libraryMigrationError": self.server.studio.library_migration_error,
             "audioAvailable": audio.audio_available(),
             "renderAvailable": render_available,
-            "mediaInstallAvailable": media_tools.can_install() and not render_available,
+            "renderBackend": render.render_backend(),
+            "browserAvailable": render.browser_available(),
+            "browserLabel": render.browser_label(),
+            "mediaInstallAvailable": media_tools.can_install() and not media_tools.available(),
         }
 
     def _timing_status(self):
@@ -426,18 +472,18 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
         self._bytes(data, "application/json; charset=utf-8", status)
 
-    def _headers(self, status, mime, length, cache="no-store"):
+    def _headers(self, status, mime, length, cache="no-store", csp=CSP):
         self.send_response(status)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", cache)
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", csp)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
 
-    def _bytes(self, data, mime, status=200):
-        self._headers(status, mime, len(data))
+    def _bytes(self, data, mime, status=200, csp=CSP):
+        self._headers(status, mime, len(data), csp=csp)
         self.end_headers()
         self.wfile.write(data)
 

@@ -18,7 +18,7 @@ from PIL import Image
 ASSET_ID = re.compile(r"[a-f0-9]{32}")
 CONTENT_HASH = re.compile(r"[a-f0-9]{64}")
 SCENE_ALIAS = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-SOURCES = {"upload", "generated", "project"}
+SOURCES = {"upload", "generated", "project", "import"}
 VERSION_FIELDS = {"id", "version", "hash", "name", "brief", "style", "source", "createdAt"}
 ASSET_FIELDS = ("id", "name", "brief", "style", "latestVersion")
 SURROGATE = re.compile(r"[\ud800-\udfff]")
@@ -222,6 +222,59 @@ class Library:
             self._write_record(asset_id, {"schema": 1, "origin": origin, "asset": asset,
                                           "qualifications": qualifications, "issues": issues})
             return self._view_version({"qualifications": qualifications, "issues": issues}, version)
+
+    def import_asset(self, *, alias, name, brief, style, png_bytes: bytes, origin_key="studio-import", source_hash=None) -> tuple[dict, bool]:
+        """Import a verified pre-approved studio artwork PNG directly into this style library."""
+        if not isinstance(alias, str) or not SCENE_ALIAS.fullmatch(alias):
+            raise LibraryError("Imported artwork needs a lowercase hyphenated alias.")
+        if not all(_metadata_text(value) for value in (name, brief, style)) or not name.strip():
+            raise LibraryError("Imported artwork requires a valid name and text metadata.")
+        try:
+            with Image.open(BytesIO(png_bytes), formats=["PNG"]) as image:
+                if getattr(image, "n_frames", 1) != 1:
+                    raise LibraryError("The artwork library stores single-frame PNG images.")
+                image.verify()
+        except LibraryError:
+            raise
+        except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as error:
+            raise LibraryError("The artwork library stores valid PNG images.") from error
+
+        content_hash = hashlib.sha256(png_bytes).hexdigest()
+        if source_hash is not None and (not isinstance(source_hash, str) or not CONTENT_HASH.fullmatch(source_hash)):
+            raise LibraryError("The imported source image needs a valid SHA-256 fingerprint.")
+        origin = {"projectId": origin_key, "alias": alias}
+        identity = json.dumps(origin, sort_keys=True, ensure_ascii=True).encode("ascii")
+        asset_id = hashlib.sha256(identity).hexdigest()[:32]
+        with self._exclusive():
+            record = self._read(asset_id, optional=True)
+            if record is None and next(self._safe_path("quarantine").glob(f"{asset_id}-*.json"), None):
+                raise LibraryError("This artwork has quarantined metadata. Restore the entry before importing to it.", 409)
+            asset = record["asset"] if record else {"id": asset_id, "latestVersion": 0, "versions": []}
+            qualifications = (record or {}).get("qualifications", {})
+            issues = (record or {}).get("issues", {})
+            target = self._blob_path(content_hash)
+            if target.exists():
+                self.blob(content_hash)
+            else:
+                _atomic_write(target, png_bytes)
+            for existing in asset["versions"]:
+                if existing["hash"] == content_hash:
+                    return self._view_version({"qualifications": qualifications, "issues": issues}, existing), False
+            version = {
+                "id": asset_id, "version": asset["latestVersion"] + 1, "hash": content_hash,
+                "name": name.strip(), "brief": brief.strip(), "style": style,
+                "source": "import",
+                "createdAt": datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+            asset.update(name=version["name"], brief=version["brief"], style=style,
+                         latestVersion=version["version"], versions=[version, *asset["versions"]])
+            qualifications[str(version["version"])] = {
+                "projectId": origin_key,
+                "proofs": {source_hash or content_hash: content_hash},
+            }
+            self._write_record(asset_id, {"schema": 1, "origin": origin, "asset": asset,
+                                          "qualifications": qualifications, "issues": issues})
+            return self._view_version({"qualifications": qualifications, "issues": issues}, version), True
 
     def _write_record(self, asset_id, record):
         raw = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")

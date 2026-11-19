@@ -30,7 +30,7 @@ PALETTE_KEYS = {"paper", "ink", "muted", "rule", "accent"}
 NOTE_KEYS = ("visualNotes", "colorNotes", "sceneNotes", "musicNotes", "effectsNotes")
 SPEC_KEYS = {"name", "libraryName", "description", "visualPreset", "palette", "answers", "guide", "referenceImages"}
 ANSWER_DEFAULTS = {
-    **dict.fromkeys(NOTE_KEYS, ""), "music": True, "musicPreset": "ambient", "soundEffects": False,
+    **dict.fromkeys(NOTE_KEYS, ""), "music": True, "musicPreset": "ambient", "soundEffects": True,
 }
 GUIDE_ROOT = Path(__file__).resolve().parent / "resources" / "style_guides"
 BUILT_INS = {

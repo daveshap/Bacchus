@@ -109,10 +109,24 @@ class ReviewTests(unittest.TestCase):
             edit["assets"][0]["approved"] = True
             with patch.object(render._Composition, "apply_motion", side_effect=AssertionError("Motion used")):
                 proof = review.asset_proof_png(edit, folder, check)
-            frame = render._Composition(edit, folder)._draw(0)
+            self.assertLess(len(proof), 5 * 1024 * 1024)
             with Image.open(BytesIO(proof)) as sheet:
                 self.assertEqual(sheet.format, "PNG")
-                self.assertIsNone(ImageChops.difference(sheet.crop((24, 88, 24 + frame.width, 88 + frame.height)), frame).getbbox())
+                if render.render_backend() == "canvas":
+                    html_bytes, assets, _ = render.build_canvas_film(edit, folder)
+                    from bacchus import browser_cdp
+                    raw_static = browser_cdp.render_static_scene_png(html_bytes, assets, 0, scale=1280 / 1920.0)
+                    with Image.open(BytesIO(raw_static)) as static_frame:
+                        expected = static_frame.convert("RGB")
+                        self.assertIsNone(
+                            ImageChops.difference(
+                                sheet.convert("RGB").crop((24, 88, 24 + expected.width, 88 + expected.height)),
+                                expected,
+                            ).getbbox()
+                        )
+                else:
+                    frame = render._Composition(edit, folder, scale=1)._draw(0)
+                    self.assertIsNone(ImageChops.difference(sheet.crop((24, 88, 24 + frame.width, 88 + frame.height)), frame).getbbox())
             edit["plan"]["scenes"][0]["title"] = "Changed scene"
             with self.assertRaisesRegex(render.RenderError, "no longer matches"):
                 review.asset_proof_png(edit, folder, check)
@@ -126,7 +140,7 @@ class ReviewTests(unittest.TestCase):
         x, y = 20 + column * 788, 64 + row * 491
         with (
             Image.open(BytesIO(review.animation_proof_png(edit, Path("."), check))) as sheet,
-            Image.open(BytesIO(render.preview(edit, Path("."), sample["time"]))) as frame,
+            Image.open(BytesIO(render.preview(edit, Path("."), sample["time"], width=768))) as frame,
         ):
             tile = sheet.crop((x, y, x + 768, y + 432))
             self.assertIsNone(ImageChops.difference(tile, frame.resize((768, 432), Image.Resampling.LANCZOS)).getbbox())

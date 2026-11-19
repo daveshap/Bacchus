@@ -1,5 +1,6 @@
-"""Render the same constrained scene plan to a still or an H.264 video."""
+"""Render the approved scene plan to previews, proofs and a verified H.264 video."""
 
+import base64
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -14,9 +15,9 @@ import subprocess
 from tempfile import TemporaryDirectory
 from threading import Timer
 
-from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont, ImageOps, ImageStat
 
-from . import layer_spec, media_tools, mixing, video_encoding
+from . import browser_cdp, canvas_engine, canvas_qc, layer_spec, media_tools, mixing, video_encoding
 
 # Measure layouts in one coordinate space and draw at the destination's pixel density.
 DESIGN_WIDTH, DESIGN_HEIGHT = 1280, 720
@@ -26,7 +27,7 @@ MAX_PREVIEW_SECONDS = 12
 SAMPLE_RATE = mixing.SAMPLE_RATE
 CHANNELS = mixing.CHANNELS
 MAX_MUSIC_REGIONS = mixing.MAX_MUSIC_REGIONS
-MOTION_DURATION = {"still": 0, "fade": 0.48, "push-in": 1.15}
+MOTION_DURATION = {"still": 0, "fade": 0.48, "push-in": 1.15, "slide": 0.55, "glide": 0.65}
 
 
 @dataclass(frozen=True)
@@ -434,6 +435,12 @@ class _Composition:
     def prepare(self, index):
         try:
             scene = self.scenes[index]
+            if scene.get("canvasCode") or scene["motion"] not in ("still", "fade", "push-in") or any(
+                layer["kind"] not in ("text", "art", "bar-chart", "flow")
+                or layer["enter"]["effect"] not in ("show", "fade", "wipe", "rise")
+                for layer in scene.get("layers", [])
+            ):
+                raise RenderError("This scene requires the BFG Canvas renderer.")
             if scene["layout"] == "layered":
                 return self._prepare_layers(scene, self.positions[index])
             return _PreparedScene(_draw_scene(scene, self.assets, self.folder, self.palette, self.scale))
@@ -538,8 +545,67 @@ class _Composition:
         return frame
 
 
-def preview(project, folder: Path, time: float) -> bytes:
-    composition = _Composition(project, folder)
+def render_backend() -> str:
+    requested = os.environ.get("BACCHUS_RENDER_BACKEND", "canvas").strip().lower()
+    if requested == "pillow":
+        return "pillow"
+    return "canvas"
+
+
+def browser_available() -> bool:
+    return browser_cdp.browser_available()
+
+
+def browser_label() -> str | None:
+    return browser_cdp.browser_label()
+
+
+def build_canvas_film(project, folder: Path | None, *, audio_url: str = "", asset_url_prefix: str = "/assets/",
+                      asset_url_suffix: str = ".png", verify_assets: bool = True):
+    try:
+        preset = project_visual_preset(project)
+        palette = canvas_engine.palette_to_dict(project_palette(project))
+        return canvas_engine.build_film(
+            project, folder, palette_dict=palette, preset=preset,
+            audio_url=audio_url, asset_url_prefix=asset_url_prefix,
+            asset_url_suffix=asset_url_suffix, verify_assets=verify_assets,
+        )
+    except canvas_engine.CanvasBuildError as error:
+        raise RenderError(str(error)) from error
+
+
+def canvas_qc_report(project, folder: Path, *, run_jumps: bool = True, jumps_fps: int = 30) -> dict:
+    if render_backend() != "canvas":
+        return {"findings": [], "summary": None, "buildHash": None}
+    try:
+        preset = project_visual_preset(project)
+        palette = canvas_engine.palette_to_dict(project_palette(project))
+        return canvas_qc.run_canvas_qc(
+            project, folder, palette_dict=palette, preset=preset,
+            run_jumps=run_jumps, jumps_fps=jumps_fps,
+        )
+    except (canvas_engine.CanvasBuildError, browser_cdp.BrowserError) as error:
+        raise RenderError(str(error)) from error
+
+
+def preview(project, folder: Path, time: float, *, width: int | None = None) -> bytes:
+    if not math.isfinite(time):
+        raise RenderError("Preview time must be finite.")
+    if render_backend() == "canvas":
+        scale = (width / 1920.0) if width else 2.0
+        html_bytes, assets, _ = build_canvas_film(project, folder)
+        try:
+            raw_png = browser_cdp.render_still_png(html_bytes, assets, float(time), scale=scale)
+        except browser_cdp.BrowserError as error:
+            raise RenderError(str(error)) from error
+        # Normalize Chrome RGBA PNG to deterministic RGB PNG so byte comparisons & RGB callers match identically.
+        with Image.open(BytesIO(raw_png)) as frame:
+            rgb = frame.convert("RGB")
+            with BytesIO() as out:
+                rgb.save(out, format="PNG", compress_level=3)
+                return out.getvalue()
+    scale = max(1, round((width or WIDTH) / DESIGN_WIDTH)) if width else DELIVERY_SCALE
+    composition = _Composition(project, folder, scale=scale)
     index, elapsed = composition.at(time)
     frame = composition.draw_prepared(index, elapsed, composition.prepare(index))
     with BytesIO() as buffer:
@@ -551,6 +617,23 @@ def layout_findings(project, folder: Path) -> list[str]:
     """Return concrete draw errors from every scene for the deterministic QC gate."""
     composition = _Composition(project, folder)
     findings = []
+    if render_backend() == "canvas":
+        for index, scene in enumerate(composition.scenes):
+            try:
+                composition.motion_length(index)
+                if scene["layout"] == "layered":
+                    for layer in layer_spec.validate_layers({"input": composition.source}, scene):
+                        _, settled, end = layer_spec.schedule(composition.source, scene, layer)
+                        if frame_at_or_after(settled) / FPS >= end:
+                            raise RenderError(f"Scene {index + 1}. Layer {layer['id']!r}. The layer leaves before any fully visible output frame.")
+            except (RenderError, layer_spec.LayerError) as error:
+                findings.append(str(error))
+        if not findings:
+            try:
+                build_canvas_film(project, folder)
+            except RenderError as error:
+                findings.append(str(error))
+        return findings
     for index in range(len(composition.scenes)):
         try:
             composition.motion_length(index)
@@ -561,7 +644,7 @@ def layout_findings(project, folder: Path) -> list[str]:
 
 
 def render_available() -> bool:
-    return media_tools.available()
+    return media_tools.available() and (render_backend() == "pillow" or browser_available())
 
 
 def validate_music_regions(project, regions):
@@ -598,7 +681,7 @@ class _EncodingFailure(RenderError):
     pass
 
 
-def _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix, *, first_frame=0):
+def _encode(project, folder, composition, frame_count, scratch, encoder, approved_mix, *, first_frame=0, workers=None):
     output = scratch / f"{encoder.name}.mp4"
     log = scratch / f"{encoder.name}.log"
     duration = frame_count / FPS
@@ -615,13 +698,34 @@ def _encode(project, folder, composition, frame_count, scratch, encoder, approve
             first_sample = first_frame * SAMPLE_RATE // FPS
             end_sample = (first_frame + frame_count) * SAMPLE_RATE // FPS
             audio_options.extend(("-af", f"atrim=start_sample={first_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS"))
+    backend = render_backend()
+    video_in = video_encoding.png_input(FPS) if backend == "canvas" else video_encoding.raw_input(*composition.size, FPS)
     command = [
         encoder.executable or media_tools.command("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-filter_threads", "4", *encoder.input_options, *video_encoding.raw_input(*composition.size, FPS),
+        "-filter_threads", "4", *encoder.input_options, *video_in,
         *audio_options, "-map", "0:v:0", *video_encoding.encoding_options(encoder),
         "-movflags", "+faststart+write_colr",
         str(output),
     ]
+    if backend == "canvas":
+        html_bytes, assets, _ = build_canvas_film(project, folder)
+        canvas_scale = composition.size[0] / 1920.0
+        worker_count = workers if workers is not None else (browser_cdp.DEFAULT_WORKERS if frame_count >= 24 else 1)
+        with log.open("w+b") as errors:
+            try:
+                return_code = browser_cdp.render_frames_to_ffmpeg(
+                    html_bytes, assets, scale=canvas_scale, fps=FPS, first_frame=first_frame,
+                    frame_count=frame_count, ffmpeg_command=command, stderr_file=errors,
+                    workers=worker_count, timeout_seconds=duration * 18 + 120,
+                )
+            except browser_cdp.BrowserError as error:
+                raise _EncodingFailure(f"Canvas renderer failed: {error}") from error
+            if return_code:
+                errors.seek(0)
+                detail = errors.read(1200).decode("utf-8", "replace").strip()
+                raise _EncodingFailure(f"FFmpeg could not encode the video. {detail or 'The encoder exited.'}")
+        return output, bool(audio_options)
+
     with log.open("w+b") as errors:
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors,
@@ -733,9 +837,57 @@ def _encode_verified(project, folder, composition, frame_count, scratch, encoder
         raise _EncodingFailure(str(error)) from error
 
 
+def _verify_canvas_pictures(project, folder, composition, path, count):
+    """Compare decoded pictures with fresh renders of the approved, full-resolution BFG film."""
+    html, assets, build_hash = build_canvas_film(project, folder)
+    positions = {0, count // 4, count // 2, 3 * count // 4, count - 1}
+    if len(composition.positions) > 1:
+        boundary = frame_at_or_after(composition.positions[len(composition.positions) // 2])
+        positions.update((max(0, boundary - 1), min(count - 1, boundary + 1)))
+    width, height = 320, 180
+
+    def compare(browser, session, _ready, errors):
+        samples = []
+        for index in sorted(positions):
+            # Seek to an integral second, then select the exact presentation-order frame.
+            second, within = divmod(index, FPS)
+            command = [
+                media_tools.command("ffmpeg"), "-v", "error", "-nostdin", "-ss", str(second),
+                "-i", str(path), "-map", "0:v:0", "-an", "-vf",
+                f"select=eq(n\\,{within}),scale={width}:{height}:flags=area,format=rgb24",
+                "-frames:v", "1", "-f", "rawvideo", "pipe:1",
+            ]
+            try:
+                decoded = subprocess.run(command, check=True, capture_output=True, timeout=60,
+                                         **media_tools.process_options()).stdout
+                actual = Image.frombytes("RGB", (width, height), decoded)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                raise RenderError(f"Could not verify decoded picture {index}.") from error
+            data = browser.eval_js(session, f"window.__film.render({index / FPS!r}); window.__film.frameB64()")
+            if errors:
+                raise RenderError(f"BFG reference frame {index} failed: {errors[0]}")
+            with Image.open(BytesIO(base64.b64decode(data))) as image:
+                expected = image.convert("RGB").resize((width, height), Image.Resampling.BOX)
+            delta = ImageChops.difference(expected, actual)
+            mean = sum(ImageStat.Stat(delta).mean) / 3
+            # Compare the worst local area as well; an omitted diagram can occupy a small part of a shot.
+            worst = max(channel[1] for channel in delta.reduce(16).getextrema())
+            if mean > 5 or worst > 45:
+                raise RenderError(f"Encoded picture {index} differs from the approved BFG film "
+                                  f"(mean channel error {mean:.2f}, worst area {worst}).")
+            samples.append({"frame": index, "meanChannelError": round(mean, 3), "maxTileChannelError": worst})
+        return samples
+
+    try:
+        samples = browser_cdp.run_with_film(html, assets, composition.size[0] / 1920, compare)
+    except browser_cdp.BrowserError as error:
+        raise RenderError(str(error)) from error
+    return {"buildHash": build_hash, "frames": samples, "sampleWidth": width, "sampleHeight": height}
+
+
 def export_video(project, folder: Path, destination: Path, *, approved_mix=None, encoder_mode="auto") -> dict:
     if not render_available():
-        raise RenderError("Video export needs FFmpeg and FFprobe on PATH.")
+        raise RenderError("Video export needs FFmpeg and ffprobe, plus a Chromium browser for the BFG Canvas renderer.")
     composition = _Composition(project, folder)
     frame_count = _frame_count(composition.duration)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -750,6 +902,8 @@ def export_video(project, folder: Path, destination: Path, *, approved_mix=None,
             fallback = f"{encoder.label} failed the export or its output checks. Bacchus retried on the CPU."
             encoder = video_encoding.CPU
             output, media = _encode_verified(*args, encoder, approved_mix)
+        if render_backend() == "canvas":
+            media["visualVerification"] = _verify_canvas_pictures(project, folder, composition, output, frame_count)
         if approved_mix is not None:
             try:
                 media["audioLevels"] = mixing.verify_delivery(output, media["duration"], approved_mix)
@@ -757,14 +911,14 @@ def export_video(project, folder: Path, destination: Path, *, approved_mix=None,
                 raise RenderError(str(error)) from error
         output.replace(destination)
     media.update(encoder=encoder.name, hardwareEncoding=encoder != video_encoding.CPU,
-                 encoderMode=encoder_mode, encoderFallback=fallback)
+                 encoderMode=encoder_mode, encoderFallback=fallback, renderer=render_backend())
     return media
 
 
 def export_motion_preview(project, folder: Path, destination: Path, start: float, end: float, *, approved_mix=None) -> dict:
     """Export a bounded review clip on the same frame and audio clocks as the finished film."""
     if not render_available():
-        raise RenderError("Motion preview needs FFmpeg and FFprobe.")
+        raise RenderError("Motion preview needs FFmpeg and ffprobe, plus a Chromium browser for the BFG Canvas renderer.")
     composition = _Composition(project, folder, scale=1)
     if (
         any(type(value) not in (int, float) or not math.isfinite(value) for value in (start, end))

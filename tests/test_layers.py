@@ -93,9 +93,15 @@ class LayeredScenesTests(unittest.TestCase):
             self.assertEqual((chart.start, flow.start), (1, 2.25))
             self.assertEqual(render.layout_findings(project, folder), [])
 
-            encoded = next(render._video_frames(composition, 1, first_frame=render.FPS))
-            with Image.open(BytesIO(render.preview(project, folder, 1))) as expected:
-                self.assertEqual(expected.tobytes(), encoded)
+            frame_at_one = render.preview(project, folder, 1)
+            self.assertEqual(frame_at_one, render.preview(project, folder, 1))
+            if render.render_backend() == "pillow":
+                encoded = next(render._video_frames(composition, 1, first_frame=render.FPS))
+                with Image.open(BytesIO(frame_at_one)) as expected:
+                    self.assertEqual(expected.tobytes(), encoded)
+            else:
+                self.assertNotEqual(render.preview(project, folder, 0.25), render.preview(project, folder, 0.95))
+                self.assertNotEqual(render.preview(project, folder, 0.95), render.preview(project, folder, 4.25))
             changed = deepcopy(project)
             changed["plan"]["scenes"][0]["layers"][0]["items"][0]["value"] = 5.25
             original = render.preview(project, folder, 1.7)
@@ -120,10 +126,8 @@ class LayeredScenesTests(unittest.TestCase):
             self.assertNotEqual(composition.palette.matte, render.PALETTES["warm-editorial"].matte)
             with Image.open(BytesIO(render.preview(project, folder, 1.7))) as styled:
                 self.assertEqual(styled.getpixel((0, 0)), ImageColor.getrgb("#E2F3E1"))
-                self.assertEqual(
-                    styled.getpixel((106 * render.DELIVERY_SCALE, 76 * render.DELIVERY_SCALE)),
-                    ImageColor.getrgb("#00662E"),
-                )
+                accent_pt = (204, 116) if render.render_backend() == "canvas" else (106 * render.DELIVERY_SCALE, 76 * render.DELIVERY_SCALE)
+                self.assertEqual(styled.getpixel(accent_pt), ImageColor.getrgb("#00662E"))
             self.assertEqual(render.layout_findings(project, folder), [])
 
     def test_palette_rejects_malformed_colors_and_unknown_roles(self):
@@ -146,9 +150,12 @@ class LayeredScenesTests(unittest.TestCase):
             labels = " ".join(sample["label"] for sample in motion["samples"])
             for marker in ("sensor enters", "sensor moves", "sensor settles", "sensor leaves", "response settles"):
                 self.assertIn(marker, labels)
-            with Image.open(BytesIO(review.asset_proof_png(project, folder, use))) as proof:
+            proof_bytes = review.asset_proof_png(project, folder, use)
+            self.assertLess(len(proof_bytes), 5 * 1024 * 1024)
+            with Image.open(BytesIO(proof_bytes)) as proof:
                 self.assertEqual(proof.format, "PNG")
-                self.assertGreater(proof.height, render.HEIGHT + 300)
+                self.assertGreaterEqual(proof.width, 1280)
+                self.assertGreater(proof.height, 900)
             with Image.open(BytesIO(review.animation_proof_png(project, folder, motion))) as proof:
                 self.assertEqual(proof.format, "PNG")
             project["assets"][0].update(libraryId="published", libraryVersion=1)

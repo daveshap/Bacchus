@@ -85,6 +85,10 @@ def raw_input(width, height, fps):
             "-video_size", f"{width}x{height}", "-framerate", str(fps), "-i", "pipe:0"]
 
 
+def png_input(fps):
+    return ["-f", "image2pipe", "-c:v", "png", "-framerate", str(fps), "-i", "pipe:0"]
+
+
 def encoding_options(encoder):
     # The renderer supplies full-range RGB. Convert to limited-range BT.709 before encoding or hardware upload.
     conversion = f"scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format={encoder.pixel_format}"

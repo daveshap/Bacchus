@@ -37,4 +37,6 @@ jobs:
       - run: ffmpeg -version
       - run: ffprobe -version
       - run: python -m pip install -r requirements.txt
+      - name: Verify the hosted browser starts with the Canvas renderer
+        run: python -c "from bacchus.browser_cdp import CDPBrowser; browser = CDPBrowser(); print(browser.executable); browser.close()"
       - run: python -m unittest discover -s tests -v

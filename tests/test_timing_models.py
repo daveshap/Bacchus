@@ -75,7 +75,7 @@ class TimingModelsTests(unittest.TestCase):
         old.mkdir()
         for name, data in self.previous.items():
             (old / name).write_bytes(data)
-        self.assertEqual(self.setup.validate_existing(str(old)), old)
+        self.assertEqual(self.setup.validate_existing(str(old)), old.resolve())
         self.assertEqual(self.setup.status(old)["source"], "existing")
         self.assertFalse(self.setup.directory.exists())
         target = old / models.MODEL_FILES[0]

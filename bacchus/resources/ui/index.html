@@ -30,7 +30,10 @@
     <main class="main">
       <header class="topbar">
         <div class="breadcrumb"><span id="workspace-name">Projects</span><span aria-hidden="true">/</span><strong id="project-name">New project</strong></div>
-        <span id="pack-name" class="pack" hidden></span>
+        <div class="topbar-meta">
+          <button id="mode-toggle" class="button small quiet" type="button" data-action="toggle-auto-mode" hidden></button>
+          <span id="pack-name" class="pack" hidden></span>
+        </div>
       </header>
       <div class="workspace">
         <div id="message" class="notice" role="status" aria-live="polite" hidden></div>

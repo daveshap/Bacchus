@@ -21,7 +21,10 @@ _UNITS = {
 }
 _CURRENCIES = {"usd", "eur", "gbp"}
 _QUALIFIERS = set(_SCALE) | _CURRENCIES | {"%"}
-_UNCERTAIN = {"no", "not", "never", "would", "could", "might"}
+_UNCERTAIN = {
+    "no", "not", "never", "would", "could", "might", "below", "above", "under", "over",
+    "roughly", "nearly", "approximately", "about", "less", "more", "least", "most",
+}
 
 
 def _tokens(text):
@@ -109,6 +112,8 @@ def _supported(clauses, item, labels, unit):
     if not label:
         return False
     for words in clauses:
+        if "if" in words or "unless" in words:
+            continue
         other_positions = [
             (position, position + len(other))
             for other in labels if other != label for position in _label_positions(words, other)
@@ -131,7 +136,7 @@ def chart_findings(source, scenes):
     brief = _CLAUSE.split(source.get("intention", ""))
     findings = []
     for index, scene in enumerate(scenes, 1):
-        charts = [layer for layer in scene.get("layers", []) if layer["kind"] == "bar-chart"]
+        charts = [layer for layer in scene.get("layers", []) if layer["kind"] in ("bar-chart", "meter", "counter")]
         if not charts:
             continue
         narration = " ".join(line["text"] for line in source["lines"][scene["startLine"] - 1:scene["endLine"]])

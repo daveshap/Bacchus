@@ -7,7 +7,7 @@ import json
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from . import api_log, settings
+from . import api_log, budget, settings
 from .settings import DEFAULT_IMAGE_MODEL, openai_images_enabled, provider_value
 
 
@@ -41,6 +41,12 @@ def _finish_log(call, status, body=None, **details):
 
 
 def send_request(request, provider, *, timeout, limit):
+    if budget.active():
+        raise budget.BudgetError("This provider operation has no Auto budget adapter.")
+    return _send_request(request, provider, timeout=timeout, limit=limit)
+
+
+def _send_request(request, provider, *, timeout, limit):
     """Send one request and capture up to the adapter's response-byte limit."""
     call = _start_log(request, provider)
     http_error = None
@@ -93,15 +99,157 @@ def send_request(request, provider, *, timeout, limit):
 
 
 def post_json(url, payload, headers, provider, timeout=125, limit=512 * 1024):
+    return budget.run(provider, url, payload,
+                      lambda: _count_inputs(url, payload, headers, provider),
+                      lambda: _post_json(url, payload, headers, provider, timeout, limit))
+
+
+def _post_json(url, payload, headers, provider, timeout, limit):
     request = Request(
         url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={**headers, "content-type": "application/json"}, method="POST",
     )
-    raw, request_id = send_request(request, provider, timeout=timeout, limit=limit)
+    raw, request_id = _send_request(request, provider, timeout=timeout, limit=limit)
     try:
         result = json.loads(raw)
     except (ValueError, RecursionError) as error:
         raise ProviderError(f"{provider} did not return a JSON result.") from error
+    return result, request_id
+
+
+def _count_inputs(url, payload, headers, provider):
+    if url == "https://api.anthropic.com/v1/messages":
+        suffix = "/count_tokens"
+        fields = ("model", "messages", "system", "output_config", "thinking", "tools")
+    elif url == "https://api.openai.com/v1/responses":
+        suffix = "/input_tokens"
+        fields = ("model", "instructions", "input", "text", "reasoning", "tools")
+    else:
+        raise budget.BudgetError("No input token counter is available for this endpoint.")
+    body = {key: payload[key] for key in fields if key in payload}
+    counted, _ = _post_json(url + suffix, body, headers, provider, 125, 32 * 1024)
+    return counted.get("input_tokens") if isinstance(counted, dict) else None
+
+
+def post_anthropic_stream(url, payload, headers, provider="Anthropic", *, timeout=180, limit=4 * 1024 * 1024):
+    return budget.run(provider, url, payload,
+                      lambda: _count_inputs(url, payload, headers, provider),
+                      lambda: _anthropic_stream(url, payload, headers, provider, timeout, limit))
+
+
+def _anthropic_stream(url, payload, headers, provider, timeout, limit):
+    """Send a streaming Anthropic Messages request, reassembling text/usage while auditing bytes."""
+    stream_payload = {**payload, "stream": True}
+    request = Request(
+        url, data=json.dumps(stream_payload, ensure_ascii=False).encode("utf-8"),
+        headers={**headers, "content-type": "application/json", "accept": "text/event-stream"},
+        method="POST",
+    )
+    call = _start_log(request, provider)
+    http_error = None
+    try:
+        response = build_opener(NoRedirect()).open(request, timeout=timeout)
+    except HTTPError as error:
+        http_error = response = error
+    except (HTTPException, OSError, ValueError) as error:
+        _finish_log(call, None, error="network_error")
+        raise ProviderError(f"The {provider} request did not return. Provider status is unknown.") from error
+
+    with response:
+        status = response.getcode()
+        res_headers = response.headers or {}
+        request_id = res_headers.get("request-id") or res_headers.get("x-request-id")
+        content_type = res_headers.get("content-type") or res_headers.get("Content-Type")
+        if http_error is not None:
+            raw = response.read(limit + 1)
+            _finish_log(call, status, raw[:limit], content_type=content_type, request_id=request_id,
+                        error="http_error", truncated=len(raw) > limit)
+            raise ProviderError(f"{provider} returned HTTP {status}. Check the API key, model access, and limits.") from http_error
+
+        buf = bytearray()
+        oversized = False
+        read_error = None
+        text_parts = []
+        message_id = None
+        model_id = payload.get("model", "")
+        stop_reason = None
+        usage = {}
+        final_usage = False
+        complete = False
+        stream_error = False
+        try:
+            while True:
+                line = response.readline(256 * 1024)
+                if not line:
+                    break
+                if len(buf) + len(line) > limit:
+                    oversized = True
+                    break
+                buf.extend(line)
+                decoded = line.decode("utf-8", "replace").strip()
+                if not decoded.startswith("data:"):
+                    continue
+                data_str = decoded[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data_str)
+                except ValueError:
+                    stream_error = True
+                    break
+                if not isinstance(event, dict):
+                    stream_error = True
+                    break
+                etype = event.get("type")
+                if etype == "error":
+                    stream_error = True
+                    break
+                elif etype == "message_stop":
+                    complete = True
+                elif etype == "message_start":
+                    msg = event.get("message") or {}
+                    message_id = msg.get("id") or message_id
+                    model_id = msg.get("model") or model_id
+                    if isinstance(msg.get("usage"), dict):
+                        usage.update(msg["usage"])
+                elif etype == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                        text_parts.append(delta["text"])
+                elif etype == "message_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("stop_reason"):
+                        stop_reason = delta["stop_reason"]
+                    if isinstance(event.get("usage"), dict):
+                        usage.update(event["usage"])
+                        final_usage = event["usage"].get("output_tokens") is not None
+        except (HTTPException, IncompleteRead, OSError, ValueError) as error:
+            read_error = error
+        error_code = "response_read_error" if (read_error or stream_error or not complete) else None
+        if oversized:
+            error_code = "response_too_large"
+        _finish_log(
+            call, status, bytes(buf[:limit]),
+            content_type=content_type, request_id=request_id, error=error_code,
+            truncated=oversized or read_error is not None,
+        )
+    if read_error is not None:
+        raise ProviderError(f"The {provider} stream ended before Bacchus could finish reading it.") from read_error
+    if oversized:
+        raise ProviderError(f"{provider} returned more data than the configured size limit.")
+    if stream_error or not complete or not message_id:
+        raise ProviderError(f"The {provider} stream did not complete. Check the API log before retrying.")
+    if not final_usage:
+        # message_start reports a partial output count. Leave the reservation in place.
+        usage.pop("output_tokens", None)
+        usage.pop("total_tokens", None)
+    result = {
+        "id": message_id or request_id or "streamed",
+        "model": model_id,
+        "stop_reason": stop_reason,
+        "content": [{"type": "text", "text": "".join(text_parts)}],
+        "usage": usage or None,
+    }
     return result, request_id
 
 

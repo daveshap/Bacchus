@@ -76,10 +76,27 @@ def run(project, folder, scope, write_file):
     records = project["review"][scope]
     prove = review.asset_proof_png if scope == "assets" else review.animation_proof_png
     failures = []
-    for check in checks(project, scope):
+    pending = [check for check in checks(project, scope) if not has_proof(folder, scope, check, records.get(check["id"], {}))]
+    if scope == "animation" and pending and render.render_backend() == "canvas":
+        try:
+            batch = review.animation_proofs_batch(project, folder, pending)
+            for check in pending:
+                check_id = check["id"]
+                proof = batch.get(check_id)
+                if not proof:
+                    reason = f"Scene {check['scene']}: proof could not be rendered."
+                    failures.append(reason)
+                    records[check_id] = {"status": "error", "reason": reason}
+                    continue
+                path = proof_path(folder, scope, check_id)
+                write_file(path, proof)
+                records[check_id] = {"status": "ready", "proofHash": hashlib.sha256(proof).hexdigest()}
+            return failures
+        except render.RenderError:
+            # Fall back to per-scene proofs so exact failing scene errors are isolated
+            pass
+    for check in pending:
         check_id = check["id"]
-        if has_proof(folder, scope, check, records.get(check_id, {})):
-            continue
         try:
             proof = prove(project, folder, check)
         except render.RenderError as error:

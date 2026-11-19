@@ -25,6 +25,9 @@ def notices(package, destination):
 data = [
     (str(project / "bacchus" / "resources"), "bacchus/resources"),
     (str(project / "LICENSE"), "licenses/Bacchus"),
+    (str(project / "bacchus" / "resources" / "engine" / "FONTS-OFL.txt"), "licenses/Fonts"),
+    (str(project / "bacchus" / "resources" / "engine" / "OFL-BebasNeue.txt"), "licenses/Fonts"),
+    (str(project / "bacchus" / "resources" / "engine" / "OFL-Montserrat.txt"), "licenses/Fonts"),
 ]
 data.extend(notices("Pillow", "Pillow"))
 data.extend(notices("PyInstaller", "PyInstaller"))

@@ -24,3 +24,5 @@ class ChartEvidenceTests(unittest.TestCase):
         self.assertFalse(findings("", [("North", 1250)], "USD", "North: $1,250"))
         self.assertTrue(findings("", [("North", 1)], "USD", "North: $1 million"))
         self.assertTrue(findings("North could reach 20 percent if sales increase.", [("North", 20)], "%"))
+        self.assertTrue(findings("North received below 25 percent.", [("North", 25)], "%"))
+        self.assertTrue(findings("If North received 25 percent, South would benefit.", [("North", 25)], "%"))

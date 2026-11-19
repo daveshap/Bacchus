@@ -50,9 +50,13 @@ jobs:
       - name: Install FFmpeg on Linux
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          # Build against Ubuntu 22.04's glibc; the render smoke test needs FFmpeg 5.1+.
+          brew=/home/linuxbrew/.linuxbrew/bin/brew
+          "$brew" install ffmpeg
+          echo "$("$brew" --prefix ffmpeg)/bin" >> "$GITHUB_PATH"
       - run: python -m pip install -r requirements.txt -r packaging/requirements.txt
+      - name: Verify the hosted browser starts with the Canvas renderer
+        run: python -c "from bacchus.browser_cdp import CDPBrowser; browser = CDPBrowser(); print(browser.executable); browser.close()"
       - run: python -m unittest discover -s tests -v
       - run: python packaging/build.py
       - name: Verify the frozen application and MP4 export

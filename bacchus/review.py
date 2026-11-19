@@ -1,5 +1,6 @@
 """Stable review check IDs and visual evidence for planned uses and animation."""
 
+import base64
 from dataclasses import asdict
 import hashlib
 from io import BytesIO
@@ -9,19 +10,24 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageOps
 
-from . import ENGINE_VERSION, layer_spec, render
+from . import ENGINE_VERSION, browser_cdp, canvas_engine, canvas_qc, layer_spec, render
 from .render import RenderError
 
 
-EVIDENCE_VERSION = 2
+EVIDENCE_VERSION = 4
 SHEET_BACKGROUND = "#f5f4ef"
 SHEET_INK = "#222b26"
 SHEET_SECONDARY = "#44514a"
+MAX_PROOF_PNG_BYTES = 4_500_000
+REVIEW_FRAME_WIDTH = 1280
+REVIEW_FRAME_HEIGHT = 720
 
 
 def _check_id(kind, inputs):
+    backend = render.render_backend()
     encoded = json.dumps(
-        [EVIDENCE_VERSION, kind, ENGINE_VERSION, inputs],
+        [EVIDENCE_VERSION, kind, ENGINE_VERSION, backend,
+         canvas_engine.runtime_hash() if backend == "canvas" else None, inputs],
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -52,6 +58,8 @@ def _visual(scene, assets):
         "asset": [asset_id, assets.get(asset_id, {}).get("hash")],
         "brief": scene.get("artBrief", ""),
     }
+    if scene.get("canvasCode"):
+        visual["canvasCode"] = hashlib.sha256(scene["canvasCode"].encode("utf-8")).hexdigest()
     if scene.get("layers"):
         visual["layers"] = [
             {"layer": layer, "contentHash": assets.get(layer["artId"], {}).get("hash")}
@@ -183,10 +191,19 @@ def _current_check(check, available, label):
     raise RenderError(f"This {label} proof no longer matches the current project.")
 
 
-def _png(image):
-    with BytesIO() as buffer:
-        image.save(buffer, format="PNG")
-        return buffer.getvalue()
+def _bounded_png(image: Image.Image, max_bytes: int = MAX_PROOF_PNG_BYTES) -> bytes:
+    """Encode PNG cleanly, downscaling only if needed to stay safely below API byte limits."""
+    current = image
+    for _ in range(5):
+        with BytesIO() as buffer:
+            current.save(buffer, format="PNG", optimize=True)
+            data = buffer.getvalue()
+        if len(data) <= max_bytes:
+            return data
+        new_w = max(640, int(current.width * 0.8))
+        new_h = max(360, int(current.height * 0.8))
+        current = current.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    return data
 
 
 def _text(draw, position, text, size=23, *, muted=False, width=None):
@@ -212,21 +229,67 @@ def _reference_panel(art, size):
 
 
 def asset_proof_png(project, folder: Path, check) -> bytes:
+    """Render an HD (1280x720) static asset-use proof alongside the reference artwork."""
     selected = _current_check(check, asset_checks(project), "artwork")
-    composition = render._Composition(project, folder)
+    assets = {asset["id"]: asset for asset in project["assets"]}
     asset_id = selected["assetId"]
-    art = render._read_asset(asset_id, composition.assets, folder)
-    # Use the exact static composition without drawing any timed motion.
+    art = render._read_asset(asset_id, assets, folder)
     index = selected["scene"] - 1
-    prepared = composition.prepare(index)
-    frame = composition.asset_frame(index, selected["layerId"], prepared)
-    layer = next((item for item in prepared.layers if item.id == selected["layerId"]), None)
-    animated = layer is not None and layer.settled > layer.start
-    reference_width, margin, header = 408, 24, 88
+    scene = project["plan"]["scenes"][index]
+    layer_id = selected["layerId"]
+    target_layer = next((item for item in scene.get("layers", []) if item["id"] == layer_id), None)
+    animated = target_layer is not None and float(target_layer["enter"]["duration"]) > 0
+
+    phase_tiles: list[tuple[str, Image.Image]] = []
+    if render.render_backend() == "canvas":
+        html_bytes, asset_blobs, _ = render.build_canvas_film(project, folder)
+        scale = REVIEW_FRAME_WIDTH / 1920.0
+
+        def _capture(browser, session_id, _ready, page_errors):
+            b64 = browser.eval_js(
+                session_id,
+                f"(() => {{ window.__film.renderSceneStatic({index}, {json.dumps(layer_id)}, null); "
+                "return window.__film.frameB64(); })()",
+            )
+            phases = []
+            if animated:
+                for phase_val, label in ((0.0, "Before"), (0.5, "During"), (1.0, "Settled")):
+                    pb64 = browser.eval_js(
+                        session_id,
+                        f"(() => {{ window.__film.renderSceneStatic({index}, {json.dumps(layer_id)}, {phase_val}); "
+                        "return window.__film.frameB64(); })()",
+                    )
+                    phases.append((label, base64.b64decode(pb64)))
+            if page_errors:
+                raise browser_cdp.BrowserError("; ".join(page_errors[:5]))
+            return base64.b64decode(b64), phases
+
+        try:
+            frame_bytes, raw_phases = browser_cdp.run_with_film(html_bytes, asset_blobs, scale, _capture)
+        except browser_cdp.BrowserError as error:
+            raise RenderError(str(error)) from error
+        with Image.open(BytesIO(frame_bytes)) as img:
+            frame = img.convert("RGB")
+        for label, raw in raw_phases:
+            with Image.open(BytesIO(raw)) as img:
+                phase_tiles.append((label, img.convert("RGB").resize((448, 252), Image.Resampling.LANCZOS)))
+    else:
+        composition = render._Composition(project, folder, scale=1)
+        prepared = composition.prepare(index)
+        frame = composition.asset_frame(index, layer_id, prepared)
+        if animated:
+            layer_obj = next((item for item in prepared.layers if item.id == layer_id), None)
+            if layer_obj is not None:
+                for phase_val, label in ((0, "Before"), (0.5, "During"), (1, "Settled")):
+                    sample = prepared.frame.copy()
+                    layer_obj.paste(sample, phase_val)
+                    phase_tiles.append((label, sample.resize((448, 252), Image.Resampling.LANCZOS)))
+
+    reference_width, margin, header = 380, 24, 88
     sheet = Image.new(
         "RGB", (
             frame.width + reference_width + margin * 3,
-            frame.height + header + margin + (338 if animated else 0),
+            frame.height + header + margin + (338 if phase_tiles else 0),
         ),
         SHEET_BACKGROUND,
     )
@@ -239,16 +302,14 @@ def asset_proof_png(project, folder: Path, check) -> bytes:
         _reference_panel(art, (reference_width, frame.height)),
         (frame.width + margin * 2, header),
     )
-    if animated:
+    if phase_tiles:
         y = header + frame.height + 26
-        _text(draw, (margin, y), f"Isolated entrance: {layer.id}", 20)
-        for step, (phase, label) in enumerate(((0, "Before"), (0.5, "During"), (1, "Settled"))):
-            sample = prepared.frame.copy()
-            layer.paste(sample, phase)
-            x = margin + 471 * step
-            sheet.paste(sample.resize((448, 252), Image.Resampling.LANCZOS), (x, y + 32))
+        _text(draw, (margin, y), f"Isolated entrance: {layer_id}", 20)
+        for step_idx, (label, tile) in enumerate(phase_tiles):
+            x = margin + 471 * step_idx
+            sheet.paste(tile, (x, y + 32))
             _text(draw, (x, y + 288), label, 18, muted=True)
-    return _png(sheet)
+    return _bounded_png(sheet)
 
 
 def _timecode(seconds):
@@ -257,11 +318,47 @@ def _timecode(seconds):
     return f"{minutes:02d}:{remainder / 1000:06.3f}"
 
 
+def animation_proofs_batch(project, folder: Path, checks: list[dict]) -> dict[str, bytes]:
+    """Render multiple animation contact-sheet PNGs in a single Chrome Canvas session."""
+    if not checks:
+        return {}
+    available = {c["id"]: c for c in animation_checks(project)}
+    validated = []
+    for check in checks:
+        selected = available.get(check.get("id"))
+        if not selected:
+            raise RenderError("This animation proof no longer matches the current project.")
+        if not selected["samples"]:
+            raise RenderError(f"Scene {selected['scene']}. This scene is too short to appear in the exported video.")
+        validated.append(selected)
+    if render.render_backend() == "canvas":
+        try:
+            preset = render.project_visual_preset(project)
+            palette = asdict(render.project_palette(project))
+            raw_map = canvas_qc.render_animation_proofs_batch(
+                project, folder, validated, palette_dict=palette, preset=preset,
+            )
+            bounded = {}
+            for cid, data in raw_map.items():
+                with Image.open(BytesIO(data)) as img:
+                    if img.mode == "RGB" and len(data) <= MAX_PROOF_PNG_BYTES:
+                        bounded[cid] = data
+                    else:
+                        bounded[cid] = _bounded_png(img.convert("RGB"))
+            return bounded
+        except (browser_cdp.BrowserError, ValueError) as error:
+            raise RenderError(str(error)) from error
+    return {check["id"]: animation_proof_png(project, folder, check) for check in validated}
+
+
 def animation_proof_png(project, folder: Path, check) -> bytes:
     selected = _current_check(check, animation_checks(project), "animation")
     if not selected["samples"]:
         raise RenderError(f"Scene {selected['scene']}. This scene is too short to appear in the exported video.")
-    composition = render._Composition(project, folder)
+    if render.render_backend() == "canvas":
+        return animation_proofs_batch(project, folder, [selected])[selected["id"]]
+    # Pillow fallback: render directly at review scale=1 (1280x720) instead of 4K
+    composition = render._Composition(project, folder, scale=1)
     detailed = len(selected["samples"]) > 10
     width, height = (544, 306) if detailed else (768, 432)
     margin, header, caption = 20, 64, 39
@@ -288,4 +385,4 @@ def animation_proof_png(project, folder: Path, check) -> bytes:
             draw, (x, y + height + 7), f"{_timecode(sample['time'])}  {sample['label']}", 20,
             muted=True, width=width,
         )
-    return _png(sheet)
+    return _bounded_png(sheet)

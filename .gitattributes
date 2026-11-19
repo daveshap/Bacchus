@@ -1,2 +1,4 @@
 *.msi binary
 bacchus/resources/packs/** text eol=lf
+bacchus/resources/engine/bfg/*.js text eol=lf -whitespace
+bacchus/resources/engine/*OFL*.txt -whitespace

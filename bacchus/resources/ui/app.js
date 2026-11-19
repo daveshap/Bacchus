@@ -41,6 +41,7 @@ const state = {
   newStyleId: "",
   newMusicChoice: "style",
   newMusicStyle: "",
+  newAutoMode: true,
   newRecording: null,
   styles: [],
   stylesError: "",
@@ -74,6 +75,7 @@ const studioNavigation = document.querySelector("#studio-nav");
 const workspaceName = document.querySelector("#workspace-name");
 const projectName = document.querySelector("#project-name");
 const packName = document.querySelector("#pack-name");
+const modeToggle = document.querySelector("#mode-toggle");
 const newProject = document.querySelector(".sidebar-new");
 const quitButton = document.querySelector("#quit-bacchus");
 
@@ -306,6 +308,17 @@ function render() {
   const style = project?.styleSnapshot;
   packName.textContent = style ? `${style.name} · v${style.revision}` : "";
   packName.hidden = Boolean(toolName) || !packName.textContent;
+  if (modeToggle) {
+    const showMode = Boolean(project) && !toolName;
+    modeToggle.hidden = !showMode;
+    if (showMode) {
+      modeToggle.textContent = project.autoMode ? "Auto mode · On" : "Manual gates";
+      modeToggle.disabled = Boolean(project.busy);
+      modeToggle.title = project.autoMode
+        ? "Switch this project back to manual gated checkpoints"
+        : "Enable Auto mode (MP3 to verified MP4 without manual gate clicks)";
+    }
+  }
   quitButton.disabled = !state.config;
   studioNavigation.querySelectorAll("[data-view]").forEach(control => {
     control.disabled = !state.config;
@@ -380,11 +393,14 @@ function readiness(label, available, waitingLabel, readyLabel = "Ready", waiting
 function readinessList(settings) {
   const planner = settings.plannerProvider === "openai" ? "OpenAI" : "Anthropic";
   const imagesEnabled = Boolean(settings.useOpenAIImages);
+  const canvasLabel = settings.browserLabel ? `${settings.browserLabel} · Ready` : "Ready";
   return [
     readiness("Audio tools", settings.audioAvailable, "Install FFmpeg and ffprobe"),
     readiness("Local word timings", canDeriveTimings(), state.timingModel?.runtimeAvailable === false ? "Runtime unavailable" :
       timingModelIsWorking() ? "Installing" : state.timingModel ? "Needs a timing model" : "Awaiting check"),
-    readiness("Video export", settings.renderAvailable, "Install FFmpeg and ffprobe"),
+    readiness("BFG Canvas renderer", settings.renderBackend === "canvas" && settings.browserAvailable,
+      settings.renderBackend === "pillow" ? "Legacy Pillow selected" : "Install Chrome, Edge or Chromium", canvasLabel),
+    readiness("Video export", settings.renderAvailable, settings.audioAvailable ? "Check the renderer" : "Install FFmpeg and ffprobe"),
     readiness(`Scene planning · ${planner}`, state.config.plannerAvailable, `Needs ${planner} key`, "Configured"),
     readiness("OpenAI image generation", state.config.imageAvailable, imagesEnabled ? "Needs OpenAI key" : "Off",
       "Configured", imagesEnabled ? "warm" : ""),
@@ -729,7 +745,28 @@ function libraryView() {
           </select>
           ${scope ? `<p class="hint">${styleAssetCount(scope)}</p>` : ""}
         </div>
-        ${scope ? `<div>${button("Export style and library", "export-style-archive", { style: "quiet small", name: scope.id })}</div>` : ""}
+        ${scope ? `<div class="cluster">${button("Export style and library", "export-style-archive", { style: "quiet small", name: scope.id })}</div>
+        <details class="timing-import">
+          <summary>Import studio folder or catalog</summary>
+          <form class="stack" data-form="library-import-folder">
+            <div class="field">
+              <label for="library-import-dir">Local folder path</label>
+              <input id="library-import-dir" name="directory" placeholder="e.g. C:\\AnimationAutomationStudio\\engine\\lib\\warm\\style-assets" required>
+              <p class="hint">Imports a studio catalog (catalog.json / manifest.json) or any folder of PNG, JPEG, or WebP images with automatic deduplication.</p>
+            </div>
+            <div><button class="button primary small">Import folder into ${escapeHtml(scope.libraryName)}</button></div>
+          </form>
+        </details>
+        <details class="timing-import">
+          <summary>Upload image files</summary>
+          <form class="stack" data-form="library-import-files">
+            <div class="field">
+              <label for="library-import-files-input">PNG, JPEG, or WebP files</label>
+              <input id="library-import-files-input" type="file" name="files" multiple accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" required>
+            </div>
+            <div><button class="button small">Upload into ${escapeHtml(scope.libraryName)}</button></div>
+          </form>
+        </details>` : ""}
         ${libraryRecovery()}
         <div class="field"><label for="library-search">Search artwork</label>
           <input id="library-search" type="search" value="${escapeHtml(state.libraryQuery)}" placeholder="Search by name, brief, or style">
@@ -1020,6 +1057,18 @@ function startView() {
             <div id="kickoff-style-details" aria-live="polite">${kickoffStyleSummary(styleById(state.newStyleId))}</div>
           </div>
           ${musicChoiceFields("new", state.newMusicChoice, state.newMusicStyle, styleById(state.newStyleId))}
+          <div class="field">
+            <label class="music-option">
+              <input type="checkbox" id="new-auto-mode" name="autoMode"${state.newAutoMode ? " checked" : ""}>
+              <span>Auto mode (MP3 to verified MP4 without manual gate clicks)</span>
+            </label>
+            <p class="hint">Auto uses independent AI reviewers. Adding a recording here starts production when you create the project. Disable Auto to approve each stage yourself.</p>
+          </div>
+          <div data-new-auto-options${state.newAutoMode ? "" : " hidden"}>
+            <label for="new-auto-brief">Creative brief (optional)</label>
+            <textarea name="autoBrief" id="new-auto-brief" maxlength="2000" rows="2"></textarea>
+            ${autoLimitFields({})}
+          </div>
           ${state.config.audioAvailable ? `<div class="field">
             <label for="new-recording">Narration recording (optional)</label>
             <input id="new-recording" type="file" accept="audio/wav,audio/mpeg,audio/flac,.mp3,.flac,.wav">
@@ -1198,6 +1247,105 @@ function timingReview(project, busy) {
   </div>`;
 }
 
+const autoStageOrder = [
+  ["timing", "Word cues"],
+  ["intake", "Intake"],
+  ["plan", "Scene plan"],
+  ["assets", "Artwork"],
+  ["composition", "Soundtrack"],
+  ["qc", "Canvas QC"],
+  ["export", "4K60 Export"],
+];
+
+function autoLimitFields(limits) {
+  const settings = state.settings || {};
+  const rates = limits?.rates || {};
+  const models = [...new Set([settings.claudeModel, settings.openAIModel, settings.imageModel, ...Object.keys(rates)].filter(Boolean))];
+  return `<details class="timing-panel">
+    <summary>Auto token and spending limits</summary>
+    <div class="stack">
+      <label>Project token limit <input type="number" min="0" step="1" name="maxTokens" placeholder="Unlimited" value="${escapeHtml(limits?.maxTokens ?? "")}"></label>
+      <label>Project spending limit (USD) <input type="number" min="0" step="any" name="maxUsd" placeholder="Unlimited" value="${escapeHtml(limits?.maxUsd ?? "")}"></label>
+      <p class="hint">Limits apply across all Auto runs for this project, including repairs. Zero blocks paid calls. For a USD limit, enter your maximum provider prices below. Image calls use a per-image ceiling.</p>
+      ${models.map(model => {
+        const image = model === settings.imageModel || rates[model]?.imageMaxTokens != null || rates[model]?.imageMaxUsd != null;
+        const fields = image ? [["imageMaxUsd", "Maximum USD per image"], ["imageMaxTokens", "Maximum tokens per image"]]
+          : [["inputUsdPerMillion", "USD per million input tokens"], ["outputUsdPerMillion", "USD per million output tokens"]];
+        return `<fieldset class="stack"><legend>${escapeHtml(model)}</legend>
+          <input type="hidden" name="rateModel" value="${escapeHtml(model)}">
+          ${fields.map(([key, label]) => `<label>${label} <input type="number" min="${key === "imageMaxTokens" ? "1" : "0.000001"}" step="${key === "imageMaxTokens" ? "1" : "any"}" name="rate/${escapeHtml(model)}/${key}" value="${escapeHtml(rates[model]?.[key] ?? "")}"></label>`).join("")}
+        </fieldset>`;
+      }).join("")}
+    </div>
+  </details>`;
+}
+
+function readAutoLimits(data) {
+  const numeric = key => data.get(key) ? Number(data.get(key)) : null;
+  const rates = {};
+  for (const model of data.getAll("rateModel")) {
+    const rate = {};
+    for (const key of ["inputUsdPerMillion", "outputUsdPerMillion", "imageMaxUsd", "imageMaxTokens"]) {
+      const value = numeric(`rate/${model}/${key}`);
+      if (value != null) rate[key] = value;
+    }
+    if (Object.keys(rate).length) rates[model] = rate;
+  }
+  return { maxTokens: numeric("maxTokens"), maxUsd: numeric("maxUsd"), rates };
+}
+
+function autoPipelinePanel(project) {
+  if (!project.autoMode) return "";
+  const run = project.autoRun;
+  const busy = Boolean(project.busy);
+  const running = project.busy === "running auto pipeline" || run?.status === "running";
+  const canStart = Boolean((project.audio || project.input) && state.config.renderAvailable && !busy);
+  const done = new Set(run?.stagesCompleted ?? []);
+  const statusBadge = running ? badge("Running auto pipeline", "warm")
+    : run?.status === "complete" ? badge("Auto pipeline complete", "good")
+    : ["failed", "interrupted"].includes(run?.status) ? badge("Stopped", "error")
+    : badge("Auto mode ready", "warm");
+  const delivery = run?.status === "complete" && project.export?.status === "complete" ? project.export : null;
+  return `<section class="panel auto-panel stack">
+    <div class="panel-header">
+      <div>
+        <h2>Auto mode pipeline</h2>
+        <p>Independent AI reviewers check the plan, artwork, animation, QC evidence and rendered delivery.</p>
+      </div>
+      ${statusBadge}
+    </div>
+    ${run ? `<ol class="auto-steps" aria-label="Auto pipeline progress">
+      ${autoStageOrder.map(([id, label]) => {
+        const stepStatus = done.has(id) ? "done"
+          : running && run.currentStage === id ? "active"
+          : run.status === "failed" && run.currentStage === id ? "failed"
+          : "pending";
+        return `<li class="auto-step" data-status="${stepStatus}">${escapeHtml(label)}</li>`;
+      }).join("")}
+    </ol>` : ""}
+    ${run?.error ? `<p class="notice error inline">${escapeHtml(run.error)}</p>` : ""}
+    ${run?.checks?.length ? `<details class="timing-panel"><summary>Independent reviews (${run.checks.length})</summary>
+      <ul>${run.checks.map(check => `<li><strong>${escapeHtml(check.stage)} · ${escapeHtml(check.item)} · ${escapeHtml(check.status)}</strong>
+        ${escapeHtml((check.findings || []).map(f => typeof f === "string" ? f : (f.evidence || f.detail || f.reason || f.status)).join(" · "))}</li>`).join("")}</ul></details>` : ""}
+    ${run?.warnings?.length ? `<ul class="notice inline read-list">${run.warnings.slice(0, 6).map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul>` : ""}
+    ${delivery ? deliveryDownloads(delivery, project.title) : ""}
+    ${project.autoUsage?.calls ? `<p class="hint">Auto usage · ${project.autoUsage.calls} provider calls · ${project.autoUsage.tokens.toLocaleString()} tokens · $${project.autoUsage.usd.toFixed(4)} estimated exposure${project.autoUsage.unknownUsdCalls ? ` · ${project.autoUsage.unknownUsdCalls} unpriced calls` : ""}${project.autoUsage.unknownTokenCalls ? ` · ${project.autoUsage.unknownTokenCalls} calls with unknown token use` : ""}${project.autoUsage.heldCalls ? ` · ${project.autoUsage.heldCalls} outstanding reservations` : ""}</p>` : ""}
+    <form data-form="auto-settings" class="stack">
+      <fieldset class="stack"${busy ? " disabled" : ""}>
+        ${autoLimitFields(project.autoLimits)}
+        <div class="cluster">
+          <button class="button" name="action" value="save">Save limits</button>
+          <button class="button primary" name="action" value="run"${canStart ? "" : " disabled"}>${running ? "Auto running…" : "Run Auto"}</button>
+        </div>
+      </fieldset>
+    </form>
+    <div class="cluster">
+      ${button("Switch to manual gates", "toggle-auto-mode", { style: "quiet small", disabled: busy })}
+      ${!project.audio && !project.input ? '<span class="hint">Upload an MP3/WAV/FLAC recording below first.</span>' : ""}
+    </div>
+  </section>`;
+}
+
 function intakeView(project) {
   const input = project.input;
   const audio = project.audio;
@@ -1208,6 +1356,7 @@ function intakeView(project) {
   const sourceTimings = project.transcript?.timing === "source-cues" && Boolean(project.transcript.words?.length);
   return `
     ${heading("Intake", "Import the narration recording, verify its word timings, and add creative direction.")}
+    ${autoPipelinePanel(project)}
     <div class="columns">
       <div class="stack">
       <section class="panel">
@@ -1257,7 +1406,7 @@ function intakeView(project) {
           <div class="field">
             <label for="intention">Creative brief <span class="muted">(optional)</span></label>
             <textarea id="intention" name="intention" rows="3" maxlength="2000" ${input ? "readonly" : ""}
-              placeholder="Describe the audience, visual preferences, tone, and what the animation should communicate.">${escapeHtml(input?.intention ?? draft?.intention)}</textarea>
+              placeholder="Describe the audience, visual preferences, tone, and what the animation should communicate.">${escapeHtml(input?.intention ?? draft?.intention ?? project.autoBrief)}</textarea>
           </div>
           ${input ? `
             <div class="cluster">
@@ -1319,13 +1468,33 @@ function layerInput(prefix, key, label, value, attributes = "") {
   </div>`;
 }
 
+const numericLayerKinds = new Set(["bar-chart", "meter", "counter"]);
+const statusLayerKinds = new Set(["checklist", "comparison"]);
+const listLayerKinds = new Set(["flow", "card"]);
+
 function layerEditor(layer, sceneIndex, index, count, project) {
   const prefix = `scene-${sceneIndex}-layer-${index}`;
   const reference = `${sceneIndex}/${index}`;
-  const kinds = ["text", "art", "bar-chart", "flow"];
-  const effects = ["show", "fade", "rise", "wipe"];
-  const chart = layer.kind === "bar-chart";
-  const diagram = layer.kind === "flow";
+  const kinds = state.config.layerKinds ?? ["text", "art", "bar-chart", "flow", "card", "meter", "counter", "checklist", "callout", "comparison"];
+  const effects = state.config.layerEffects ?? ["show", "fade", "rise", "wipe", "pop", "draw"];
+  const isNumeric = numericLayerKinds.has(layer.kind);
+  const isStatus = statusLayerKinds.has(layer.kind);
+  const isList = listLayerKinds.has(layer.kind);
+  const hasItems = isNumeric || isStatus || isList;
+  const itemsLabel = isNumeric ? "Labels and numeric values"
+    : isStatus ? "Items and status (1 pass, -1 fail, 0 neutral)"
+    : layer.kind === "flow" ? "Flow steps"
+    : "Card bullet items (optional)";
+  const itemsHint = isNumeric
+    ? "Enter lines in the form Label | Value. Values and units must be supported by the narration or project brief."
+    : isStatus
+      ? "Enter 1–8 lines in the form Label | 1 (check), Label | -1 (cross), or Label | 0 (neutral)."
+      : layer.kind === "flow"
+        ? "Enter 2–5 steps, one per line."
+        : "Optional bullet lines for this card, one per line.";
+  const itemsText = (layer.items ?? []).map(item =>
+    isNumeric || isStatus ? `${item.label} | ${item.value ?? 0}` : item.label
+  ).join("\n");
   const lineMax = project.input.lines.length;
   const wordMax = project.input.words?.length ?? 0;
   return `<fieldset class="stack scene-layer" data-layer>
@@ -1346,14 +1515,17 @@ function layerEditor(layer, sceneIndex, index, count, project) {
       <div class="field"><label for="${prefix}-art-brief">Artwork brief</label>
         <textarea id="${prefix}-art-brief" data-layer-field="artBrief" maxlength="380" rows="2">${escapeHtml(layer.artBrief)}</textarea>
       </div>
-    </div>` : `<div class="field"><label for="${prefix}-text">${chart || diagram ? "Heading" : "Layer text"}</label>
-      <textarea id="${prefix}-text" data-layer-field="text" maxlength="220" rows="2"${layer.kind === "text" ? " required" : ""}>${escapeHtml(layer.text)}</textarea>
+    </div>` : state.config.bfgSubjects?.[layer.kind] ? `<div class="field">
+      <label for="${prefix}-text">${layer.kind === "figure" ? "Figure pose" : "Illustrated prop"}</label>
+      <select id="${prefix}-text" data-layer-field="text">${options(state.config.bfgSubjects[layer.kind], layer.text)}</select>
+    </div>` : `<div class="field"><label for="${prefix}-text">${hasItems ? "Heading" : "Layer text"}</label>
+      <textarea id="${prefix}-text" data-layer-field="text" maxlength="220" rows="2"${["text", "callout"].includes(layer.kind) ? " required" : ""}>${escapeHtml(layer.text)}</textarea>
     </div>`}
-    ${chart || diagram ? `<div class="field"><label for="${prefix}-items">${chart ? "Bar labels and values" : "Flow steps"}</label>
-      <textarea id="${prefix}-items" data-layer-field="items" rows="3" required>${escapeHtml(layer.items.map(item => chart ? `${item.label} | ${item.value}` : item.label).join("\n"))}</textarea>
-      <p class="hint">${chart ? "Enter 1–6 lines in the form Label | Value. Use labels, values, and units supported by the narration or project brief." : "Enter 2–5 steps, one per line."}</p>
+    ${hasItems ? `<div class="field"><label for="${prefix}-items">${itemsLabel}</label>
+      <textarea id="${prefix}-items" data-layer-field="items" rows="3"${layer.kind === "card" ? "" : " required"}>${escapeHtml(itemsText)}</textarea>
+      <p class="hint">${itemsHint}</p>
     </div>` : ""}
-    ${chart ? layerInput(prefix, "unit", "Chart unit", layer.unit, 'maxlength="24"') : ""}
+    ${isNumeric ? layerInput(prefix, "unit", "Unit (e.g. %, $, x)", layer.unit, 'maxlength="24"') : ""}
     <div class="stack scene-fields">
       ${layerInput(prefix, "enter.line", "Entrance cue", layer.enter.line, `type="number" min="0" max="${lineMax}" required`)}
       ${layerInput(prefix, "enter.word", "Entrance word ID", layer.enter.word, `type="number" min="0" max="${wordMax}" required`)}
@@ -1399,8 +1571,7 @@ function sceneEditor(scene, index, project, expanded) {
           <div class="field"><label for="${prefix}-start">Start cue</label><input id="${prefix}-start" data-field="startLine" type="number" min="1" max="${lines}" value="${escapeHtml(scene.startLine)}" required></div>
           <div class="field"><label for="${prefix}-end">End cue</label><input id="${prefix}-end" data-field="endLine" type="number" min="1" max="${lines}" value="${escapeHtml(scene.endLine)}" required></div>
           <div class="field"><label for="${prefix}-layout">Layout</label><select id="${prefix}-layout" data-field="layout">${options(state.config.layouts, scene.layout)}</select></div>
-          ${layered ? '<input type="hidden" data-field="motion" value="still">' :
-            `<div class="field"><label for="${prefix}-motion">Motion</label><select id="${prefix}-motion" data-field="motion">${options(state.config.motions, scene.motion)}</select></div>`}
+          <div class="field"><label for="${prefix}-motion">Motion</label><select id="${prefix}-motion" data-field="motion">${options(state.config.motions, scene.motion)}</select></div>
         </div>
         <div class="field"><label for="${prefix}-title">Title</label><input id="${prefix}-title" data-field="title" value="${escapeHtml(scene.title)}"></div>
         <div class="field"><label for="${prefix}-caption">On-screen caption</label><textarea id="${prefix}-caption" data-field="caption" rows="2">${escapeHtml(scene.caption)}</textarea></div>
@@ -1409,9 +1580,16 @@ function sceneEditor(scene, index, project, expanded) {
           <p class="hint">Place layers using percentages of the content area. Use either a cue or a word ID for each entrance or exit. Two zeroes select the scene edge.</p>
           ${sceneWords(scene, project.input)}
           ${layers.map((layer, layerIndex) => layerEditor(layer, index, layerIndex, layers.length, project)).join("")}
-          <div>${button("Add layer", "add-layer", { name: index.toString(), disabled: layers.length >= (state.config.maxLayers ?? 12) })}</div>
+          <div>${button("Add layer", "add-layer", { name: index.toString(), disabled: layers.length >= (state.config.maxLayers ?? 16) })}</div>
         </div>` : `<div class="field"><label for="${prefix}-art">Artwork ID</label><input id="${prefix}-art" data-field="artId" list="project-art-ids" pattern="[a-z0-9\\-]*" value="${escapeHtml(scene.artId)}" placeholder="e.g. opening-collage"></div>
         <div class="field"><label for="${prefix}-brief">Artwork brief</label><textarea id="${prefix}-brief" data-field="artBrief" rows="2">${escapeHtml(scene.artBrief)}</textarea></div>`}
+        <details class="timing-panel"${scene.canvasCode ? " open" : ""}>
+          <summary>Custom Canvas 2D script (BFG draw hook, optional)</summary>
+          <div class="field settings-note">
+            <label for="${prefix}-canvas-code">JS body for <code>draw(g, t, s, BFG)</code></label>
+            <textarea id="${prefix}-canvas-code" class="code-editor" data-field="canvasCode" rows="5" maxlength="24000" placeholder="// Optional procedural Canvas 2D code using BFG helpers (card, txt, arrow, pill, icon, at, eio, clamp)...">${escapeHtml(scene.canvasCode || "")}</textarea>
+          </div>
+        </details>
         <div>${button("Remove scene", "remove-scene", { name: index.toString(), style: "quiet danger small" })}</div>
       </div>
     </details>`;
@@ -1616,8 +1794,8 @@ function artworkView(project) {
             <datalist id="pending-art-ids">${[...required.keys()].filter(id => !assets.has(id)).map(id => `<option value="${escapeHtml(id)}"></option>`).join("")}</datalist>
           </div>
           <div class="field">
-            <label for="art-file">PNG or JPEG image</label>
-            <input id="art-file" type="file" name="file" accept="image/png,image/jpeg,.png,.jpg,.jpeg" required>
+            <label for="art-file">PNG, JPEG, or WebP image</label>
+            <input id="art-file" type="file" name="file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" required>
           </div>
           <div><button class="button"${project.busy ? " disabled" : ""}>Import artwork</button></div>
         </form>
@@ -1907,8 +2085,9 @@ function animationPlayer(project, proof) {
         <p id="preview-feedback" class="hint player-feedback" role="status" hidden></p>
         <div class="cluster motion-preview-controls">
           <button id="prepare-motion-preview" class="button small primary" type="button"${canPrepareMotion && !project.busy ? "" : " disabled"}>Play full-speed clip</button>
+          <a class="button small quiet" href="${localMedia(projectPath("/film-preview", project))}" target="_blank" rel="noopener">Open 60fps Canvas preview</a>
           <p id="motion-preview-status" class="hint" role="status">${canPrepareMotion ?
-            "Play up to 12 seconds at 60 fps. Seek to preview a different point." :
+            "Play up to 12 seconds at 60 fps, or open the live HTML5 Canvas player in a new tab." :
             state.config.renderAvailable ? "Pass the animation checks to play a full-speed clip." : "Set up the media tools to play a full-speed clip."}</p>
         </div>
         ${proof ? `<ul class="shot-list" aria-label="Jump to a proof sample">
@@ -1975,6 +2154,18 @@ function captionReviewPanel(review, error) {
   </section>`;
 }
 
+function canvasDiagnosticsBadges(qc) {
+  const diag = qc?.canvasDiagnostics;
+  if (!diag) return "";
+  return `<div class="canvas-diag" aria-label="Canvas QC diagnostics">
+    ${badge(`${diag.labelsChecked} labels`, "good")}
+    ${badge(`${diag.cueMatches} cue matches`, diag.cueIssues ? "warm" : "good")}
+    ${badge(`${diag.jumpsDetected} jumps`, diag.jumpsDetected ? "warm" : "good")}
+    ${diag.errors ? badge(`${diag.errors} errors`, "error") : ""}
+    ${diag.warnings ? badge(`${diag.warnings} warnings`, "warm") : ""}
+  </div>`;
+}
+
 function animationChecksPanel(project, records, proof, captions) {
   const qc = project.qc;
   const busy = Boolean(project.busy);
@@ -1985,6 +2176,7 @@ function animationChecksPanel(project, records, proof, captions) {
           ${project.accepted ? badge("Candidate accepted", "good") :
             qc?.status === "passed" ? badge("Technical checks passed", "good") : qc ? badge("Technical checks failed", "error") : badge("Awaiting checks", "warm")}
         </div>
+        ${canvasDiagnosticsBadges(qc)}
         ${showFindings(qc)}
         ${qc?.candidateHash ? `<dl class="receipt actions"><dt>Candidate</dt><dd>${shortHash(qc.candidateHash)}</dd></dl>` : ""}
         ${qc?.status === "passed" && !project.animationReviewReady && !project.accepted
@@ -2189,7 +2381,7 @@ function attachPreview(project) {
     if (disposed || fetchController || queued == null) return;
     const time = Math.min(queued, Math.max(0, duration - .001));
     queued = null;
-    const query = new URLSearchParams({ time, revision: project.revision });
+    const query = new URLSearchParams({ time, revision: project.revision, width: 1280 });
     fetchController = new AbortController();
     try {
       const response = await fetch(`${path}?${query}`, { signal: fetchController.signal });
@@ -2490,6 +2682,7 @@ async function quitBacchus() {
   workspaceName.textContent = "Studio";
   projectName.textContent = "Closed";
   packName.hidden = true;
+  if (modeToggle) modeToggle.hidden = true;
   setConnection("closed");
   setMessage();
   content.innerHTML = heading("Bacchus has quit", "You can close this window.");
@@ -2908,10 +3101,17 @@ function readLayer(section) {
   const number = key => Number(read(key));
   const kind = read("kind");
   const effect = read("enter.effect");
-  const items = ["bar-chart", "flow"].includes(kind) ? read("items").split("\n").map(row => row.trim()).filter(Boolean).map(row => {
-    if (kind === "flow") return { label: row, value: 0 };
+  const isNumeric = numericLayerKinds.has(kind);
+  const isStatus = statusLayerKinds.has(kind);
+  const isList = listLayerKinds.has(kind);
+  const items = (isNumeric || isStatus || isList) ? read("items").split("\n").map(row => row.trim()).filter(Boolean).map(row => {
+    if (isList) return { label: row, value: 0 };
     const divider = row.lastIndexOf("|");
     const rawValue = divider === -1 ? "" : row.slice(divider + 1).trim();
+    if (isStatus) {
+      const parsed = rawValue === "" ? 1 : Number(rawValue);
+      return { label: divider === -1 ? row : row.slice(0, divider).trim(), value: Number.isFinite(parsed) ? parsed : 0 };
+    }
     return { label: divider === -1 ? row : row.slice(0, divider).trim(), value: rawValue ? Number(rawValue) : null };
   }) : [];
   return {
@@ -2921,7 +3121,7 @@ function readLayer(section) {
     artId: kind === "art" ? read("artId") : "",
     artBrief: kind === "art" ? read("artBrief") : "",
     items,
-    unit: kind === "bar-chart" ? read("unit") : "",
+    unit: isNumeric ? read("unit") : "",
     enter: { line: number("enter.line"), word: number("enter.word"), effect, duration: effect === "show" ? 0 : number("enter.duration") },
     leave: { line: number("leave.line"), word: number("leave.word") },
   };
@@ -2995,7 +3195,9 @@ function updatePlanDraft() {
       const value = field.type === "number" ? Number(field.value) : field.value;
       return [field.dataset.field, value];
     }));
-    return { artId: "", artBrief: "", ...scene, layers: Array.from(section.querySelectorAll("[data-layer]"), readLayer) };
+    const compiled = { artId: "", artBrief: "", ...scene, layers: Array.from(section.querySelectorAll("[data-layer]"), readLayer) };
+    if (!compiled.canvasCode || !compiled.canvasCode.trim()) delete compiled.canvasCode;
+    return compiled;
   });
   state.planDraft = { id: state.project.id, hash: state.project.plan.hash, scenes };
   const save = content.querySelector("[data-plan-save]");
@@ -3103,6 +3305,9 @@ document.addEventListener("change", event => {
   } else if (control.id === "new-recording") {
     state.newRecording = control.files[0] ?? null;
     content.querySelector("#kickoff-recording-details").innerHTML = kickoffRecordingSummary();
+  } else if (control.id === "new-auto-mode") {
+    state.newAutoMode = control.checked;
+    content.querySelector("[data-new-auto-options]").hidden = !control.checked;
   } else if (control.id === "library-style") {
     setLibraryStyle(control.value);
     state.libraryAliasPreferred = "";
@@ -3127,7 +3332,11 @@ document.addEventListener("change", event => {
     const index = Number(control.closest("[data-scene]").dataset.scene);
     const layerIndex = [...control.closest("[data-scene]").querySelectorAll("[data-layer]")].indexOf(control.closest("[data-layer]"));
     const layer = updatePlanDraft()[index].layers[layerIndex];
-    if (control.dataset.layerField === "kind") layer.items = [];
+    if (control.dataset.layerField === "kind") {
+      layer.items = [];
+      const subjects = state.config.bfgSubjects?.[layer.kind];
+      if (subjects && !subjects.includes(layer.text)) layer.text = subjects[0];
+    }
     if (layer.enter.effect !== "show" && !layer.enter.duration) layer.enter.duration = 0.3;
     repaintScene(index, `[id="${control.id}"]`);
   }
@@ -3203,7 +3412,60 @@ function importFile(name, data) {
   perform(() => upload(path, file), { busy: "Importing file…", success: "File imported." });
 }
 
-async function createProject(title, style, musicChoice, musicStyle) {
+async function importLibraryFolder(directory) {
+  if (state.pending || !state.libraryStyle) return;
+  const finish = beginRequest("Importing artwork folder into style library…");
+  try {
+    const result = await post("/api/library/import-folder", { styleId: state.libraryStyle, directory });
+    await Promise.all([refreshStyles(), refreshLibrary()]);
+    const failure = result.failed ? ` ${result.failed} failed. ${result.errors[0]}` : "";
+    setMessage(`Checked ${result.total} assets. Imported ${result.imported}, with ${result.skipped} already present.${failure}`, result.failed ? "error" : "good");
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    finish();
+  }
+}
+
+async function importLibraryFiles(files) {
+  if (state.pending || !state.libraryStyle) return;
+  const list = Array.from(files || []).filter(file => file?.size);
+  if (!list.length) {
+    setMessage("Choose one or more image files to upload.", "error");
+    return;
+  }
+  const finish = beginRequest(`Uploading ${list.length} artwork file(s)…`);
+  let imported = 0;
+  let skipped = 0;
+  const failures = [];
+  try {
+    for (const file of list) {
+      if (file.size > state.config.maxArtBytes) {
+        failures.push(`${file.name}: exceeds size limit`);
+        continue;
+      }
+      const query = new URLSearchParams({ styleId: state.libraryStyle, name: file.name });
+      try {
+        const res = await api(`/api/library/import?${query}`, {
+          method: "POST",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
+        });
+        if (res.imported) imported += 1;
+        else skipped += 1;
+      } catch (error) {
+        failures.push(`${file.name}: ${error.message}`);
+      }
+    }
+    await Promise.all([refreshStyles(), refreshLibrary()]);
+    const note = failures.length ? ` Failed: ${failures.slice(0, 3).join("; ")}.` : "";
+    setMessage(`Uploaded ${imported} new asset(s) (${skipped} duplicate).${note}`, failures.length && !imported ? "error" : "good");
+  } finally {
+    finish();
+  }
+}
+
+async function createProject(title, style, musicChoice, musicStyle, autoMode, autoLimits, autoBrief) {
   const recording = state.newRecording;
   const limit = state.config.maxAudioBytes;
   if (recording && !recording.size) {
@@ -3219,7 +3481,7 @@ async function createProject(title, style, musicChoice, musicStyle) {
   await perform(async () => {
     let project;
     try {
-      const request = { title, styleId: style.id, styleRevision: style.revision, musicChoice };
+      const request = { title, styleId: style.id, styleRevision: style.revision, musicChoice, autoMode, autoLimits, autoBrief };
       if (musicChoice === "custom") request.musicStyle = musicStyle;
       project = await post("/api/projects", request);
     } catch (error) {
@@ -3227,9 +3489,11 @@ async function createProject(title, style, musicChoice, musicStyle) {
       throw error;
     }
     state.newRecording = null;
+    state.newAutoMode = true;
     if (recording) {
       try {
-        return await upload("/audio", recording, project);
+        project = await upload("/audio", recording, project);
+        if (autoMode) project = await post(projectPath("/auto/run", project), { revision: project.revision });
       } catch (error) {
         importError = error.message;
       }
@@ -3237,7 +3501,7 @@ async function createProject(title, style, musicChoice, musicStyle) {
     return project;
   }, { stage: "intake", busy: recording ? "Creating project and importing narration…" : "Creating project…" });
   if (styleChanged) await refreshStyles();
-  if (importError) setMessage(`Project created. Try importing the recording again in Intake. ${importError}`, "error");
+  if (importError) setMessage(`Project created. ${importError}`, "error");
 }
 
 document.addEventListener("submit", event => {
@@ -3264,6 +3528,12 @@ document.addEventListener("submit", event => {
     if (directory) changeTimingModel("location", { directory });
   } else if (name === "library-pin") {
     pinArtwork(data);
+  } else if (name === "library-import-folder") {
+    const directory = String(data.get("directory") ?? "").trim();
+    if (directory) importLibraryFolder(directory);
+  } else if (name === "library-import-files") {
+    const input = form.querySelector('input[type="file"]');
+    importLibraryFiles(input?.files);
   } else if (name === "art-issue") {
     const reason = data.get("reason").trim();
     if (!reason) {
@@ -3293,7 +3563,17 @@ document.addEventListener("submit", event => {
       setMessage("Choose a style for this project.", "error");
       return;
     }
-    createProject(title, style, data.get("musicChoice"), data.get("musicStyle"));
+    createProject(title, style, data.get("musicChoice"), data.get("musicStyle"), data.has("autoMode"),
+      readAutoLimits(data), data.get("autoBrief") || "");
+  } else if (name === "auto-settings") {
+    const shouldRun = event.submitter?.value === "run";
+    const autoBrief = state.project.input?.intention ?? content.querySelector("#intention")?.value ?? state.project.autoBrief ?? "";
+    perform(async () => {
+      const project = await mutate("/auto/settings", { autoLimits: readAutoLimits(data), autoBrief });
+      if (!shouldRun) return project;
+      state.project = project;
+      return post(projectPath("/auto/run", project), { revision: project.revision });
+    }, { busy: shouldRun ? "Starting Auto…" : "Saving limits…", success: shouldRun ? "Auto started." : "Auto limits saved." });
   } else if (name === "derive-timings") {
     if (!canDeriveTimings()) return;
     if (state.project.transcript && !window.confirm("Replace the current word timings with new timings from the recording?")) return;
@@ -3415,10 +3695,19 @@ document.addEventListener("click", event => {
     state.newStyleId = "";
     state.newMusicChoice = "style";
     state.newMusicStyle = "";
+    state.newAutoMode = true;
     state.newRecording = null;
     state.returnToKickoff = false;
     openStage("intake", false);
     content.querySelector("#new-title")?.focus();
+  } else if (action === "toggle-auto-mode") {
+    const nextMode = !state.project.autoMode;
+    perform(() => mutate("/mode", { autoMode: nextMode }), {
+      busy: nextMode ? "Enabling Auto mode…" : "Switching to manual gates…",
+      success: nextMode
+        ? "Auto mode enabled for this project. Run the Auto Pipeline from Intake."
+        : "Manual gated review enabled for this project.",
+    });
   } else if (action === "clear-new-recording") {
     state.newRecording = null;
     const input = content.querySelector("#new-recording");

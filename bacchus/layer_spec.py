@@ -3,9 +3,17 @@
 import re
 
 
-KINDS = ("text", "art", "bar-chart", "flow")
-EFFECTS = ("show", "fade", "rise", "wipe")
-MAX_LAYERS = 12
+KINDS = (
+    "text", "art", "bar-chart", "flow",
+    "card", "meter", "counter", "checklist", "callout", "comparison", "figure", "prop",
+)
+BFG_SUBJECTS = {
+    "figure": ("stand", "walk", "think", "point", "speak", "sit", "reach", "wave"),
+    "prop": ("book", "clock", "hourglass", "laptop", "brain", "coin-stack"),
+}
+EFFECTS = ("show", "fade", "rise", "wipe", "pop", "draw")
+MAX_LAYERS = 16
+MAX_CANVAS_CODE_CHARS = 24_000
 IDENTIFIER = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
@@ -117,21 +125,34 @@ def schedule(source, scene, layer):
     return start, settled, end
 
 
+_ITEM_BOUNDS = {
+    "bar-chart": (1, 8),
+    "flow": (2, 6),
+    "meter": (1, 4),
+    "counter": (1, 1),
+    "checklist": (2, 8),
+    "comparison": (2, 8),
+    "card": (0, 6),
+}
+
+
 def _items(value, kind):
     if not isinstance(value, list):
         raise LayerError("Items must be a list.")
-    bounds = {"bar-chart": (1, 6), "flow": (2, 5)}.get(kind, (0, 0))
+    bounds = _ITEM_BOUNDS.get(kind, (0, 0))
     if not bounds[0] <= len(value) <= bounds[1]:
         raise LayerError(f"The {kind} layer needs {bounds[0]} to {bounds[1]} items.")
     checked = []
     for raw in value:
         _fields(raw, LAYER_SCHEMA["properties"]["items"]["items"], "Chart or diagram item")
-        label = _text(raw["label"], "Item label", 48, True)
+        label = _text(raw["label"], "Item label", 72, True)
         number = raw["value"]
         if type(number) not in (int, float) or not -1e12 <= number <= 1e12:
             raise LayerError("Chart values must be finite numbers within ±1 trillion.")
-        if kind == "flow" and number != 0:
-            raise LayerError("Flow items carry labels only and need a neutral value of zero.")
+        if kind in ("flow", "card") and number != 0:
+            raise LayerError(f"{kind.capitalize()} items carry labels only and need a neutral value of zero.")
+        if kind in ("checklist", "comparison") and number not in (-1, 0, 1):
+            raise LayerError(f"{kind.capitalize()} item values must be -1, 0, or 1.")
         checked.append({"label": label, "value": number})
     return checked
 
@@ -142,7 +163,10 @@ def _validate_layer(source, scene, layer):
     kind = layer["kind"]
     if kind not in KINDS:
         raise LayerError(f"Unsupported layer kind {kind!r}.")
-    text = _text(layer["text"], "Layer text", 220, kind == "text")
+    text_required = kind in ("text", "callout")
+    text = _text(layer["text"], "Layer text", 260, text_required)
+    if kind in BFG_SUBJECTS and text not in BFG_SUBJECTS[kind]:
+        raise LayerError(f"Choose a BFG {kind} from {', '.join(BFG_SUBJECTS[kind])}.")
     art_id = _text(layer["artId"], "Artwork ID", 64)
     brief = _text(layer["artBrief"], "Artwork brief", 380)
     unit = _text(layer["unit"], "Chart unit", 24)
@@ -152,8 +176,10 @@ def _validate_layer(source, scene, layer):
             raise LayerError("Use a separate text layer to label artwork.")
     elif art_id or brief:
         raise LayerError("Only an artwork layer can specify an artwork ID or brief.")
-    if unit and kind != "bar-chart":
-        raise LayerError("Only a bar chart can specify a unit.")
+    if unit and kind not in ("bar-chart", "meter", "counter"):
+        raise LayerError("Only a bar-chart, meter, or counter can specify a unit.")
+    if kind == "card" and not text and not layer["items"]:
+        raise LayerError("A card layer needs a heading or bullet items.")
     enter = layer["enter"]
     leave = layer["leave"]
     _fields(enter, LAYER_SCHEMA["properties"]["enter"], "Entrance")
@@ -162,7 +188,7 @@ def _validate_layer(source, scene, layer):
     if effect not in EFFECTS:
         raise LayerError(f"Unsupported layer entrance {effect!r}.")
     if type(duration) not in (int, float) or not (duration == 0 if effect == "show" else 0 < duration <= 3):
-        raise LayerError("Show needs zero duration. Fade, rise and wipe need more than zero and at most 3 seconds.")
+        raise LayerError("Show needs zero duration. Animated entrances need more than zero and at most 3 seconds.")
     result = {
         **layer, "box": _box(layer["box"]), "text": text, "artId": art_id, "artBrief": brief,
         "items": _items(layer["items"], kind), "unit": unit, "enter": dict(enter), "leave": dict(leave),
@@ -179,8 +205,8 @@ def validate_layers(project, scene):
         if layers:
             raise LayerError("Choose the layered layout to add independent layers.")
         return []
-    if scene["motion"] != "still" or scene.get("artId") or scene.get("artBrief"):
-        raise LayerError("A layered scene uses still scene motion and assigns artwork within layers.")
+    if scene.get("artId") or scene.get("artBrief"):
+        raise LayerError("A layered scene assigns artwork within layers rather than at the scene level.")
     if not 1 <= len(layers) <= MAX_LAYERS:
         raise LayerError(f"A layered scene needs 1 to {MAX_LAYERS} layers.")
     checked = []

@@ -136,9 +136,9 @@ class RendererTests(unittest.TestCase):
                 size = int.from_bytes(data[cursor:cursor + 4], "big")
                 self.assertGreaterEqual(size, 8)
                 if data[cursor + 4:cursor + 8] == b"mdat":
-                    start = cursor + size // 2
-                    end = min(cursor + size, start + 4000)
-                    data[start:end] = bytes(end - start)
+                    # An impossible H.264 NAL length breaks the first video sample on every encoder.
+                    self.assertGreater(size, 12)
+                    data[cursor + 8:cursor + 12] = b"\xff" * 4
                     break
                 cursor += size
             else:

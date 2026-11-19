@@ -19,8 +19,8 @@ FORMATS = {".mp3": "mp3", ".flac": "flac", ".wav": "wav"}
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 TRANSCRIPTION_INPUT_LIMIT = 25_000_000
 TRANSCRIPTION_RESPONSE_LIMIT = 512 * 1024
-MAX_CUES = 240
-MAX_TRANSCRIPT_LENGTH = 100_000
+MAX_CUES = 1200
+MAX_TRANSCRIPT_LENGTH = 250_000
 
 
 class AudioError(ValueError):

@@ -41,8 +41,10 @@ def _word_spans(words, duration):
             _finite_number(start) and _finite_number(end)
             and 0 <= start < duration and previous_start < start
             and start < end <= duration + END_TOLERANCE
-        ) or str(word.get("end_basis", "")).startswith("estimated"):
+        ):
             raise TimingError(f"Word {index} has unordered times or extends past the recording.")
+        if str(word.get("end_basis", "")).startswith("estimated"):
+            raise TimingError(f"Word {index} has an estimated end time. Re-align this recording before importing the cues.")
         previous_start = start
         end = min(end, duration)
         script_length += len(text) + int(index > 1)
