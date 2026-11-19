@@ -22,8 +22,9 @@ def notices(package, destination):
     ]
 
 
+bundle_data = runpy.run_path(str(packaging / "bundle_resources.py"))["bundle_data"]
 data = [
-    (str(project / "bacchus" / "resources"), "bacchus/resources"),
+    *bundle_data(project),
     (str(project / "LICENSE"), "licenses/Bacchus"),
     (str(project / "bacchus" / "resources" / "engine" / "FONTS-OFL.txt"), "licenses/Fonts"),
     (str(project / "bacchus" / "resources" / "engine" / "OFL-BebasNeue.txt"), "licenses/Fonts"),

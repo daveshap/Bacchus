@@ -13,8 +13,11 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import RESOURCES, audio, layer_spec, local_timing, media_tools, planning, providers, render, score, style_archive, styles, timing_models, visual_review
 from .library import LibraryError
+from .folder_picker import choose_folder
 from .runtime import APP_VERSION
 from .settings import SettingsError, directory_preference, provider_secrets, timing_model_directory
+from .storage_paths import StoragePathError, writable_path
+from .workspace import WorkspaceError, WorkspaceLocation
 from .workflow import (
     MAX_ART_BYTES, MAX_ART_GENERATIONS, MAX_AUDIO_BYTES, MAX_DURATION, MAX_EFFECTS,
     MAX_FX_BYTES, MAX_FX_DURATION, MAX_TRANSCRIPTIONS, PACK_PIN, STYLES, WorkflowError, fields,
@@ -67,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
         except (WorkflowError, LibraryError, SettingsError, styles.StyleError, timing_models.TimingModelError,
                 style_archive.ArchiveError) as error:
             self._json({"error": str(error)}, error.status)
+        except (StoragePathError, WorkspaceError) as error:
+            self._json({"error": str(error)}, 409)
         except render.RenderError as error:
             self._json({"error": str(error)}, 422)
         except ConnectionError:
@@ -205,6 +210,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/quit":
             fields(self._body(), ())
             self._quit()
+            return
+        if path == "/api/workspace":
+            data = self._body()
+            fields(data, ("directory",))
+            with self.server.workspace_lock:
+                self.server.workspace.choose(data["directory"])
+            self._json(self._settings_view(self.server.settings.get()))
+            return
+        if path == "/api/workspace/browse":
+            fields(self._body(), ())
+            if not self.server.picker_lock.acquire(blocking=False):
+                raise WorkspaceError("A workspace folder chooser is already open.")
+            try:
+                directory = choose_folder(self.server.workspace.active)
+            finally:
+                self.server.picker_lock.release()
+            self._json({"directory": directory})
             return
         if path == "/api/media-tools/install":
             fields(self._body(), ())
@@ -388,6 +410,7 @@ class Handler(BaseHTTPRequestHandler):
         render_available = render.render_available()
         return {
             **settings,
+            "workspace": self.server.workspace.view(),
             "dataPath": str(self.server.studio.root),
             "libraryPath": str(self.server.studio.library_root),
             "libraryMigrationError": self.server.studio.library_migration_error,
@@ -426,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise WorkflowError("Bacchus is closing.", 409)
             self.server.active_archive_transfers += 1
         try:
-            with TemporaryDirectory(prefix=".style-transfer-", dir=studio.root) as folder:
+            with TemporaryDirectory(prefix=".style-transfer-", dir=writable_path(studio.root)) as folder:
                 yield Path(folder)
         finally:
             with studio.lock:
@@ -525,9 +548,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class StudioServer(ThreadingHTTPServer):
-    def __init__(self, port, studio, settings):
+    def __init__(self, port, studio, settings, workspace=None):
         self.studio = studio
         self.settings = settings
+        self.workspace = workspace if workspace is not None else WorkspaceLocation(studio.root)
+        self.workspace_lock = threading.Lock()
+        self.picker_lock = threading.Lock()
         self.closing = False
         self.active_archive_transfers = 0
         self.instance_id = uuid.uuid4().hex

@@ -9,6 +9,7 @@ from tempfile import NamedTemporaryFile
 from threading import RLock
 
 from . import api_log
+from .storage_paths import StoragePathError, writable_path
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
@@ -82,6 +83,11 @@ def directory_preference(field, value, secrets):
             len(value) <= 2048 and not any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in value)
             and not any(secret and secret in value for secret in secrets) and Path(value).is_absolute()
         ):
+            if field == "apiLogDirectory":
+                try:
+                    return str(writable_path(value))
+                except StoragePathError as error:
+                    raise SettingsError(str(error)) from error
             return str(Path(value))
     raise SettingsError(f"Enter an absolute folder path for {label}, or leave it empty to use the default.")
 
@@ -262,6 +268,7 @@ class Settings:
     def _write(self, preferences):
         temporary = None
         try:
+            writable_path(self.path)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent, delete=False) as handle:
                 temporary = Path(handle.name)

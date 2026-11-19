@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from PIL import Image
 
+from .storage_paths import writable_path
 
 ASSET_ID = re.compile(r"[a-f0-9]{32}")
 CONTENT_HASH = re.compile(r"[a-f0-9]{64}")
@@ -31,6 +32,7 @@ class LibraryError(Exception):
 
 
 def _atomic_write(path, data):
+    path = writable_path(path)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         with temporary.open("xb") as destination:
@@ -56,13 +58,16 @@ def _proofs_valid(proofs):
 class Library:
     """Store one metadata document per artwork and one immutable PNG per digest."""
 
-    def __init__(self, root: Path):
-        self.root = Path(root).resolve()
+    def __init__(self, root: Path, *, read_only=False):
+        self.root = Path(root).resolve() if read_only else writable_path(root)
         self._lock = RLock()
+        self._read_only = read_only
+        if read_only:
+            return
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            self._safe_path("entries").mkdir(exist_ok=True)
-            self._safe_path("blobs").mkdir(exist_ok=True)
+            writable_path(self._safe_path("entries")).mkdir(exist_ok=True)
+            writable_path(self._safe_path("blobs")).mkdir(exist_ok=True)
         except OSError as error:
             raise LibraryError("The artwork library folder could not be opened.", 500) from error
 
@@ -75,9 +80,11 @@ class Library:
     @contextmanager
     def _exclusive(self):
         # Separate Bacchus processes may point at the same library folder.
+        if self._read_only:
+            raise LibraryError("This artwork library was opened for import only.", 409)
         with self._lock:
             try:
-                with self._safe_path(".library.lock").open("a+b") as lock:
+                with writable_path(self._safe_path(".library.lock")).open("a+b") as lock:
                     lock.seek(0)
                     if sys.platform == "win32":
                         import msvcrt
@@ -404,10 +411,10 @@ class Library:
                 raise LibraryError("Only damaged artwork metadata can be quarantined.", 409)
             if not source.is_file() or source.is_symlink():
                 raise LibraryError("Bacchus could not safely move this artwork metadata.", 409)
-            folder = self._safe_path("quarantine")
+            folder = writable_path(self._safe_path("quarantine"))
             folder.mkdir(exist_ok=True)
             destination = self._safe_path("quarantine", f"{asset_id}-{uuid4().hex}.json")
-            source.replace(destination)
+            writable_path(source).replace(writable_path(destination))
             return {"id": asset_id, "retainedPath": str(destination)}
 
     def get(self, asset_id, version: int) -> dict:

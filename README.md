@@ -2,6 +2,8 @@
 
 Bacchus turns an MP3, FLAC, or WAV into a 4K60 MP4 with animated graphics, voiceover, music and sound effects selected by the project's style. It also delivers timed SRT captions and a receipt. Version 0.8 uses the BFG Canvas runtime for composition, Chromium for frame capture and FFmpeg for mastering and delivery.
 
+**Windows x64** · [Download the 0.8.1 installer](https://github.com/daveshap/Bacchus/raw/refs/heads/main/releases/0.8.1/Bacchus-0.8.1-windows-x64.msi) · [SHA-256 checksum](releases/0.8.1/Bacchus-0.8.1-windows-x64.sha256)
+
 ## Produce one video
 
 In **New project**, choose a style, optionally enter a brief, and attach the recording. **Auto mode** is selected for new projects. Creating an Auto project with a recording starts the run. To import an existing cue sheet or adjust settings first, create the project without attaching audio, add the recording in **Intake**, then select **Run Auto**. Chrome, Edge or Chromium, FFmpeg/ffprobe, a verified timing model or recording-matched cues, and a configured review provider are required. Artwork generation uses the optional image provider when the library cannot supply the planned asset.
@@ -14,9 +16,9 @@ Disable **Auto mode** to use **Manual gates**. You control the brief, artwork, s
 
 ## Install Bacchus on Windows x64
 
-Download the [Bacchus 0.8.0 Windows installer](releases/0.8.0/Bacchus-0.8.0-windows-x64.msi) and its [SHA-256 checksum](releases/0.8.0/Bacchus-0.8.0-windows-x64.sha256). This unsigned preview includes Python and the app's runtime dependencies.
+The unsigned MSI includes the studio, its fonts, the BFG drawing engine, Python and its libraries. Install it and open **Bacchus** from the Start menu. Git and a source checkout are optional developer tools. Video rendering uses an installed Edge, Chrome or Chromium browser.
 
-1. Compare the MSI's SHA-256 with the checksum file using `Get-FileHash -Algorithm SHA256 .\Bacchus-0.8.0-windows-x64.msi` in PowerShell. Run the MSI, then open **Bacchus** from the Start menu. The app opens **Set up Bacchus** in your default browser on first launch.
+1. To verify the download, compare the MSI's SHA-256 with the checksum file using `Get-FileHash -Algorithm SHA256 .\Bacchus-0.8.1-windows-x64.msi` in PowerShell. The app opens **Set up Bacchus** in your default browser on first launch. Keep the suggested workspace to start immediately, or choose another folder and reopen Bacchus before creating projects there.
 2. Under **Readiness**, choose **Install media tools** if the app reports that its media tools are unavailable. Bacchus downloads and verifies FFmpeg and ffprobe in its own data folder.
 3. For local word cues, choose **Install timing model**. The English Parakeet download is about 460 MiB and needs about 1.1 GiB of free space during installation. To reuse a supported model, expand **Use an existing model folder**, enter its path, and select **Verify and use folder**. You can also import a recording-matched cue sheet in Intake.
 4. Select **Finish setup** to save provider settings, or **Continue offline**. The offline workflow uses the media tools and either a verified local model or a recording-matched cue sheet. In the studio, **Create example** opens a sample with an approved plan so you can try preview, review, and export without a recording or API key.
@@ -28,9 +30,11 @@ The checked-in installer targets Windows x64. The [native release workflow](.git
 
 ## Storage
 
-Bacchus stores projects, settings, managed models, style guides, reference images, and artwork libraries in `%LOCALAPPDATA%\Bacchus` on Windows, `~/Library/Application Support/Bacchus` on macOS, or `$XDG_DATA_HOME/bacchus` on Linux (default `~/.local/share/bacchus`). **Settings** shows the data and library paths. The Windows MSI installs program files in `%LOCALAPPDATA%\Programs\Bacchus`.
+Bacchus stores projects, studio settings, managed models, style guides, reference images and artwork libraries in the active workspace. The default is `%LOCALAPPDATA%\Bacchus` on Windows, `~/Library/Application Support/Bacchus` on macOS, or `$XDG_DATA_HOME/bacchus` on Linux (default `~/.local/share/bacchus`). The Windows MSI installs program files separately in `%LOCALAPPDATA%\Programs\Bacchus`.
 
-To back up Bacchus, quit the app and copy its data folder. To restore a backup, copy its contents into an empty data folder with Bacchus closed. The application supports `--data <folder>` for a different storage location, such as an external drive.
+In **Settings → Project workspace**, browse to a folder or enter its full path, select **Save workspace**, then quit and reopen Bacchus from the Start menu. The app remembers that location. Existing projects and styles stay together in their original workspace. To move them, quit Bacchus and copy the entire workspace to the chosen destination. The optional `--data <folder>` launch argument overrides the saved choice for one session.
+
+Git checkouts, including linked worktrees, and the installed program directory are protected from project and log writes. API logs and audio/Chromium scratch use system temporary storage by default. Render and mix staging use the workspace drive so completed deliveries can be published together.
 
 ## Styles and project kickoff
 

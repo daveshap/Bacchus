@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
+from .storage_paths import StoragePathError, writable_path
+
 
 MODEL_NAME = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
 MODEL_LABEL = "Parakeet TDT 0.6B v2 (English)"
@@ -230,7 +232,7 @@ class TimingModels:
     def _install(self):
         error = "Bacchus could not finish installing Parakeet. Check the drive and retry."
         try:
-            target = self._managed_directory()
+            target = writable_path(self._managed_directory())
             target.parent.mkdir(parents=True, exist_ok=True)
             if disk_usage(target.parent).free < ARCHIVE_BYTES + sum(MANAGED_SIZES):
                 raise TimingModelError("Free about 1.1 GB in the Bacchus data drive before installing Parakeet.")
@@ -245,7 +247,7 @@ class TimingModels:
                 _extract(archive, staged)
                 self._publish(staged, self._managed_directory())
             error = None
-        except TimingModelError as failure:
+        except (StoragePathError, TimingModelError) as failure:
             error = str(failure)
         except (OSError, ValueError, tarfile.TarError):
             pass
@@ -257,6 +259,7 @@ class TimingModels:
 
     @staticmethod
     def _publish(staged, target):
+        target = writable_path(target)
         previous = None
         if target.exists():
             try:

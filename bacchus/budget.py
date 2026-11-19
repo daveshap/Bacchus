@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import sqlite3
 
+from .storage_paths import writable_path
+
 
 class BudgetError(ValueError):
     pass
@@ -78,7 +80,9 @@ def _path(folder):
 
 @contextmanager
 def _ledger(folder):
-    path = _path(folder)
+    path = writable_path(_path(folder))
+    for suffix in ("-journal", "-wal", "-shm"):
+        writable_path(path.with_name(path.name + suffix))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(path, timeout=10)) as db, db:

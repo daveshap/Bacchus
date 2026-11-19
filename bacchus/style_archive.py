@@ -16,6 +16,7 @@ import zlib
 from PIL import Image
 
 from . import library, styles
+from .storage_paths import writable_path
 
 
 FORMAT = "bacchus-style"
@@ -246,7 +247,7 @@ def export_style(studio, style_id, destination: Path):
         raw_manifest = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         if len(raw_manifest) > MAX_MANIFEST_BYTES:
             raise ArchiveError("This style archive has too much metadata.", 413)
-        destination = Path(destination)
+        destination = writable_path(destination)
         with TemporaryDirectory(prefix=".bacchus-style-export-", dir=destination.parent) as temporary:
             output = Path(temporary) / "style.zip"
             with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=3, allowZip64=False) as archive:
@@ -400,9 +401,11 @@ def _publish_import(studio, stage, style_id, refs):
         if (not library_root.is_relative_to(studio.root) or final_library.resolve() != library_root / style_id
                 or not final_style.resolve().is_relative_to(studio.root)):
             raise ArchiveError("Imported style data must stay inside Bacchus's data folder.", 409)
+        writable_path(final_library)
+        writable_path(final_style)
         if final_library.exists() or final_style.exists():
             raise ArchiveError("Another style already uses the generated storage ID. Try importing again.", 409)
-        library_root.mkdir(exist_ok=True)
+        writable_path(library_root).mkdir(exist_ok=True)
         pending = []
         for digest, path in refs.items():
             target = studio.styles._path("references", f"{digest}.png")
@@ -412,7 +415,7 @@ def _publish_import(studio, stage, style_id, refs):
                 except ArchiveError as error:
                     raise ArchiveError("A shared style reference is damaged. Repair it before importing this archive.", 409) from error
             else:
-                pending.append((path, target))
+                pending.append((path, writable_path(target)))
         installed = []
         staged_library = stage / "library"
         try:
@@ -433,7 +436,7 @@ def import_style(studio, source: Path):
     """Validate an entire ZIP before making its new local style visible."""
     style_id = uuid4().hex
     try:
-        with TemporaryDirectory(prefix=".bacchus-style-import-", dir=studio.root) as path:
+        with TemporaryDirectory(prefix=".bacchus-style-import-", dir=writable_path(studio.root)) as path:
             stage = Path(path)
             try:
                 current, refs = _parse_zip(studio, Path(source), stage, style_id)

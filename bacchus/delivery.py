@@ -7,6 +7,8 @@ import re
 import shutil
 import stat
 
+from .storage_paths import StoragePathError, writable_path
+
 
 FILES = {
     "video": (".mp4", "video/mp4"),
@@ -40,9 +42,10 @@ def _ordinary_tree(root, device):
     while pending:
         path = pending.pop()
         info = _plain_stat(path)
-        if info is None or info.st_dev != device:
+        if info is None or info.st_dev != device or path.name.casefold() == ".git":
             return False
         if stat.S_ISDIR(info.st_mode):
+            writable_path(path)
             pending.extend(path.iterdir())
         elif not stat.S_ISREG(info.st_mode):
             return False
@@ -53,6 +56,7 @@ def remove_abandoned_staging(data_root, folder):
     """Discard interrupted render scratch while startup owns the data instance lock."""
     exports = folder / "exports"
     try:
+        writable_path(exports)
         if folder.parent != data_root or folder.resolve(strict=True) != folder or exports.resolve(strict=True) != exports:
             return
         project_info = _plain_stat(folder / "project.json")
@@ -64,7 +68,7 @@ def remove_abandoned_staging(data_root, folder):
                 or exports_info.st_dev != folder_info.st_dev):
             return
         entries = tuple(exports.iterdir())
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, StoragePathError):
         return
 
     for entry in entries:
@@ -77,7 +81,7 @@ def remove_abandoned_staging(data_root, folder):
             target = entry.resolve(strict=True)
             if target == entry and target.parent == exports and _ordinary_tree(target, exports_info.st_dev):
                 shutil.rmtree(target)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, StoragePathError):
             # A locked or inaccessible entry can be retried next time Bacchus starts.
             continue
 

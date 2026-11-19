@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 import wave
 
 from . import media_tools
+from .storage_paths import writable_path
 
 SAMPLE_RATE = 48_000
 CHANNELS = 2
@@ -364,6 +365,7 @@ def prepare_mix(project, folder, destination, frame_count, fps):
             "integratedLufs": voice_levels["integratedLufs"], "truePeakDbtp": voice_levels["truePeakDbtp"],
         }
     options = _sound_options(project, folder, samples, voice_gain)
+    destination = writable_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".bacchus-mix-", dir=destination.parent) as work:
         work = Path(work)

@@ -13,6 +13,8 @@ import sys
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4, uuid5
 
+from bundle_resources import verify_bundled_resources
+
 
 UPGRADE_CODE = UUID("8e3e6d31-68ca-45d1-9f52-2b6db07cbb6d")
 PRODUCT = "Bacchus"
@@ -203,6 +205,10 @@ def check_bundle(bundle):
         raise BuildError("The bundle must contain Bacchus.exe.") from error
     if machine != b"PE\x00\x00\x64\x86":
         raise BuildError("The MSI requires an x64 Windows Bacchus executable.")
+    try:
+        verify_bundled_resources(bundle / "_internal" / "bacchus" / "resources")
+    except ValueError as error:
+        raise BuildError(str(error)) from error
 
 
 def bundle_tables(bundle, version, cabinet, staging):

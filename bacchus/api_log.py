@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 import re
 import stat
-from tempfile import NamedTemporaryFile, gettempdir
+from tempfile import NamedTemporaryFile
 from uuid import uuid4
+
+from .storage_paths import StoragePathError, scratch_directory as gettempdir, writable_path
 
 
 _SCOPE = ContextVar("bacchus_api_scope", default=None)
@@ -63,16 +65,17 @@ def _timestamp():
 
 
 def _root(directory):
-    value = Path(directory).expanduser().absolute()
+    value = writable_path(directory)
     value.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.name != "nt" and value == default_directory().absolute():
-        details = value.lstat()
+    if os.name != "nt" and Path(directory) == default_directory():
+        details = Path(directory).lstat()
         if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid() or details.st_mode & 0o077:
             raise ApiLogError("Choose a private folder for API logs. The default folder is not private.")
     return value
 
 
 def _write(path, data):
+    path = writable_path(path)
     temporary = None
     try:
         with NamedTemporaryFile(dir=path.parent, prefix=".api-log-", delete=False) as handle:
@@ -121,6 +124,8 @@ class Call:
                 **self._record, "state": "completed" if successful else "failed",
                 "finishedAt": _timestamp(), "response": response,
             })
+        except StoragePathError as failure:
+            raise ApiLogError(str(failure)) from failure
         except OSError as failure:
             raise ApiLogError("Bacchus could not finish the provider audit log.") from failure
 
@@ -149,6 +154,8 @@ def start(directory: Path, provider: str, url: str, request_body: bytes, content
         _metadata(path / "metadata.json", record)
         record["request"].update(_body_file(path / "request.body", request_body, patterns))
         _metadata(path / "metadata.json", record)
+    except StoragePathError as failure:
+        raise ApiLogError(str(failure)) from failure
     except OSError as failure:
         raise ApiLogError("Bacchus could not start the provider audit log.") from failure
     return Call(path, record, patterns)

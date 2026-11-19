@@ -17,6 +17,7 @@ from . import ENGINE_VERSION, api_log, audio, budget, captions, chart_evidence, 
 from . import auto_review
 from .library import Library, LibraryError
 from .settings import timing_model_directory, video_encoder_mode
+from .storage_paths import StoragePathError, writable_path
 
 
 MAX_ART_BYTES = 12 * 1024 * 1024
@@ -77,6 +78,7 @@ def file_digest(path):
 
 
 def write_file(path, data):
+    path = writable_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -476,7 +478,7 @@ def subtitles(project):
 
 class Studio:
     def __init__(self, root, library_root=None):
-        self.root = Path(root).resolve()
+        self.root = writable_path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self._caption_cache = OrderedDict()
@@ -535,8 +537,8 @@ class Studio:
         marker = self.library_root / f".legacy-{digest(str(source).encode('utf-8'))}.json"
         if marker.is_file() or source.is_relative_to(self.library_root):
             return
-        Library(source).copy_by_style({style_id: self.library_for(style_id) for style_id in STYLES})
-        write_json(marker, {"source": str(source), "copiedAt": now()})
+        Library(source, read_only=True).copy_by_style({style_id: self.library_for(style_id) for style_id in STYLES})
+        write_json(marker, {"copiedAt": now()})
 
     def style_view(self, style, *, include_count=True):
         view = {**style, "referenceImages": [{**ref, "url": f"/api/style-references/{ref['sha256']}"}
@@ -628,7 +630,10 @@ class Studio:
     def _folder(self, project_id):
         if not PROJECT_ID.fullmatch(project_id):
             raise WorkflowError("Project not found.", 404)
-        return self.root / project_id
+        folder = self.root / project_id
+        if writable_path(folder) != folder:
+            raise WorkflowError("The project folder must stay in the selected Bacchus workspace.", 409)
+        return folder
 
     def _read(self, project_id):
         try:
@@ -670,6 +675,8 @@ class Studio:
             project.setdefault("autoLimits", {})
             project.setdefault("autoBrief", "")
             return project
+        except StoragePathError as error:
+            raise WorkflowError(str(error), 409) from error
         except FileNotFoundError as error:
             raise WorkflowError("Project not found.", 404) from error
         except (OSError, ValueError) as error:
@@ -1070,8 +1077,10 @@ class Studio:
             if project["input"]:
                 raise WorkflowError("Unlock narration before changing the recording.", 409)
             folder = self._folder(project_id)
-            write_file(folder / "source-audio" / (original_hash + extension), raw)
-            write_file(folder / "audio" / f"{content_hash}.wav", normalized)
+            original_path = writable_path(folder / "source-audio" / (original_hash + extension))
+            normalized_path = writable_path(folder / "audio" / f"{content_hash}.wav")
+            write_file(original_path, raw)
+            write_file(normalized_path, normalized)
             project["audio"] = {"name": name, "hash": content_hash, "duration": duration,
                                 "originalHash": original_hash, "sourceExtension": extension}
             if project["transcript"] and project["transcript"].get("originalHash") != original_hash:
@@ -1275,8 +1284,8 @@ class Studio:
         staging = folder / "exports"
         committed = False
         try:
-            directory.mkdir(exist_ok=True)
-            staging.mkdir(exist_ok=True)
+            writable_path(directory).mkdir(exist_ok=True)
+            writable_path(staging).mkdir(exist_ok=True)
             composed_music = None
             with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=staging) as work:
                 if compose:
@@ -1285,7 +1294,7 @@ class Studio:
                     content_hash = file_digest(track_path)
                     if not content_hash:
                         raise WorkflowError("The composed score could not be saved.", 422)
-                    target = folder / "audio" / f"{content_hash}.wav"
+                    target = writable_path(folder / "audio" / f"{content_hash}.wav")
                     target.parent.mkdir(exist_ok=True)
                     if file_digest(target) != content_hash:
                         track_path.replace(target)
@@ -1303,7 +1312,7 @@ class Studio:
                     snapshot["audio"] and file_digest(folder / "audio" / f"{snapshot['audio']['hash']}.wav") != snapshot["audio"]["hash"]
                 ):
                     raise WorkflowError("An audio source changed during preparation.", 409)
-                output = directory / f"{result['sha256']}.wav"
+                output = writable_path(directory / f"{result['sha256']}.wav")
                 if file_digest(output) != result["sha256"]:
                     temporary.replace(output)
             result["recipeHash"] = key
@@ -2658,8 +2667,8 @@ class Studio:
         if need_mix:
             mix_dir = folder / "mixes"
             staging = folder / "exports"
-            mix_dir.mkdir(exist_ok=True)
-            staging.mkdir(exist_ok=True)
+            writable_path(mix_dir).mkdir(exist_ok=True)
+            writable_path(staging).mkdir(exist_ok=True)
             composed_music = None
             with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=staging) as work:
                 if compose:
@@ -2668,7 +2677,7 @@ class Studio:
                     score_hash = file_digest(score_path)
                     if not score_hash:
                         raise WorkflowError("The composed score could not be saved.", 422)
-                    target = folder / "audio" / f"{score_hash}.wav"
+                    target = writable_path(folder / "audio" / f"{score_hash}.wav")
                     target.parent.mkdir(exist_ok=True)
                     if file_digest(target) != score_hash:
                         score_path.replace(target)
@@ -2683,7 +2692,7 @@ class Studio:
                 key = mix_key(mix_snapshot, recipe)
                 temp_mix = Path(work) / "mix.wav"
                 mix_result = render.export_mix(mix_snapshot, folder, temp_mix)
-                out_mix = mix_dir / f"{mix_result['sha256']}.wav"
+                out_mix = writable_path(mix_dir / f"{mix_result['sha256']}.wav")
                 if file_digest(out_mix) != mix_result["sha256"]:
                     temp_mix.replace(out_mix)
             mix_result["recipeHash"] = key
@@ -2810,9 +2819,9 @@ class Studio:
             destination = directory / f"{key}.mp4"
             self.motion_jobs.add(project_id)
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            writable_path(directory).mkdir(parents=True, exist_ok=True)
             staging = folder / "exports"
-            staging.mkdir(exist_ok=True)
+            writable_path(staging).mkdir(exist_ok=True)
             with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=staging) as work:
                 clip = Path(work) / "preview.mp4"
                 result = render.export_motion_preview(project, folder, clip, start, min(end, source["duration"]),
@@ -2821,7 +2830,7 @@ class Studio:
                     current = self._edit(project_id, data["revision"])
                     if self._require_prepared(current, folder) != record:
                         raise WorkflowError("The candidate changed. Prepare a preview of the current cut.", 409)
-                    clip.replace(destination)
+                    clip.replace(writable_path(destination))
             return {**result, "url": f"/api/projects/{project_id}/motion-preview/{key}"}
         finally:
             with self.lock:
@@ -2829,6 +2838,7 @@ class Studio:
                 try:
                     files = sorted(directory.glob("*.mp4"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
                     for previous in files[MAX_MOTION_PREVIEWS:]:
+                        writable_path(previous)
                         previous.unlink(missing_ok=True)
                 except OSError:
                     pass
@@ -2885,7 +2895,7 @@ class Studio:
     def _build_delivery_bundle(self, snapshot, folder, key, record, encoder_mode, delivery_id, caption_data, execution_mode):
         output_dir = folder / "exports"
         caption_text, caption_review = caption_data
-        output_dir.mkdir(exist_ok=True)
+        writable_path(output_dir).mkdir(exist_ok=True)
         with TemporaryDirectory(prefix=delivery.STAGING_PREFIX, dir=output_dir) as work:
             bundle = Path(work) / "bundle"
             bundle.mkdir()
@@ -2939,7 +2949,7 @@ class Studio:
                     receipt["independentChecks"] = current["autoRun"]["checks"]
             write_json(paths["receipt"], receipt)
             hashes["receipt"] = delivery.file_hash(paths["receipt"])
-            bundle.rename(output_dir / delivery_id)
+            bundle.rename(writable_path(output_dir / delivery_id))
             result = {"status": "complete", "media": details, "fileHashes": hashes}
             if caption_review is not None:
                 result["captionReview"] = caption_review
@@ -2951,7 +2961,7 @@ class Studio:
             result.update(self._build_delivery_bundle(
                 snapshot, folder, key, record, encoder_mode, delivery_id, caption_data, "manual",
             ))
-        except (WorkflowError, render.RenderError) as error:
+        except (WorkflowError, render.RenderError, StoragePathError) as error:
             result.update(status="failed", error=str(error))
         except Exception:
             result.update(status="failed", error="Bacchus could not finish writing the export.")

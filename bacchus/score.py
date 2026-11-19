@@ -8,6 +8,8 @@ import wave
 
 import numpy as np
 
+from .storage_paths import writable_path
+
 
 SAMPLE_RATE = 48_000
 CHANNELS = 2
@@ -262,7 +264,7 @@ def write_arrangement(destination, plan):
     if not starts or starts[0] != 0 or any(end <= start for start, end in zip(starts, [*starts[1:], frames])):
         raise ValueError("The original score sections must grow across the complete film.")
     measure_frames = round(SAMPLE_RATE * 4 * 60 / settings[0])
-    with destination.open("xb") as file, wave.open(file, "wb") as track:
+    with writable_path(destination).open("xb") as file, wave.open(file, "wb") as track:
         track.setparams((CHANNELS, 2, SAMPLE_RATE, frames, "NONE", "not compressed"))
         for index, section in enumerate(sections):
             section_frames = (starts[index + 1] if index + 1 < len(starts) else frames) - starts[index]

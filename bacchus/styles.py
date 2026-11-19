@@ -17,6 +17,7 @@ from PIL import Image, ImageOps
 from . import api_log, providers
 from .library import _atomic_write
 from .settings import DEFAULT_CLAUDE_MODEL, provider_value
+from .storage_paths import writable_path
 
 
 PRESETS = ("warm-editorial", "studio-ink", "night-signal")
@@ -122,12 +123,12 @@ class StyleCatalog:
     """Store every saved style revision without changing previously pinned revisions."""
 
     def __init__(self, data_root):
-        self.root = (Path(data_root) / "styles").resolve()
+        self.root = writable_path(Path(data_root) / "styles")
         self._lock = RLock()
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            self._path("snapshots").mkdir(exist_ok=True)
-            self._path("references").mkdir(exist_ok=True)
+            writable_path(self._path("snapshots")).mkdir(exist_ok=True)
+            writable_path(self._path("references")).mkdir(exist_ok=True)
             with self._exclusive():
                 for style_id, defaults in BUILT_INS.items():
                     if not self._path("snapshots", style_id, "1.json").exists():
@@ -147,7 +148,7 @@ class StyleCatalog:
     def _exclusive(self):
         with self._lock:
             try:
-                with self._path(".style.lock").open("a+b") as lock:
+                with writable_path(self._path(".style.lock")).open("a+b") as lock:
                     lock.seek(0)
                     if sys.platform == "win32":
                         import msvcrt
@@ -199,7 +200,7 @@ class StyleCatalog:
         return result
 
     def _save(self, style_id, revision, spec, *, built_in):
-        folder = self._path("snapshots", style_id)
+        folder = writable_path(self._path("snapshots", style_id))
         folder.mkdir(exist_ok=True)
         path = self._path("snapshots", style_id, f"{revision}.json")
         if path.exists():

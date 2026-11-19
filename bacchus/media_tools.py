@@ -16,6 +16,8 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
+from .storage_paths import scratch_directory, writable_path
+
 
 WINDOWS_RELEASE = "9.0.2"
 WINDOWS_BUILD = f"ffmpeg-{WINDOWS_RELEASE}-essentials_build"
@@ -89,8 +91,10 @@ def can_install():
 
 def process_options():
     env = os.environ.copy()
-    for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+    for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "FFREPORT", "CHROME_LOG_FILE"):
         env.pop(key, None)
+    temporary = str(scratch_directory())
+    env.update(TMPDIR=temporary, TEMP=temporary, TMP=temporary)
     if sys.platform == "win32":
         return {"env": env, "creationflags": subprocess.CREATE_NO_WINDOW}
     if getattr(sys, "frozen", False):
@@ -152,14 +156,15 @@ def install():
     try:
         if available():
             return
-        _managed.parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="media-install-", dir=_managed.parent) as directory:
+        target = writable_path(_managed)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="media-install-", dir=target.parent) as directory:
             work = Path(directory)
             archive = work / "ffmpeg.zip"
             _download(archive)
             unpacked = work / "bin"
             _unpack(archive, unpacked)
-            unpacked.rename(_managed)
+            unpacked.rename(target)
     except (URLError, TimeoutError) as error:
         raise MediaToolsError("Bacchus could not download FFmpeg. Check your connection and try again.") from error
     except (OSError, KeyError, BadZipFile, subprocess.SubprocessError) as error:

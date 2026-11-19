@@ -18,6 +18,7 @@ from threading import Timer
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont, ImageOps, ImageStat
 
 from . import browser_cdp, canvas_engine, canvas_qc, layer_spec, media_tools, mixing, video_encoding
+from .storage_paths import writable_path
 
 # Measure layouts in one coordinate space and draw at the destination's pixel density.
 DESIGN_WIDTH, DESIGN_HEIGHT = 1280, 720
@@ -890,6 +891,7 @@ def export_video(project, folder: Path, destination: Path, *, approved_mix=None,
         raise RenderError("Video export needs FFmpeg and ffprobe, plus a Chromium browser for the BFG Canvas renderer.")
     composition = _Composition(project, folder)
     frame_count = _frame_count(composition.duration)
+    destination = writable_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     encoder, fallback = video_encoding.choose(encoder_mode, WIDTH, HEIGHT, FPS)
     with TemporaryDirectory(prefix=".bacchus-render-", dir=destination.parent) as work:
@@ -929,6 +931,7 @@ def export_motion_preview(project, folder: Path, destination: Path, start: float
     first = min(math.floor(start * FPS), _frame_count(composition.duration) - 1)
     last = min(frame_at_or_after(end), first + MAX_PREVIEW_SECONDS * FPS)
     count = max(1, last - first)
+    destination = writable_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".bacchus-render-", dir=destination.parent) as work:
         output, media = _encode_verified(

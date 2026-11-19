@@ -1,13 +1,16 @@
 """Start and verify a frozen Bacchus executable over localhost."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 from io import BytesIO
 import json
 import os
 from pathlib import Path
 from runpy import run_path
+import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import time
 from urllib.error import HTTPError
@@ -19,11 +22,8 @@ from zipfile import ZipFile
 from PIL import Image
 
 
-APP_VERSION = run_path(str(Path(__file__).resolve().parents[1] / "bacchus" / "runtime.py"))["APP_VERSION"]
-PROVIDER_SETTINGS = (
-    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "BACCHUS_PLANNER_PROVIDER", "BACCHUS_CLAUDE_MODEL",
-    "BACCHUS_USE_OPENAI_TRANSCRIPTION", "BACCHUS_USE_OPENAI_IMAGES",
-)
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+APP_VERSION = run_path(str(SOURCE_ROOT / "bacchus" / "runtime.py"))["APP_VERSION"]
 
 
 def request(url, path, data=None, *, content_type="image/png"):
@@ -398,23 +398,116 @@ def check_audit_directory(url, root):
         raise RuntimeError("The custom API audit folder did not persist.")
 
 
+def smoke_environment(root):
+    home = root / "test user"
+    local = home / "AppData" / "Local"
+    xdg = home / ".local" / "share"
+    temp = root / "temp"
+    temp.mkdir()
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("BACCHUS_") or key == "BACCHUS_CHROME"}
+    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "PYTHONHOME", "PYTHONPATH"):
+        env.pop(name, None)
+    env.update(HOME=str(home), USERPROFILE=str(home), LOCALAPPDATA=str(local),
+               APPDATA=str(home / "AppData" / "Roaming"), XDG_DATA_HOME=str(xdg),
+               XDG_CONFIG_HOME=str(home / ".config"), XDG_CACHE_HOME=str(home / ".cache"),
+               TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp))
+    search = [Path(item) for item in os.defpath.split(os.pathsep) if Path(item).is_absolute()]
+    if os.name == "nt":
+        windows = Path(os.environ["SystemRoot"])
+        search.extend((windows / "System32", windows))
+    for tool in ("ffmpeg", "ffprobe"):
+        if found := shutil.which(tool):
+            directory = Path(found).resolve().parent
+            if not directory.is_relative_to(SOURCE_ROOT):
+                search.append(directory)
+    env["PATH"] = os.pathsep.join(str(path) for path in dict.fromkeys(search))
+    if os.name == "nt":
+        return env, local / "Bacchus"
+    if sys.platform == "darwin":
+        return env, home / "Library" / "Application Support" / "Bacchus"
+    return env, xdg / "bacchus"
+
+
+@contextmanager
+def running(executable, env, cwd, workspace, *flags):
+    command = [str(executable), "--no-browser", "--port", "0", *flags]
+    process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        url = endpoint(workspace, process)
+        yield url
+        request(url, "/api/quit", {})
+        if process.wait(15) != 0:
+            raise RuntimeError("Bacchus returned a failure status after quitting.")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(10)
+
+
+def verify_workspace(settings, active, preferred, default, override=False):
+    info = settings["workspace"]
+    expected = {"active": active, "preferred": preferred, "systemDefault": default}
+    if info["override"] is not override or any(Path(info[key]) != value for key, value in expected.items()):
+        raise RuntimeError(f"Unexpected workspace settings: {info!r}. Expected {expected} with override={override}.")
+
+
+def check_storage(executable, env, cwd, root, default):
+    chosen = root / "Selected workspace"
+    override = root / "One-time workspace"
+    denied = cwd / "should stay absent"
+    with running(executable, env, cwd, default) as url:
+        settings = json.loads(request(url, "/api/settings"))
+        verify_workspace(settings, default, default, default)
+        for path, data in (("/api/workspace", {"directory": str(denied)}),
+                           ("/api/settings", {"apiLogDirectory": str(denied)})):
+            try:
+                request(url, path, data)
+            except HTTPError as error:
+                if not 400 <= error.code < 500:
+                    raise
+            else:
+                raise RuntimeError(f"The packaged app accepted a Git destination for {path}.")
+        after = json.loads(request(url, "/api/settings"))
+        if after["workspace"] != settings["workspace"] or after["apiLogPath"] != settings["apiLogPath"] or denied.exists():
+            raise RuntimeError("Rejecting a Git destination changed storage or preferences.")
+        verify_workspace(json.loads(request(url, "/api/workspace", {"directory": str(chosen)})),
+                         default, chosen, default)
+
+    refused = subprocess.run([str(executable), "--no-browser", "--data", str(denied)],
+                             cwd=cwd, env=env, capture_output=True, timeout=20)
+    if refused.returncode == 0 or denied.exists():
+        raise RuntimeError("Launching with a Git workspace did not refuse before writing.")
+
+    with running(executable, env, cwd, chosen) as url:
+        verify_workspace(json.loads(request(url, "/api/settings")), chosen, chosen, default)
+        example = json.loads(request(url, "/api/demo", {}))
+    with running(executable, env, cwd, override, "--data", str(override)) as url:
+        verify_workspace(json.loads(request(url, "/api/settings")), override, chosen, default, override=True)
+        if (override / example["id"]).exists():
+            raise RuntimeError("The one-launch override unexpectedly copied the project.")
+    with running(executable, env, cwd, chosen) as url:
+        verify_workspace(json.loads(request(url, "/api/settings")), chosen, chosen, default)
+        if json.loads(request(url, "/api/projects/" + example["id"]))["id"] != example["id"]:
+            raise RuntimeError("The saved workspace did not reopen its project.")
+        verify_workspace(json.loads(request(url, "/api/workspace", {"directory": ""})), chosen, default, default)
+    print("Verified workspace selection, reopening, one-launch override, reset and Git destination rejection.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
     parser.add_argument("--render", action="store_true", help="Export the example through FFmpeg and FFprobe.")
     args = parser.parse_args()
-    with TemporaryDirectory(prefix="bacchus-bundle-smoke-") as data:
-        root = Path(data)
-        command = [str(args.executable.resolve()), "--no-browser", "--data", data, "--port", "0"]
-        env = os.environ.copy()
-        for variable in PROVIDER_SETTINGS:
-            env.pop(variable, None)
-        env.pop("BACCHUS_VIDEO_ENCODER", None)
-        env.pop("BACCHUS_RENDER_BACKEND", None)
-        env.pop("BACCHUS_TIMING_MODEL_DIR", None)
-        process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            url = endpoint(root, process)
+    executable = args.executable.resolve()
+    with TemporaryDirectory(prefix="bacchus-bundle-smoke-") as temp:
+        sandbox = Path(temp).resolve()
+        env, root = smoke_environment(sandbox)
+        cwd = sandbox / "checkout"
+        (cwd / ".git").mkdir(parents=True)
+        check_storage(executable, env, cwd, sandbox, root)
+        with running(executable, env, cwd, root) as url:
+            verify_workspace(json.loads(request(url, "/api/settings")), root, root, root)
             config = json.loads(request(url, "/api/config"))
             if config.get("version") != APP_VERSION:
                 raise RuntimeError(f"Expected Bacchus {APP_VERSION}, received {config.get('version')!r}.")
@@ -438,13 +531,8 @@ def main():
                 project = run_export(url, root, project, custom["styleSnapshot"]["id"])
                 print(f"Verified default export encoder: {project['export']['media']['encoder']}")
                 check_export_recovery(url, root, project)
-            request(url, "/api/quit", {})
-            if process.wait(15) != 0:
-                raise RuntimeError("Bacchus returned a failure status after quitting.")
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(10)
+        if set(cwd.iterdir()) != {cwd / ".git"} or any((cwd / ".git").iterdir()):
+            raise RuntimeError("The packaged app left files in its Git launch directory.")
     print("Verified packaged startup, Claude-first setup, style guides and libraries, offline example, and clean shutdown"
           + (", including evidence gates and MP4 export." if args.render else "."))
 

@@ -29,6 +29,7 @@ import urllib.request
 import numpy as np
 
 from . import media_tools
+from .storage_paths import StoragePathError, scratch_directory, writable_path
 
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -558,7 +559,7 @@ class CDPBrowser:
                 "No Chrome or Edge browser was found for HTML5 Canvas rendering. "
                 "Install Google Chrome or Microsoft Edge, or set CHROME."
             )
-        self._profile_dir = Path(tempfile.mkdtemp(prefix="bacchus-chrome-"))
+        self._profile_dir = Path(tempfile.mkdtemp(prefix="bacchus-chrome-", dir=scratch_directory()))
         self._process: subprocess.Popen | None = None
         self.client: _CDPClient | None = None
         self._tab_handlers: dict[str, tuple] = {}
@@ -778,6 +779,10 @@ class CDPBrowser:
             self._process = None
         for _ in range(5):
             if not self._profile_dir.exists():
+                break
+            try:
+                writable_path(self._profile_dir)
+            except StoragePathError:
                 break
             shutil.rmtree(self._profile_dir, ignore_errors=True)
             if self._profile_dir.exists():

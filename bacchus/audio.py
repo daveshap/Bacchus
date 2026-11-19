@@ -13,6 +13,7 @@ import wave
 from . import media_tools
 from .providers import ProviderError, send_request
 from .settings import DEFAULT_TRANSCRIBE_MODEL, openai_transcription_enabled, provider_value
+from .storage_paths import scratch_directory
 
 
 FORMATS = {".mp3": "mp3", ".flac": "flac", ".wav": "wav"}
@@ -64,7 +65,7 @@ def normalize_audio(raw, name, max_duration, *, voice=True):
     if not container:
         raise AudioError("Choose an MP3, FLAC, or WAV recording.")
     channels, rate = (1, 24_000) if voice else (2, 48_000)
-    with TemporaryDirectory(prefix="bacchus-audio-") as work:
+    with TemporaryDirectory(prefix="bacchus-audio-", dir=scratch_directory()) as work:
         path = Path(work) / f"recording.{container}"
         output = Path(work) / "normalized.wav"
         path.write_bytes(raw)
@@ -138,7 +139,7 @@ def transcribe(wav_path):
     model = transcription_model()
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", model):
         raise AudioError("BACCHUS_TRANSCRIBE_MODEL must be a valid model ID.")
-    with TemporaryDirectory(prefix="bacchus-transcribe-") as work:
+    with TemporaryDirectory(prefix="bacchus-transcribe-", dir=scratch_directory()) as work:
         encoded_path = Path(work) / "narration.m4a"
         settings = ["-ac", "1", "-ar", "24000", "-c:a", "aac", "-b:a", "48k", "-fs", str(TRANSCRIPTION_INPUT_LIMIT)]
         _convert(wav_path, "wav", encoded_path, settings)

@@ -517,6 +517,35 @@ const workflowOverview = [
   "Preview the cut, run quality checks, and export.",
 ];
 
+function workspacePaths(workspace) {
+  return `${workspace.warning ? `<p class="notice" role="status">${escapeHtml(workspace.warning)}</p>` : ""}
+    <div><h3>Active workspace</h3><code>${escapeHtml(workspace.active)}</code></div>
+    ${workspace.active !== workspace.preferred
+      ? `<div><h3>Saved for the next normal launch</h3><code>${escapeHtml(workspace.preferred)}</code></div>` : ""}
+    ${workspace.override
+      ? '<p class="hint">This launch uses the --data folder. Open Bacchus without that option to use the saved workspace.</p>' : ""}`;
+}
+
+function workspaceForm(workspace) {
+  if (!workspace) return "";
+  return `<form class="panel stack" data-form="workspace" autocomplete="off">
+    <div><h2>Project workspace</h2>
+      <p class="hint">Each workspace has its own projects, styles and studio settings. Reopen Bacchus to switch folders. Existing projects stay in their original workspace.</p></div>
+    <div class="stack storage-paths break-path" id="workspace-paths">${workspacePaths(workspace)}</div>
+    <div class="field">
+      <label for="workspace-directory">Workspace folder for next launch</label>
+      <input id="workspace-directory" name="directory" value="${escapeHtml(workspace.preferred)}"
+        placeholder="Enter an absolute folder path" spellcheck="false" required>
+    </div>
+    <div class="cluster">
+      ${button("Browse…", "browse-workspace", { style: "quiet" })}
+      <button class="button primary">Save workspace</button>
+      ${button("Use default folder", "reset-workspace", { style: "quiet" })}
+    </div>
+    <p class="hint break-path">Default folder <code>${escapeHtml(workspace.systemDefault)}</code></p>
+  </form>`;
+}
+
 function settingsView() {
   const settings = state.settings;
   if (!settings) return heading("Settings", "Loading studio settings.");
@@ -524,8 +553,10 @@ function settingsView() {
   const provider = settings.plannerProvider === "openai" ? "openai" : "anthropic";
   const keyStatus = value => badge(value ? "Key available" : "No key set", value ? "good" : "");
   return `
-    ${heading(setup ? "Set up Bacchus" : "Settings", "Check the media tools and choose your providers and video encoder.")}
+    ${heading(setup ? "Set up Bacchus" : "Settings", "Choose your workspace, providers and video encoder.")}
     <div class="columns">
+      <div class="stack">
+      ${workspaceForm(settings.workspace)}
       <form class="panel stack" data-form="settings" autocomplete="off">
         <div><h2>Scene planning</h2>
           <p class="hint">Bacchus uses Claude from Anthropic to draft scene plans by default.</p>
@@ -588,6 +619,7 @@ function settingsView() {
             '<button class="button quiet" type="button" data-view="project">Back to studio</button>'}
         </div>
       </form>
+      </div>
       <div class="stack">
         <section class="panel">
           <div class="panel-header"><h2>Readiness</h2></div>
@@ -602,7 +634,7 @@ function settingsView() {
         <section class="panel">
           <h2>Storage</h2>
           <div class="stack storage-paths">
-            ${settings.dataPath ? `<div><h3>Project data</h3>
+            ${!settings.workspace && settings.dataPath ? `<div><h3>Project data</h3>
               <p class="hint">Project files, imported media, and exports.</p>
               <code>${escapeHtml(settings.dataPath)}</code></div>` : ""}
             <div><h3>Shared art library</h3>
@@ -751,7 +783,7 @@ function libraryView() {
           <form class="stack" data-form="library-import-folder">
             <div class="field">
               <label for="library-import-dir">Local folder path</label>
-              <input id="library-import-dir" name="directory" placeholder="e.g. C:\\AnimationAutomationStudio\\engine\\lib\\warm\\style-assets" required>
+              <input id="library-import-dir" name="directory" placeholder="Enter the folder containing your artwork" required>
               <p class="hint">Imports a studio catalog (catalog.json / manifest.json) or any folder of PNG, JPEG, or WebP images with automatic deduplication.</p>
             </div>
             <div><button class="button primary small">Import folder into ${escapeHtml(scope.libraryName)}</button></div>
@@ -2771,21 +2803,75 @@ async function installMediaTools(control) {
   }
 }
 
+async function persistWorkspace(directory, input) {
+  const settings = await post("/api/workspace", { directory });
+  state.settings = settings;
+  input.value = settings.workspace.preferred;
+  content.querySelector("#workspace-paths").innerHTML = workspacePaths(settings.workspace);
+}
+
+async function chooseWorkspace(action) {
+  if (state.pending) return;
+  const input = content.querySelector("#workspace-directory");
+  if (!input) return;
+  const browse = action === "browse";
+  if (action === "save" && !input.value.trim()) {
+    input.focus();
+    setMessage("Enter a folder path or choose Use default folder.", "error");
+    return;
+  }
+  const finish = beginRequest(browse ? "Opening the folder picker…" : "Saving the workspace…");
+  input.readOnly = true;
+  try {
+    if (browse) {
+      const { directory } = await post("/api/workspace/browse", {});
+      if (directory) input.value = directory;
+      setMessage(directory ? "Folder selected. Save the workspace to use it on the next launch." : "");
+    } else {
+      await persistWorkspace(action === "reset" ? "" : input.value.trim(), input);
+      setMessage("Workspace saved for the next normal launch.", "good");
+    }
+  } catch (error) {
+    setMessage(browse ? `${error.message} You can enter the folder path here.` : error.message, "error");
+    input.focus();
+  } finally {
+    input.readOnly = false;
+    finish();
+  }
+}
+
 async function saveSettings(payload, setup) {
   if (state.pending) return;
+  const input = content.querySelector("#workspace-directory");
+  if (input && !input.value.trim()) {
+    input.focus();
+    setMessage("Enter a workspace path or choose Use default folder.", "error");
+    return;
+  }
   const finish = beginRequest("Applying studio settings…");
+  if (input) input.readOnly = true;
   let updated = false;
   try {
+    if (input && input.value.trim() !== state.settings.workspace.preferred) {
+      await persistWorkspace(input.value.trim(), input);
+    }
+    if (payload.anthropicKey || payload.openAIKey) {
+      content.querySelectorAll('input[type="password"]').forEach(field => { field.value = ""; });
+    }
     state.settings = await post("/api/settings", payload);
     updated = true;
     state.config = await api("/api/config");
     if (setup) state.view = "project";
-    setMessage(setup ? "" : "Studio settings saved.", setup ? "" : "good");
+    const workspace = state.settings.workspace;
+    const reminder = workspace && workspace.active !== workspace.preferred
+      ? `Reopen Bacchus${workspace.override ? " without --data" : ""} to start in the saved workspace.` : "";
+    setMessage([setup ? "" : "Studio settings saved.", reminder].filter(Boolean).join(" "), "good");
   } catch (error) {
     const secrets = [payload.openAIKey, payload.anthropicKey].filter(Boolean);
     const sanitized = secrets.reduce((detail, secret) => detail.replaceAll(secret, "[hidden]"), error.message);
     setMessage(sanitized, "error");
   } finally {
+    if (input) input.readOnly = false;
     finish();
     if (updated) render();
   }
@@ -3515,13 +3601,14 @@ document.addEventListener("submit", event => {
     saveStyle(form);
   } else if (name === "style-archive") {
     importStyleArchive(data.get("archive"));
+  } else if (name === "workspace") {
+    chooseWorkspace("save");
   } else if (name === "settings") {
     const payload = settingsPayload(data);
     if ((payload.openAIKey && payload.clearOpenAIKey) || (payload.anthropicKey && payload.clearAnthropicKey)) {
       setMessage("Choose either a replacement key or the clear option for each provider.", "error");
       return;
     }
-    form.querySelectorAll('input[type="password"]').forEach(input => { input.value = ""; });
     saveSettings(payload, !state.settings.completed);
   } else if (name === "timing-model-location") {
     const directory = data.get("directory")?.trim();
@@ -3770,6 +3857,8 @@ document.addEventListener("click", event => {
     content.querySelector("#style-guide")?.focus();
   } else if (action === "demo") {
     perform(() => post("/api/demo", {}), { busy: "Creating example…", stage: nextStage });
+  } else if (action === "browse-workspace" || action === "reset-workspace") {
+    chooseWorkspace(action === "browse-workspace" ? "browse" : "reset");
   } else if (action === "refresh-settings") {
     refreshSettings();
   } else if (action === "install-media-tools") {
