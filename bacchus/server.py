@@ -84,6 +84,9 @@ class Handler(BaseHTTPRequestHandler):
         expected_host = f"127.0.0.1:{self.server.server_port}"
         if self.headers.get("Host") != expected_host:
             raise WorkflowError(f"Open Bacchus at http://{expected_host}.", 403)
+        instance = self.headers.get("X-Bacchus-Instance")
+        if instance is not None and instance != self.server.instance_id:
+            raise WorkflowError("The workspace instance changed. Check project status before continuing.", 409)
         if mutation:
             origin = self.headers.get("Origin")
             if origin and origin != f"http://{expected_host}":
@@ -173,6 +176,9 @@ class Handler(BaseHTTPRequestHandler):
         project_id, tail = self._project_route(path)
         if not tail:
             self._json(studio.get(project_id))
+        elif len(tail) == 2 and tail[0] == "delivery-files":
+            paths = studio.verified_delivery_paths(project_id, tail[1])
+            self._json({"files": {kind: str(path) for kind, path in paths.items()}})
         elif tail == ["preview"]:
             try:
                 time = float(query.get("time", ["0"])[0])

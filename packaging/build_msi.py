@@ -192,19 +192,26 @@ def short_long(short, long):
     return f"{short}|{long}"
 
 
-def check_bundle(bundle):
-    launcher = bundle / f"{PRODUCT}.exe"
+def check_launcher(launcher, subsystem):
     try:
         with launcher.open("rb") as file:
             header = file.read(64)
             if not header.startswith(b"MZ") or len(header) != 64:
-                raise BuildError("The Bacchus launcher is not a Windows executable.")
+                raise BuildError(f"{launcher.name} is not a Windows executable.")
             file.seek(int.from_bytes(header[60:64], "little"))
-            machine = file.read(6)
+            coff = file.read(24)
+            optional = file.read(70)
     except OSError as error:
-        raise BuildError("The bundle must contain Bacchus.exe.") from error
-    if machine != b"PE\x00\x00\x64\x86":
-        raise BuildError("The MSI requires an x64 Windows Bacchus executable.")
+        raise BuildError(f"The bundle must contain {launcher.name}.") from error
+    if coff[:6] != b"PE\x00\x00\x64\x86" or optional[:2] != b"\x0b\x02":
+        raise BuildError(f"The MSI requires an x64 Windows {launcher.name}.")
+    if len(optional) != 70 or int.from_bytes(optional[68:70], "little") != subsystem:
+        raise BuildError(f"{launcher.name} has the wrong Windows subsystem.")
+
+
+def check_bundle(bundle):
+    check_launcher(bundle / "Bacchus.exe", subsystem=2)      # Windows GUI
+    check_launcher(bundle / "Bacchus-MCP.exe", subsystem=3)  # Windows console
     try:
         verify_bundled_resources(bundle / "_internal" / "bacchus" / "resources")
     except ValueError as error:

@@ -18,6 +18,23 @@ def decision(stage, status="pass", message="The supplied evidence meets the crit
 
 
 class CheckerAdapterTests(unittest.TestCase):
+    def test_artwork_free_plan_persists_an_independently_checked_inventory(self):
+        with TemporaryDirectory(prefix="bacchus-art-inventory-") as temp:
+            studio = Studio(temp)
+            pid = studio.create("No external artwork", demo=True)["id"]
+            project = studio._read(pid)
+            project["autoRun"] = {"checks": []}
+            studio._save(project)
+            with patch.object(auto_review, "check", return_value=decision("asset-inventory")) as checker:
+                studio._auto_proofs(pid, "assets")
+            checker.assert_called_once()
+            [record] = studio._read(pid)["autoRun"]["checks"]
+            self.assertEqual((record["stage"], record["status"]), ("asset-inventory", "passed"))
+            path = Path(temp) / pid / "records" / "checks" / (record["evidenceHash"] + ".json")
+            context = json.loads(path.read_bytes())["context"]
+            self.assertEqual(context, checker.call_args.args[1])
+            self.assertEqual([row["artwork"] for row in context["scenes"]], [[] for _ in project["plan"]["scenes"]])
+
     def test_delivery_refuses_exporter_with_different_renderer_or_film(self):
         with TemporaryDirectory(prefix="bacchus-encoded-binding-") as temp:
             studio = Studio(temp)

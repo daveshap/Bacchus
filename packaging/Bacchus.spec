@@ -43,24 +43,26 @@ for directory in (Path(sys.base_prefix), stdlib, stdlib.parent):
         break
 
 analysis = Analysis(
-    [str(project / "bacchus" / "__main__.py")],
+    [str(project / "bacchus" / name) for name in ("__main__.py", "mcp_main.py")],
     pathex=[str(project)],
     datas=data,
     binaries=collect_dynamic_libs("sherpa_onnx"),
 )
 archive = PYZ(analysis.pure)
-executable = EXE(
-    archive,
-    analysis.scripts,
-    [],
-    exclude_binaries=True,
-    name="Bacchus",
-    console=False,
-    upx=False,
-    icon=str(windows_icon) if sys.platform == "win32" and windows_icon.is_file() else None,
-)
+# Both launchers keep PyInstaller's startup hooks and share one dependency directory.
+def launcher(name, other_entry, console):
+    scripts = [entry for entry in analysis.scripts if entry[0] != other_entry]
+    return EXE(
+        archive, scripts, [], exclude_binaries=True, name=name, console=console, upx=False,
+        icon=str(windows_icon) if sys.platform == "win32" and windows_icon.is_file() else None,
+    )
+
+
+desktop = launcher("Bacchus", "mcp_main", console=False)
+bridge = launcher("Bacchus-MCP", "__main__", console=True)
 bundle = COLLECT(
-    executable,
+    desktop,
+    bridge,
     analysis.binaries,
     analysis.datas,
     upx=False,
@@ -73,5 +75,5 @@ if sys.platform == "darwin":
         bundle_identifier="app.bacchus.studio",
         version=version,
         icon=str(mac_icon) if mac_icon.is_file() else None,
-        info_plist={"NSHighResolutionCapable": True},
+        info_plist={"CFBundleExecutable": "Bacchus", "LSBackgroundOnly": False, "NSHighResolutionCapable": True},
     )

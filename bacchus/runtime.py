@@ -10,7 +10,7 @@ import webbrowser
 
 
 LOOPBACK = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})")
-APP_VERSION = "0.8.2"
+APP_VERSION = "0.8.3"
 
 
 def _absolute_override(name, fallback):
@@ -31,13 +31,18 @@ def default_data_directory():
     return _absolute_override("XDG_DATA_HOME", home / ".local" / "share") / "bacchus"
 
 
-def open_running(data):
+def running_instance(data):
+    """Identify the live studio that owns this workspace."""
     try:
-        instance = json.loads((data / "runtime.json").read_bytes())
+        with (data / "runtime.json").open("rb") as source:
+            raw = source.read(4097)
+        if len(raw) > 4096:
+            return None
+        instance = json.loads(raw)
         url, identity = instance["url"], instance["instance"]
         match = LOOPBACK.fullmatch(url)
         if not match or not 0 < (port := int(match[1])) < 65536:
-            return False
+            return None
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
         try:
             connection.request("GET", "/api/instance")
@@ -46,7 +51,12 @@ def open_running(data):
         finally:
             connection.close()
         if details.get("instance") != identity or not isinstance(identity, str):
-            return False
-    except (OSError, ValueError, AttributeError, KeyError, TypeError, http.client.HTTPException):
-        return False
-    return webbrowser.open(url)
+            return None
+    except (OSError, ValueError, AttributeError, KeyError, TypeError, RecursionError, http.client.HTTPException):
+        return None
+    return port, identity
+
+
+def open_running(data):
+    instance = running_instance(data)
+    return bool(instance and webbrowser.open(f"http://127.0.0.1:{instance[0]}"))

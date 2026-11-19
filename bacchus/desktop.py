@@ -102,7 +102,7 @@ def _serve(options, workspace):
 def main():
     parser = argparse.ArgumentParser(description="Open the Bacchus animation studio.")
     parser.add_argument("--port", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-browser", action="store_true", help="Run the local studio without opening a browser window.")
     parser.add_argument("--data", type=Path,
                         help="Use this workspace for this launch. Settings remembers the normal workspace.")
     parser.add_argument("--library", type=Path, help="Copy an existing Bacchus library into its internal style libraries.")
@@ -112,7 +112,9 @@ def main():
     try:
         _serve(options, workspace)
     except AlreadyRunning as error:
-        if options.no_browser or not open_running(workspace.active):
+        if options.no_browser:
+            parser.exit(75, f"{error}\n")
+        if not open_running(workspace.active):
             raise RuntimeError(str(error)) from error
 
 

@@ -2,11 +2,11 @@
 
 Bacchus turns a narration recording into a **4K60 MP4** with animated graphics, voiceover, music and sound effects. Each project also produces timed SRT captions and a JSON render receipt. The studio runs on your computer and opens in your browser.
 
-**Windows x64** · [Download the 0.8.2 installer](https://github.com/daveshap/Bacchus/raw/refs/heads/main/releases/0.8.2/Bacchus-0.8.2-windows-x64.msi) · [SHA-256 checksum](releases/0.8.2/Bacchus-0.8.2-windows-x64.sha256)
+**Windows x64** · [Download the 0.8.3 installer](https://github.com/daveshap/Bacchus/raw/refs/heads/main/releases/0.8.3/Bacchus-0.8.3-windows-x64.msi) · [SHA-256 checksum](releases/0.8.3/Bacchus-0.8.3-windows-x64.sha256)
 
 ## Install and open the studio
 
-1. Download the unsigned MSI. To verify it, run `Get-FileHash -Algorithm SHA256 .\Bacchus-0.8.2-windows-x64.msi` in the download folder and compare the result with the checksum above. If upgrading, select **Quit Bacchus** in the running studio first.
+1. Download the unsigned MSI. To verify it, run `Get-FileHash -Algorithm SHA256 .\Bacchus-0.8.3-windows-x64.msi` in the download folder and compare the result with the checksum above. If upgrading, select **Quit Bacchus** in the running studio first.
 2. Run the installer and open **Bacchus** from the Start menu. The MSI includes Python, the studio, the BFG drawing engine and the Canvas fonts. Installation and everyday use require no Git, source checkout, Node.js or separate Python installation.
 3. On **Set up Bacchus**, keep the suggested project workspace or browse to a folder of your own. If you choose a different folder, select **Save workspace**, quit and reopen Bacchus before starting a project there.
 4. Check **Readiness** and set up the components for your workflow using the table below. Select **Finish setup** to save provider settings, or **Continue offline** to enter the studio without a provider. For a new offline project, clear **Auto mode** when you create it.
@@ -30,6 +30,43 @@ Bacchus turns a narration recording into a **4K60 MP4** with animated graphics, 
 5. When delivery completes, select **Download MP4**, **Download captions** or **Download receipt**. Bacchus also keeps these files in the project workspace.
 
 **If Auto stops**, read the error in **Intake** and expand **Independent reviews** to see any recorded findings. Hard failures, including API errors, stop the run immediately. For repairable findings, Auto attempts one correction and checks the evidence again. After another failure it stops. Open the relevant stage in the sidebar or adjust Settings, then run Auto again. The usage ledger and retry history survive restarts. An interrupted provider call can retain its budget reservation. Dollar figures use the rates you entered and the provider determines the actual charge.
+
+## Run Bacchus headless with an AI client
+
+The Windows installer includes `Bacchus-MCP.exe`. A local MCP client launches it over standard input and output. On the first tool call it connects to the studio for your saved workspace, or starts one without opening a browser. Multiple clients and the desktop can work with the same projects. An Auto run or queued render continues after an ordinary chat disconnect. You can reconnect and ask for progress by project ID.
+
+**Connect your client.** In PowerShell, set the executable path, then run the registration command for the client you use. These commands register Bacchus for your user account. Open a new client session after registration. [Codex](https://developers.openai.com/codex/mcp/) · [Claude Code](https://code.claude.com/docs/en/mcp) · [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/)
+
+```powershell
+$bacchusMcp = Join-Path $env:LOCALAPPDATA 'Programs\Bacchus\Bacchus-MCP.exe'
+
+# Codex
+codex mcp add bacchus -- "$bacchusMcp"
+
+# Claude Code
+claude mcp add --transport stdio --scope user bacchus -- "$bacchusMcp"
+
+# Gemini CLI
+gemini mcp add --scope user --transport stdio bacchus "$bacchusMcp"
+```
+
+**First connection check.** Ask the assistant, “Use Bacchus to check render readiness and list my styles.” These tools work without a provider key. Rendering needs a Chromium-based browser and FFmpeg/ffprobe. Auto uses Bacchus’s configured planning and review provider. A chat subscription or MCP connection does not supply those credentials. An existing studio uses the keys already active in it. For unattended startup, supply the provider key through the host environment your MCP client passes to Bacchus. For Codex, you can add `env_vars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]` under `[mcp_servers.bacchus]` in your user configuration to pass keys already set in the environment. For word timings, provide recording-matched JSON, install the model in Settings, or set `BACCHUS_TIMING_MODEL_DIR` to a verified local model folder.
+
+**Produce a video.** Give the assistant an absolute path to the narration on the machine running Bacchus, a brief, a style, and your token or spend limit. A typical request is “Use Bacchus to animate this recording in Warm Editorial. Use the timing JSON beside the recording, cap Auto at 80,000 tokens, and return the verified MP4, captions and receipt.” Adjust the limit for your project. File imports and project creation are local. `run_auto` starts the independent checks and any paid provider work. The studio enforces the same limits and stop conditions as desktop Auto.
+
+| What the assistant can do | MCP tools |
+| --- | --- |
+| Check setup, discover styles and find a project | `get_readiness`, `list_styles`, `list_projects`, `get_project` |
+| Create a project and prepare its inputs | `create_project`, `attach_narration`, `import_timings`, `set_auto_settings` |
+| Run production and inspect a prepared frame by timestamp | `run_auto`, `get_project`, `preview_frame` |
+| Create an offline Manual example or render a Manual project after its review | `create_demo`, `render_accepted` |
+| Retrieve the verified MP4, SRT and receipt as local file paths and download links | `get_delivery` |
+
+Project updates take the current `expected_revision`. If it changes, read the project again before editing. Manual approvals happen in the studio. The MCP image preview shows the prepared animation, and `get_delivery` verifies the actual delivery files. If the most recent attempt failed, the result can identify an earlier intact delivery.
+
+To use a separate workspace, pass `--data` and its absolute directory as arguments to the MCP executable. Run `& $bacchusMcp --stop` to close the idle studio for the default or saved workspace, or include the same `--data` override. Studio download URLs work while the host is running. Verified local file paths remain usable after shutdown.
+
+For a source installation, point the MCP client at the virtual environment’s Python executable, set its working directory to the source root, and pass `-m bacchus.mcp_main`. For a packaged macOS or Linux build, use the `Bacchus-MCP` binary alongside the desktop executable. To run only the studio HTTP service from source, use `python -m bacchus --no-browser`.
 
 ## Walk a project through Manual
 
@@ -114,7 +151,7 @@ python packaging/build.py
 On Windows, verify the frozen app and build the MSI.
 
 ```powershell
-python packaging/smoke_bundle.py dist/Bacchus/Bacchus.exe --render
+python packaging/smoke_bundle.py dist/Bacchus/Bacchus.exe --mcp --render
 $version = python -m bacchus --version
 python packaging/build_msi.py --bundle dist/Bacchus --version $version --output "release/Bacchus-$version-windows-x64.msi"
 ```

@@ -2379,7 +2379,7 @@ class Studio:
         if scope == "assets" and not items:
             self._auto_check(project_id, "asset-inventory", "project", {
                 "brief": project["input"]["intention"],
-                "scenes": [{"title": s["title"], "layout": s["layout"], "artwork": planning.scene_art(s),
+                "scenes": [{"title": s["title"], "layout": s["layout"], "artwork": list(planning.scene_art(s)),
                             "layerKinds": [layer["kind"] for layer in s.get("layers", [])],
                             "customDrawing": bool(s.get("canvasCode"))} for s in project["plan"]["scenes"]],
             })
@@ -2956,20 +2956,25 @@ class Studio:
                     project.setdefault("deliveries", []).append(project["export"])
                 self._save(project)
 
+    def verified_delivery_paths(self, project_id, key):
+        if not DIGEST.fullmatch(key):
+            raise WorkflowError("Delivery not found.", 404)
+        folder = self._folder(project_id)
+        project = self._read(project_id)
+        for record in reversed(project.get("deliveries", [])):
+            if record["deliveryId"] == key:
+                try:
+                    return delivery.verify(folder, record)
+                except delivery.DeliveryError as error:
+                    raise WorkflowError(str(error), 409) from error
+        raise WorkflowError("Delivery not found.", 404)
+
     def media(self, project_id, kind, key):
+        if kind in delivery.FILES:
+            return self.verified_delivery_paths(project_id, key)[kind], delivery.FILES[kind][1]
         if not DIGEST.fullmatch(key):
             raise WorkflowError("Media not found.", 404)
         folder = self._folder(project_id)
-        if kind in delivery.FILES:
-            project = self._read(project_id)
-            for record in reversed(project.get("deliveries", [])):
-                if record["deliveryId"] == key:
-                    try:
-                        paths = delivery.verify(folder, record)
-                    except delivery.DeliveryError as error:
-                        raise WorkflowError(str(error), 409) from error
-                    return paths[kind], delivery.FILES[kind][1]
-            raise WorkflowError("Delivery not found.", 404)
         extensions = {"art": ("assets", ".png", "image/png"), "audio": ("audio", ".wav", "audio/wav")}
         if kind not in extensions:
             raise WorkflowError("Media not found.", 404)

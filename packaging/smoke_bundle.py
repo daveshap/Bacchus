@@ -1,6 +1,8 @@
 """Start and verify a frozen Bacchus executable over localhost."""
 
 import argparse
+import asyncio
+import base64
 from contextlib import contextmanager
 import hashlib
 from io import BytesIO
@@ -494,10 +496,124 @@ def check_storage(executable, env, cwd, root, default):
     print("Verified workspace selection, reopening, one-launch override, reset and Git destination rejection.")
 
 
+async def mcp_call(bridge, env, cwd, workspace, tool, arguments):
+    command = [str(bridge), "--data", str(workspace)] if workspace else [str(bridge)]
+    process = await asyncio.create_subprocess_exec(
+        *command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, limit=3 * 1024 * 1024,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+
+    async def send(message):
+        raw = json.dumps({"jsonrpc": "2.0", **message}, ensure_ascii=False)
+        process.stdin.write((raw + "\n").encode("utf-8"))
+        await process.stdin.drain()
+
+    async def rpc(id_, method, params):
+        await send({"id": id_, "method": method, "params": params})
+        line = await process.stdout.readline()
+        if not line:
+            raise RuntimeError(f"The MCP launcher closed stdout during {method}.")
+        reply = json.loads(line)
+        if reply.get("jsonrpc") != "2.0" or reply.get("id") != id_ or "result" not in reply:
+            raise RuntimeError(f"Unexpected MCP reply for {method}: {reply!r}")
+        return reply["result"]
+
+    try:
+        async with asyncio.timeout(60):
+            version = "2025-11-25"
+            hello = await rpc(1, "initialize", {
+                "protocolVersion": version, "capabilities": {},
+                "clientInfo": {"name": "Bacchus bundle smoke", "version": APP_VERSION},
+            })
+            if hello["protocolVersion"] != version or hello["serverInfo"]["version"] != APP_VERSION:
+                raise RuntimeError(f"Unexpected MCP server version: {hello!r}")
+            await send({"method": "notifications/initialized"})
+            listing = await rpc(2, "tools/list", {})
+            if not {"create_project", "list_projects", "get_project"} <= {item["name"] for item in listing["tools"]}:
+                raise RuntimeError("The packaged MCP launcher did not advertise the project tools.")
+            result = await rpc(3, "tools/call", {"name": tool, "arguments": arguments})
+            if result.get("isError"):
+                raise RuntimeError(f"Packaged MCP tool {tool} failed: {result!r}")
+            process.stdin.close()
+            if await process.stdout.read() or await process.wait() != 0:
+                raise RuntimeError("The packaged MCP launcher did not close cleanly on EOF.")
+            if "structuredContent" in result:
+                return result["structuredContent"]
+            block = result["content"][0]
+            if block["type"] == "image" and block.get("mimeType") == "image/png":
+                return base64.b64decode(block["data"], validate=True)
+            return json.loads(block["text"])
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+def check_mcp_reconnect(bridge, env, cwd, workspace):
+    runtime_file = workspace / "runtime.json"
+    try:
+        title = "Packaged MCP project"
+        project = asyncio.run(mcp_call(bridge, env, cwd, workspace, "create_project", {
+            "title": title, "limits": {"maxTokens": 0},
+        }))
+        instance = json.loads(runtime_file.read_bytes())
+        reopened = asyncio.run(mcp_call(bridge, env, cwd, workspace, "get_project", {"project_id": project["id"]}))
+        if (reopened["id"] != project["id"] or reopened["title"] != title
+                or json.loads(runtime_file.read_bytes()) != instance):
+            raise RuntimeError("A second MCP client did not reconnect to the same studio and project.")
+        demo = asyncio.run(mcp_call(bridge, env, cwd, workspace, "create_demo", {}))
+        saved = asyncio.run(mcp_call(bridge, env, cwd, workspace, "get_project", {"project_id": demo["id"]}))
+        if saved["id"] != demo["id"] or saved["autoMode"]:
+            raise RuntimeError("The packaged MCP launcher did not create an offline Manual demo.")
+    finally:
+        if runtime_file.exists():
+            instance = json.loads(runtime_file.read_bytes())
+            url = instance["url"]
+            parsed = urlsplit(url)
+            if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
+                raise RuntimeError("The MCP smoke host announced an unexpected address.")
+            identity = json.loads(request(url, "/api/instance"))["instance"]
+            active = Path(json.loads(request(url, "/api/settings"))["workspace"]["active"])
+            if identity != instance["instance"] or active != workspace:
+                raise RuntimeError("The MCP smoke host identity did not match the test workspace.")
+            request(url, "/api/quit", {})
+            deadline = time.monotonic() + 15
+            while runtime_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if runtime_file.exists():
+                raise RuntimeError("The MCP smoke studio did not shut down.")
+    print("Verified packaged MCP initialization, project tools and reconnection after client exit.")
+
+
+def check_mcp_delivery(bridge, env, cwd, workspace, url, project):
+    args = {"project_id": project["id"]}
+    delivery = asyncio.run(mcp_call(bridge, env, cwd, None, "get_delivery", args))
+    export = project["export"]
+    if not delivery["available"] or not delivery["current"] or delivery["deliveryId"] != export["deliveryId"]:
+        raise RuntimeError("The MCP launcher did not return the desktop's verified delivery.")
+    for kind, key in (("video", "url"), ("captions", "captionsUrl"), ("receipt", "receiptUrl")):
+        path = Path(delivery["files"][kind])
+        if (not path.is_absolute() or not path.resolve().is_relative_to(workspace / project["id"] / "exports")
+                or delivery["urls"][kind] != url + export[key]):
+            raise RuntimeError(f"The MCP {kind} path or download URL did not match the project.")
+        with path.open("rb") as local, urlopen(delivery["urls"][kind], timeout=25) as downloadable:
+            if hashlib.file_digest(local, "sha256").digest() != hashlib.file_digest(downloadable, "sha256").digest():
+                raise RuntimeError(f"The MCP {kind} file differed from the verified delivery download.")
+    frame = asyncio.run(mcp_call(bridge, env, cwd, None, "preview_frame", {**args, "seconds": 0.5}))
+    with Image.open(BytesIO(frame)) as image:
+        if image.format != "PNG" or image.size != (640, 360):
+            raise RuntimeError("The MCP frame was not a 640 by 360 PNG.")
+        image.verify()
+    if frame != request(url, f"/api/projects/{project['id']}/preview?time=0.5&width=640"):
+        raise RuntimeError("The MCP frame differed from the desktop preview at the same time.")
+    print("Verified MCP delivery files, download hashes and a frame from the rendered project.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
     parser.add_argument("--render", action="store_true", help="Export the example through FFmpeg and FFprobe.")
+    parser.add_argument("--mcp", action="store_true", help="Verify the companion MCP executable over stdio.")
     args = parser.parse_args()
     executable = args.executable.resolve()
     with TemporaryDirectory(prefix="bacchus-bundle-smoke-") as temp:
@@ -505,6 +621,9 @@ def main():
         env, root = smoke_environment(sandbox)
         cwd = sandbox / "checkout"
         (cwd / ".git").mkdir(parents=True)
+        bridge = executable.with_name("Bacchus-MCP" + executable.suffix)
+        if args.mcp:
+            check_mcp_reconnect(bridge, env, cwd, sandbox / "MCP workspace")
         check_storage(executable, env, cwd, sandbox, root)
         with running(executable, env, cwd, root) as url:
             verify_workspace(json.loads(request(url, "/api/settings")), root, root, root)
@@ -524,12 +643,19 @@ def main():
             custom = check_styles(url)
             check_style_archive(url, custom["styleSnapshot"]["id"])
             project = json.loads(request(url, "/api/demo", {}))
+            if args.mcp:
+                listed = asyncio.run(mcp_call(bridge, env, cwd, None, "list_projects", {}))
+                if project["id"] not in {item["id"] for item in listed["projects"]}:
+                    raise RuntimeError("The MCP client did not find the desktop's existing project.")
+                print("Verified a packaged MCP client can attach to the open desktop studio.")
             if not project["input"] or not project["plan"]["approved"]:
                 raise RuntimeError("The packaged app could not create the demo project.")
             if args.render:
                 check_style_mix_and_captions(url, custom)
                 project = run_export(url, root, project, custom["styleSnapshot"]["id"])
                 print(f"Verified default export encoder: {project['export']['media']['encoder']}")
+                if args.mcp:
+                    check_mcp_delivery(bridge, env, cwd, root, url, project)
                 check_export_recovery(url, root, project)
         if set(cwd.iterdir()) != {cwd / ".git"} or any((cwd / ".git").iterdir()):
             raise RuntimeError("The packaged app left files in its Git launch directory.")
